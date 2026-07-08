@@ -16,31 +16,22 @@ from datetime import date, datetime, timezone
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .core import CFG, append_event, pool
+from .core import CFG, append_event, new_id, pool
+from .policies import (
+    DEFAULT_LANE_BUDGETS,
+    DEFAULT_MODE_PATTERNS,
+    get_packet_compiler,
+    get_recall_policy,
+)
 
 APPROX_CHARS_PER_TOKEN = 4
 
-LANES = {  # spec §6.4 — token budgets per lane
-    "directives_warnings": 300,   # reserved, never evicted
-    "hot": 350,
-    "retrieved": 600,
-    "candidates": 150,
-    "open_loops": 100,
-}
-
-MODE_PATTERNS = [
-    ("debug",    re.compile(r"traceback|error|exception|stack|\.py\b|\.ts\b|/[\w./-]+\.\w{1,4}\b|undefined|null pointer", re.I)),
-    ("decision", re.compile(r"\bshould (we|i)\b|\bdid (we|i) decide\b|\bwhy did\b|\bdecision\b", re.I)),
-    ("state",    re.compile(r"\bwhere were we\b|\bcontinue\b|\bstatus\b|\bnext step", re.I)),
-    ("style",    re.compile(r"\bwrite\b|\bemail\b|\bdraft\b|\bmessage to\b|\breply\b", re.I)),
-]
+LANES = DEFAULT_LANE_BUDGETS
+MODE_PATTERNS = DEFAULT_MODE_PATTERNS
 
 
 def classify(prompt: str) -> str:
-    for mode, pat in MODE_PATTERNS:
-        if pat.search(prompt):
-            return mode
-    return "general"
+    return get_recall_policy().classify(prompt)
 
 
 def _tok(s: str) -> int:
@@ -100,7 +91,10 @@ def _row_line(r: dict, label: str | None = None) -> str:
 def build_packet(prompt: str, session_id: str, project: str | None,
                  agent: str = "claude-code") -> dict:
     t0 = time.monotonic()
-    mode = classify(prompt)
+    policy = get_recall_policy()
+    compiler = get_packet_compiler()
+    lane_budgets = policy.lane_budgets
+    mode = policy.classify(prompt)
     fts_q = _fts_query(prompt)
     canary_alarms: list[str] = []
     ambiguity: list[dict] = []
@@ -123,7 +117,7 @@ def build_packet(prompt: str, session_id: str, project: str | None,
         lane1 = conn.execute(
             f"""SELECT * FROM memories
                 WHERE type IN ('directive','warning') AND status='active'
-                  AND {base_filter} ORDER BY created_at DESC LIMIT 20""",
+                  AND {base_filter} ORDER BY created_at DESC LIMIT {policy.warning_limit}""",
             params).fetchall()
         lane1 = [r for r in lane1 if _directive_condition_ok(r["struct"] or {})]
 
@@ -133,7 +127,7 @@ def build_packet(prompt: str, session_id: str, project: str | None,
                 WHERE status='active'
                   AND ( (type IN ('identity','preference','writing_style') AND project IS NULL)
                         OR (type='project_state' AND project = %(project)s) )
-                  AND {base_filter} ORDER BY type, created_at DESC LIMIT 15""",
+                  AND {base_filter} ORDER BY type, created_at DESC LIMIT {policy.hot_limit}""",
             params).fetchall()
 
         # Lane 3/4 — hybrid retrieval: FTS (precision) + vector (recall), merged
@@ -184,6 +178,7 @@ def build_packet(prompt: str, session_id: str, project: str | None,
             + 0.15·useful + 0.10·authority + 0.05·confirmation_recency."""
             from datetime import datetime as _dt, timezone as _tz
             now = _dt.now(_tz.utc)
+            weights = policy.rerank_weights
             auth_w = {"A1": 1.0, "A2": 0.8, "B1": 0.6, "C1": 0.4, "D1": 0.2, "Q": 0.0}
             max_rank = max((float(r.get("rank") or 0) for r in fts_rows), default=0) or 1.0
             max_use = max((r["useful_count"] for r in fts_rows + vec_rows), default=0) or 1
@@ -197,23 +192,32 @@ def build_packet(prompt: str, session_id: str, project: str | None,
                     merged[r["id"]] = {**r, "kw": 0.0, "sem": max(0.0, float(r.get("cosine") or 0))}
             def score(m: dict) -> float:
                 age_d = max(0.0, (now - m["created_at"]).total_seconds() / 86400)
-                recency = 0.5 ** (age_d / 90)               # 90-day half-life
+                recency = 0.5 ** (age_d / policy.recency_half_life_days)
                 conf_d = ((now - m["last_confirmed_at"]).total_seconds() / 86400
                           if m["last_confirmed_at"] else 365)
-                confirm = 0.5 ** (conf_d / 90)
-                return (0.35 * m["sem"] + 0.20 * m["kw"] + 0.15 * recency
-                        + 0.15 * m["useful_count"] / max_use
-                        + 0.10 * auth_w.get(m["authority"], 0.2) + 0.05 * confirm)
+                confirm = 0.5 ** (conf_d / policy.recency_half_life_days)
+                return (weights["semantic"] * m["sem"]
+                        + weights["keyword"] * m["kw"]
+                        + weights["recency"] * recency
+                        + weights["useful"] * m["useful_count"] / max_use
+                        + weights["authority"] * auth_w.get(m["authority"], 0.2)
+                        + weights["confirmation_recency"] * confirm)
             return sorted(merged.values(), key=score, reverse=True)[:limit]
 
-        retrieved = _rerank(_fts_rows("active", 12), _vec_rows("active", 12), 12)
-        candidates = _rerank(_fts_rows("candidate", 5), _vec_rows("candidate", 5), 5)
+        retrieved = _rerank(
+            _fts_rows("active", policy.active_limit),
+            _vec_rows("active", policy.active_limit),
+            policy.active_limit)
+        candidates = _rerank(
+            _fts_rows("candidate", policy.candidate_limit),
+            _vec_rows("candidate", policy.candidate_limit),
+            policy.candidate_limit)
 
         # Lane 5 — open loops
         loops = conn.execute(
             f"""SELECT * FROM memories
                 WHERE type IN ('commitment','open_question') AND status='active'
-                  AND {base_filter} ORDER BY created_at DESC LIMIT 6""",
+                  AND {base_filter} ORDER BY created_at DESC LIMIT {policy.loop_limit}""",
             params).fetchall()
 
         # ---- court rules (P5) --------------------------------------
@@ -256,19 +260,19 @@ def build_packet(prompt: str, session_id: str, project: str | None,
             return out
 
         sections: list[str] = ["## Memory (auto-recalled; cite mem_ ids when relying on these)"]
-        l1 = fit(lane1, LANES["directives_warnings"])
+        l1 = fit(lane1, lane_budgets["directives_warnings"])
         if l1:
             sections += ["### Active directives & warnings"] + [("⚠ " + s if not s.startswith("⚠") else s) for s in l1]
-        l2 = fit(lane2, LANES["hot"])
+        l2 = fit(lane2, lane_budgets["hot"])
         if l2:
             sections += ["### About the user & this project"] + l2
-        l3 = fit(lane3, LANES["retrieved"])
+        l3 = fit(lane3, lane_budgets["retrieved"])
         if l3:
             sections += ["### Possibly relevant (retrieved)"] + l3
-        l4 = fit(lane4, LANES["candidates"], label="candidate")
+        l4 = fit(lane4, lane_budgets["candidates"], label="candidate")
         if l4:
             sections += ["### Unconfirmed candidates (verify before relying)"] + l4
-        l5 = fit(lane5, LANES["open_loops"])
+        l5 = fit(lane5, lane_budgets["open_loops"])
         if l5:
             sections += ["### Open loops"] + l5
 
@@ -286,14 +290,38 @@ def build_packet(prompt: str, session_id: str, project: str | None,
                                     "l4": len(l4), "l5": len(l5)},
             "channels": channels,
             "canary_alarms": canary_alarms, "ambiguity": ambiguity,
+            "policy": policy.name,
+            "packet_compiler": compiler.name,
         }
         # served is TRUE by construction: failed recalls never reach this
         # INSERT, and a dead daemon can't log at all. Column kept for a
         # future failure logger.
-        conn.execute(
+        recall_row = conn.execute(
             """INSERT INTO recall_log (session_id, project, query_text, packet, latency_ms, served, agent)
-               VALUES (%s,%s,%s,%s,%s,TRUE,%s)""",
-            (session_id, project, prompt[:2000], Jsonb(packet_meta), latency_ms, agent))
+               VALUES (%s,%s,%s,%s,%s,TRUE,%s) RETURNING id""",
+            (session_id, project, prompt[:2000], Jsonb(packet_meta), latency_ms, agent)
+        ).fetchone()
+        recall_log_id = recall_row["id"] if recall_row else None
+        try:
+            conn.execute(
+                """INSERT INTO packet_runs (id, recall_log_id, session_id, project, agent,
+                                            policy, compiler, rendered_packet,
+                                            selected_memory_ids, rejected, channels,
+                                            latency_ms)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (new_id("pkt"), recall_log_id, session_id, project, agent,
+                 policy.name, compiler.name, markdown, shown_ids,
+                 Jsonb({"ambiguity": ambiguity, "canary_alarms": canary_alarms}),
+                 channels, latency_ms))
+            conn.execute(
+                """INSERT INTO policy_runs (id, policy, operation, input, output,
+                                            latency_ms, ok)
+                   VALUES (%s,%s,%s,%s,%s,%s,TRUE)""",
+                (new_id("pol"), policy.name, "recall",
+                 Jsonb({"prompt": prompt[:2000], "project": project, "agent": agent}),
+                 Jsonb(packet_meta), latency_ms))
+        except Exception:  # noqa: BLE001 - old DBs may not have migration 005 yet
+            pass
         append_event(conn, kind="recall_packet", session_id=session_id, project=project,
                      agent=agent, meta=True, payload=packet_meta)
         if canary_alarms:

@@ -54,6 +54,12 @@ class Config:
         os.environ.get("MEMORYD_HOME") or _FILE_CFG.get("home") or "~/memory").expanduser())
     port: int = int(_get("MEMORYD_PORT", "port", "7437"))
     packet_token_budget: int = int(_get("MEMORYD_PACKET_TOKENS", "packet_tokens", "1500"))
+    model_profile: str = _get("MEMORYD_MODEL_PROFILE", "model_profile", "")
+    extractor_contract: str = _get("MEMORYD_EXTRACTOR_CONTRACT", "extractor_contract", "builtin_v1")
+    semantic_policy: str = _get("MEMORYD_SEMANTIC_POLICY", "semantic_policy", "conservative_v1")
+    recall_policy: str = _get("MEMORYD_RECALL_POLICY", "recall_policy", "heuristic_v1")
+    packet_compiler: str = _get("MEMORYD_PACKET_COMPILER", "packet_compiler", "lane_v1")
+    eval_profile: str = _get("MEMORYD_EVAL_PROFILE", "eval_profile", "default_v1")
     # per-agent memory visas (spec §6, governance). Override with
     # MEMORYD_VISAS='{"hermes": ["work_private","public"], ...}' or a
     # "visas" object in config.json.

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -25,6 +26,14 @@ from .ingest import drain_spool, ingest_transcript
 from .recall import build_packet
 
 CAPTURE_Q: "queue.Queue[dict]" = queue.Queue()
+ADMIN_POST_ENDPOINTS = {
+    "/admin/eval",
+    "/admin/replay",
+    "/admin/policies",
+    "/admin/model-profiles",
+    "/admin/export-evidence",
+    "/admin/rebuild-indexes",
+}
 
 
 def _capture_worker() -> None:
@@ -115,14 +124,29 @@ class Handler(BaseHTTPRequestHandler):
             project = body.get("project")
             stored = 0
             try:
+                from .adapters import event_to_envelope
                 from .core import archive_bytes
                 from datetime import datetime as _dt, timezone as _tz
                 with pool().connection() as conn:
                     for ev in body["events"][:200]:
-                        kind = ev.get("kind")
-                        if kind not in allowed:
+                        envelope = event_to_envelope({
+                            **ev,
+                            "session_id": body["session_id"],
+                            "agent": agent,
+                            "project": project,
+                        }, runtime=agent)
+                        kind = envelope["event_type"]
+                        if kind not in allowed and not re.match(r"^[a-z][a-z0-9_]{1,63}$", str(kind)):
                             continue
                         payload = ev.get("payload") or {}
+                        payload = {
+                            **payload,
+                            "_adapter": {
+                                "runtime": envelope["runtime"],
+                                "parent_session_id": envelope["parent_session_id"],
+                                "content_ref": envelope["content_ref"],
+                            },
+                        }
                         text = payload.get("text", "")
                         sha = None
                         if isinstance(text, str) and len(text) > 4000:
@@ -156,6 +180,101 @@ class Handler(BaseHTTPRequestHandler):
                      json.dumps(body.get("detail", {}))))
                 conn.commit()
             self._json(200, {"ok": True})
+        elif self.path == "/admin/model-profiles":
+            from .model_gateway import get_model_profile, list_model_profiles
+            profiles = [get_model_profile(name).to_dict() for name in list_model_profiles()]
+            self._json(200, {"ok": True, "profiles": profiles})
+        elif self.path == "/admin/policies":
+            from .contracts import get_extractor_contract, list_extractor_contracts
+            from .policies import (
+                get_packet_compiler,
+                get_recall_policy,
+                list_packet_compilers,
+                list_recall_policies,
+            )
+            from .semantic_policies import get_semantic_policy, list_semantic_policies
+            self._json(200, {
+                "ok": True,
+                "recall_policies": [
+                    get_recall_policy(name).to_dict() for name in list_recall_policies()
+                ],
+                "semantic_policies": [
+                    get_semantic_policy(name).to_dict() for name in list_semantic_policies()
+                ],
+                "packet_compilers": [
+                    get_packet_compiler(name).to_dict() for name in list_packet_compilers()
+                ],
+                "extractor_contracts": [
+                    get_extractor_contract(name).to_dict() for name in list_extractor_contracts()
+                ],
+            })
+        elif self.path == "/admin/eval":
+            from psycopg.types.json import Jsonb
+            from .evaluator import run_static_eval
+            cases = body.get("cases")
+            if cases is None:
+                try:
+                    with pool().connection() as conn:
+                        rows = conn.execute(
+                            "SELECT id, kind, input, expected FROM eval_cases "
+                            "WHERE enabled ORDER BY created_at, id LIMIT 100").fetchall()
+                    cases = [
+                        {"id": r[0], "kind": r[1], "input": r[2], "expected": r[3]}
+                        for r in rows
+                    ]
+                except Exception:  # noqa: BLE001 - eval can still run ad hoc
+                    cases = []
+            result = run_static_eval(cases=cases)
+            try:
+                with pool().connection() as conn:
+                    conn.execute(
+                        "INSERT INTO eval_runs (id, profile, status, summary, metrics) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (new_id("eval"), result["model_profile"],
+                         "pass" if result["failed"] == 0 else "fail",
+                         Jsonb(result), Jsonb({
+                             "cases": result["cases"],
+                             "passed": result["passed"],
+                             "failed": result["failed"],
+                         })))
+                    conn.commit()
+            except Exception:  # noqa: BLE001 - migration may not be applied yet
+                result["recorded"] = False
+            else:
+                result["recorded"] = True
+            self._json(200, {"ok": True, "eval": result})
+        elif self.path == "/admin/replay":
+            limit = int(body.get("limit", 20))
+            try:
+                with pool().connection() as conn:
+                    rows = conn.execute(
+                        "SELECT session_id, project, query_text, packet, latency_ms, agent "
+                        "FROM recall_log ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
+                replay = [{
+                    "session_id": r[0],
+                    "project": r[1],
+                    "query_text": r[2],
+                    "packet": r[3],
+                    "latency_ms": r[4],
+                    "agent": r[5] if len(r) > 5 else None,
+                } for r in rows]
+                self._json(200, {"ok": True, "replay": replay})
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"ok": False, "error": str(e)})
+        elif self.path == "/admin/export-evidence":
+            bundle: dict = {"ok": True, "tables": {}}
+            try:
+                with pool().connection() as conn:
+                    for table in ("model_runs", "policy_runs", "eval_runs", "packet_runs"):
+                        try:
+                            rows = conn.execute(f"SELECT row_to_json(t) FROM "
+                                                f"(SELECT * FROM {table} ORDER BY ts DESC LIMIT 50) t").fetchall()
+                            bundle["tables"][table] = [r[0] for r in rows]
+                        except Exception as e:  # noqa: BLE001
+                            bundle["tables"][table] = {"error": str(e)}
+                self._json(200, bundle)
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"ok": False, "error": str(e)})
         elif self.path == "/admin/rebuild-indexes":
             try:
                 from .embed import get_embedder, to_pgvector
