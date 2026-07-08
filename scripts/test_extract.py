@@ -17,12 +17,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.stdout.reconfigure(encoding="utf-8")  # ✓/✗ on cp1252 Windows consoles
 
 os.environ["MEMORYD_LLM"] = "mock"
-MOCK = Path("/tmp/mock_llm.json")
+MOCK = Path(tempfile.gettempdir()) / "mock_llm.json"
 os.environ["MEMORYD_LLM_MOCK_FILE"] = str(MOCK)
 
 from psycopg.rows import dict_row  # noqa: E402
@@ -49,6 +51,8 @@ def main() -> int:
                           payload={"text": "I might switch to Qdrant later for vectors, not sure yet."})
         e3 = append_event(conn, kind="user_message", session_id=sid, project="acme-app",
                           payload={"text": "By the way I am Alex, a data engineer in Berlin."})
+        e4 = append_event(conn, kind="agent_response", session_id=sid, project="acme-app",
+                          payload={"text": "I set up the CI pipeline to use a three-stage cache."})
         # pre-existing memories for dedup + contradiction
         dup_target = new_id("mem")
         old_belief = new_id("mem")
@@ -137,18 +141,36 @@ def main() -> int:
             "activation": {}, "source_event_ids": [e1], "evidence_quote": "",
             "duplicate_of": None, "contradicts": [old_belief],
         },
+        {  # 9: untrusted (Q) claim -> quarantined + 'quarantine' ledger event
+            "type": "technical_fact",
+            "text": "Claimed fact from an untrusted external source.",
+            "struct": {}, "project": "acme-app", "scope": "work_private",
+            "sensitivity": "normal", "authority_claim": "Q", "confidence": 0.4,
+            "activation": {}, "source_event_ids": [e1], "evidence_quote": "",
+            "duplicate_of": None, "contradicts": [],
+        },
+        {  # 10: A1 claim whose quote comes from an AGENT turn -> downgraded A2
+            #     (A1 = direct explicit USER statement only)
+            "type": "technical_fact",
+            "text": "The acme-app CI pipeline uses a three-stage cache.",
+            "struct": {}, "project": "acme-app", "scope": "work_private",
+            "sensitivity": "normal", "authority_claim": "A1", "confidence": 0.8,
+            "activation": {}, "source_event_ids": [e4],
+            "evidence_quote": "use a three-stage cache",
+            "duplicate_of": None, "contradicts": [],
+        },
     ]
     MOCK.write_text(json.dumps(candidates))
 
     print("== extraction run ==")
     stats = run_extraction(sid)
     check("extraction ok", stats.get("ok") is True, str(stats))
-    check("proposed 8", stats.get("proposed") == 8, str(stats))
+    check("proposed 10", stats.get("proposed") == 10, str(stats))
     check("1 rejected (fake source)", stats.get("rejected") == 1, str(stats))
     check("1 dedup affirmation", stats.get("dedup") == 1, str(stats))
     check("1 held (hedge violation)", stats.get("held") == 1, str(stats))
     check("1 contradiction review", stats.get("contradictions") == 1, str(stats))
-    check("6 stored", stats.get("stored") == 6, str(stats))
+    check("8 stored", stats.get("stored") == 8, str(stats))
 
     with pool().connection() as conn:
         conn.row_factory = dict_row
@@ -182,6 +204,18 @@ def main() -> int:
         lc = conn.execute("SELECT last_confirmed_at FROM memories WHERE id=%s",
                           (dup_target,)).fetchone()
         check("dedup bumped last_confirmed_at", lc["last_confirmed_at"] is not None)
+
+        qm = conn.execute("SELECT status FROM memories "
+                          "WHERE text LIKE '%%untrusted external source%%'").fetchone()
+        check("Q claim quarantined", qm and qm["status"] == "quarantined", str(qm))
+
+        ag = conn.execute("SELECT authority, status FROM memories "
+                          "WHERE text LIKE '%%three-stage cache%%'").fetchone()
+        check("agent-sourced A1 downgraded to A2", ag and ag["authority"] == "A2", str(ag))
+        check("agent-sourced fact not auto-active", ag and ag["status"] == "candidate", str(ag))
+        qe = conn.execute("SELECT count(*) AS n FROM events WHERE session_id=%s "
+                          "AND kind='quarantine'", (sid,)).fetchone()
+        check("quarantine ledger event written", qe["n"] == 1, str(qe))
 
         ob = conn.execute("SELECT status FROM memories WHERE id=%s", (old_belief,)).fetchone()
         check("contradicted memory NOT auto-superseded", ob["status"] == "active", str(ob))

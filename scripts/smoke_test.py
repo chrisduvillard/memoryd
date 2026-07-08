@@ -14,6 +14,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.stdout.reconfigure(encoding="utf-8")  # ✓/✗ on cp1252 Windows consoles
 
 import psycopg  # noqa: E402
 from memoryd.core import CFG, append_event, new_id, pool  # noqa: E402

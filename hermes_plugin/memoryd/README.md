@@ -38,3 +38,18 @@ per-agent visas.
 
 - `memoryd_search(query)` — on-demand deep recall beyond the injected packet.
 - `memoryd_report_miss(detail)` — log "you forgot" signals to improve retrieval.
+
+## Extraction model (which LLM distills memories)
+
+Extraction runs in the **daemon**, not in Hermes — configure it there
+(`MEMORYD_LLM=openrouter` + `OPENROUTER_API_KEY` + `MEMORYD_LLM_MODEL`
+in `~/memory/config.json`'s `env` map lets you pick any vendor's model).
+The pragmatic "same model as Hermes" setup today is pointing both at the
+same OpenRouter key/model.
+
+Planned keyless path (once Hermes exposes its model to plugins): the daemon
+renders the extraction prompt, this plugin runs it through the Hermes-selected
+host model, and posts the completion back for the daemon's validator to
+judge — the validator stays server-side because it is the integrity layer.
+Requires two small daemon endpoints (prompt render + completion submit); not
+built until the Hermes plugin API exists to call against.

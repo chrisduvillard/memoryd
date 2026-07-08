@@ -1,16 +1,17 @@
 {
+  "_comment": "Documentation for MANUAL installs only — `memoryd install` writes these entries into ~/.claude/settings.json with your real python path. Replace <PYTHON> with the absolute path of the interpreter that has memoryd installed (e.g. C:\\Python314\\python.exe or /usr/bin/python3).",
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "~/memory/hooks/recall_hook.sh", "timeout": 2 } ] }
+      { "hooks": [ { "type": "command", "command": "\"<PYTHON>\" -m memoryd.hook recall", "timeout": 5 } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "~/memory/hooks/capture_hook.sh stop" } ] }
+      { "hooks": [ { "type": "command", "command": "\"<PYTHON>\" -m memoryd.hook capture stop", "timeout": 10 } ] }
     ],
     "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "~/memory/hooks/capture_hook.sh session_end" } ] }
+      { "hooks": [ { "type": "command", "command": "\"<PYTHON>\" -m memoryd.hook capture session_end", "timeout": 10 } ] }
     ],
     "PreCompact": [
-      { "hooks": [ { "type": "command", "command": "~/memory/hooks/capture_hook.sh pre_compact" } ] }
+      { "hooks": [ { "type": "command", "command": "\"<PYTHON>\" -m memoryd.hook capture pre_compact", "timeout": 10 } ] }
     ]
   }
 }

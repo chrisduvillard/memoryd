@@ -12,8 +12,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-import psycopg
-
 from .core import CFG, append_event, archive_file, pool
 
 
@@ -106,9 +104,14 @@ def ingest_transcript(transcript_path: str, session_id: str, project: str | None
                          project=project, raw_sha256=sha, payload=payload)
             seen.add(probe)
             new_events += 1
-        append_event(conn, kind="capture_ack", session_id=session_id,
-                     project=project, raw_sha256=sha, meta=True,
-                     payload={"trigger": trigger, "new_events": new_events})
+        # ack only when there's something to acknowledge — a per-turn Stop
+        # capture with zero new events would otherwise append one meta row
+        # per idle turn. session_end/pre_compact always ack (microsleep's
+        # extraction-retry query keys on those triggers).
+        if new_events or trigger in ("session_end", "pre_compact"):
+            append_event(conn, kind="capture_ack", session_id=session_id,
+                         project=project, raw_sha256=sha, meta=True,
+                         payload={"trigger": trigger, "new_events": new_events})
         conn.commit()
     return {"ok": True, "sha256": sha, "new_events": new_events}
 
@@ -119,11 +122,17 @@ def drain_spool() -> int:
     for f in sorted(CFG.spool.glob("*.json")):
         try:
             job = json.loads(f.read_text())
-            res = ingest_transcript(job["transcript_path"], job["session_id"],
-                                    job.get("project"), job.get("trigger", "spool"))
+            if job.get("extract_only"):
+                # /extract jobs spooled by the capture worker carry no
+                # transcript — retry the extraction itself.
+                from .extract import run_extraction
+                res = run_extraction(job["session_id"])
+            else:
+                res = ingest_transcript(job["transcript_path"], job["session_id"],
+                                        job.get("project"), job.get("trigger", "spool"))
             if res.get("ok"):
                 f.unlink()
                 drained += 1
-        except (json.JSONDecodeError, KeyError, psycopg.Error):
-            continue  # leave in spool for next drain
+        except Exception:  # noqa: BLE001 — one bad job (e.g. LLM misconfig raising
+            continue        # LLMError) must not abort the drain or the nightly run
     return drained

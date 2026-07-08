@@ -30,6 +30,10 @@ VALID_TYPES = {
 }
 AUTO_ACTIVE_TYPES = {"directive", "decision", "constraint", "commitment"}
 
+# Unrecalled, unconfirmed candidates decay after ~1 month (microsleep);
+# NULL = no decay (identity tier, ARCHITECTURE §3.3).
+CANDIDATE_HALF_LIFE_D = 30
+
 HEDGES = re.compile(r"\b(might|maybe|perhaps|considering|could|thinking about|"
                     r"not sure|possibly|leaning|tempted|later)\b", re.I)
 COMMITTAL = re.compile(r"\b(will|decided|is going to|chose|has chosen|must|"
@@ -99,7 +103,8 @@ def _render_transcript(events: list[dict]) -> str:
 
 # ------------------------------------------------------------------ validate
 
-def _validate(cand: dict, event_ids: set[str], source_texts: dict[str, str]) -> tuple[str, str]:
+def _validate(cand: dict, event_ids: set[str], source_texts: dict[str, str],
+              user_texts: dict[str, str]) -> tuple[str, str]:
     """Return (verdict, reason): verdict in {ok, hold, reject}."""
     if cand.get("type") not in VALID_TYPES:
         return "reject", f"invalid type {cand.get('type')!r}"
@@ -119,13 +124,19 @@ def _validate(cand: dict, event_ids: set[str], source_texts: dict[str, str]) -> 
     if not 0 <= conf <= 1:
         return "reject", "confidence out of range"
 
-    # authority cap + A1 evidence requirement (deterministic downgrade)
+    # authority cap + A1 evidence requirement (deterministic downgrade).
+    # Normalize IN PLACE: an un-normalized garbage claim (e.g. "A3") would
+    # pass validation, then violate the memories.authority CHECK and abort
+    # the whole extraction transaction.
     claim = cand.get("authority_claim", "D1")
-    if claim not in {"A1", "A2", "B1", "C1", "D1"}:
+    if claim not in {"A1", "A2", "B1", "C1", "D1", "Q"}:
         claim = "D1"
+    cand["authority_claim"] = claim
     if claim == "A1":
+        # A1 = direct explicit USER statement: the quote must come from a
+        # cited user_message — agent text must not launder into top authority
         quote = (cand.get("evidence_quote") or "").strip()
-        cited = " \n ".join(source_texts.get(s, "") for s in srcs)
+        cited = " \n ".join(user_texts.get(s, "") for s in srcs)
         if not quote or quote.lower() not in cited.lower():
             cand["authority_claim"] = "A2"  # downgrade, don't reject
     # struct requirements
@@ -204,6 +215,8 @@ def run_extraction(session_id: str) -> dict:
 
         event_ids = {e["id"] for e in events}
         source_texts = {e["id"]: json.dumps(e["payload"]) for e in events}
+        user_texts = {e["id"]: json.dumps(e["payload"]) for e in events
+                      if e["kind"] == "user_message"}
         existing_ids = {m["id"] for m in existing}
         stats = {"ok": True, "proposed": len(candidates), "stored": 0, "held": 0,
                  "rejected": 0, "dedup": 0, "contradictions": 0, "statuses": {}}
@@ -212,7 +225,7 @@ def run_extraction(session_id: str) -> dict:
             if not isinstance(cand, dict):
                 stats["rejected"] += 1
                 continue
-            verdict, reason = _validate(cand, event_ids, source_texts)
+            verdict, reason = _validate(cand, event_ids, source_texts, user_texts)
             if verdict == "reject":
                 stats["rejected"] += 1
                 continue
@@ -225,7 +238,8 @@ def run_extraction(session_id: str) -> dict:
                     "VALUES (%s,'affirmed',%s,'restated in later session')",
                     (dup, session_id))
                 conn.execute(
-                    "UPDATE memories SET last_confirmed_at=now() WHERE id=%s", (dup,))
+                    "UPDATE memories SET last_confirmed_at=now(), "
+                    "useful_count = useful_count + 1 WHERE id=%s", (dup,))
                 stats["dedup"] += 1
                 continue
 
@@ -234,12 +248,14 @@ def run_extraction(session_id: str) -> dict:
             valid_to = (date.today() + timedelta(days=1)) if cand["type"] == "priming" else None
             conn.execute(
                 """INSERT INTO memories (id,type,text,struct,project,scope,sensitivity,
-                                         authority,confidence,status,valid_to,activation)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'candidate',%s,%s)""",
+                                         authority,confidence,status,valid_to,half_life_d,
+                                         activation)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'candidate',%s,%s,%s)""",
                 (mid, cand["type"], cand["text"].strip(), Jsonb(cand.get("struct") or {}),
                  cand.get("project") or project, cand.get("scope", "work_private"),
                  cand.get("sensitivity", "normal"), cand.get("authority_claim", "D1"),
                  float(cand["confidence"]), valid_to,
+                 None if cand["type"] == "identity" else CANDIDATE_HALF_LIFE_D,
                  Jsonb(cand.get("activation") or {})))
             for s in cand["source_event_ids"]:
                 conn.execute(
@@ -261,7 +277,9 @@ def run_extraction(session_id: str) -> dict:
             if status != "candidate":
                 conn.execute("UPDATE memories SET status=%s::mem_status WHERE id=%s",
                              (status, mid))
-                append_event(conn, kind="promotion", session_id=session_id, project=project,
+                append_event(conn,
+                             kind=("promotion" if status == "active" else "quarantine"),
+                             session_id=session_id, project=project,
                              payload={"memory_id": mid, "status": status,
                                       "type": cand["type"]})
             if verdict == "hold":

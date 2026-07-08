@@ -66,9 +66,8 @@ These are *not* the final architecture answers. They are the cheapest defensible
 │                                                              │
 │  /recall   sync, <700ms budget, serves the packet            │
 │  /capture  async ack-fast, queues ingestion                  │
-│  /admin    promotion queue, test harness, rebuild            │
+│  /admin    rebuild-indexes (queue = review CLI; eval: §7)    │
 │                                                              │
-│  In-RAM: hot memory set, compiled directive/warning tables   │
 │  Workers: ingestor, extractor (session-end), micro-sleep     │
 └──────────────┬───────────────────────────────┬───────────────┘
                │                               │
@@ -236,7 +235,7 @@ CREATE TABLE recall_log (
   query_text  TEXT,
   packet      JSONB,          -- exactly what was injected (audit + S12 diffing)
   latency_ms  INTEGER,
-  served      BOOLEAN         -- FALSE = fail-open occurred
+  served      BOOLEAN         -- TRUE by construction in the slice (a dead daemon can't log); kept for a future failure logger
 );
 CREATE TABLE miss_signals (
   id         BIGSERIAL PRIMARY KEY,
@@ -334,11 +333,11 @@ Capture never blocks the agent and never loses data even if extraction fails —
 
 | Failure | Behavior | Trace |
 |---|---|---|
-| daemon down at recall | fail-open, visible marker | `recall_log.served=false` |
+| daemon down at recall | fail-open, visible marker (hook-side; a dead daemon cannot log, so no recall_log row) | absent recall_log row for turn |
 | daemon down at capture | hook writes transcript path to `~/memory/spool/`; daemon drains spool on start | spool file |
-| extraction LLM error | raw already archived; extraction retried by micro-sleep | ledger `capture_ack` payload |
-| Postgres down | daemon serves hot-set-only recall from RAM snapshot; capture spools | `recall_log.packet.degraded` |
-| hook timeout (2s) | Claude Code proceeds; identical to fail-open | absent recall_log row for turn |
+| extraction LLM error | raw already archived; `extraction_run ok=false` recorded; retried by micro-sleep | ledger `extraction_run` payload |
+| Postgres down | `/recall` returns 500; hook fails open with visible marker; capture spools (RAM-snapshot recall is post-slice) | spool files + marker |
+| hook timeout | Claude Code proceeds; identical to fail-open | absent recall_log row for turn |
 
 ---
 

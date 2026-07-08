@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,27 +22,58 @@ from psycopg_pool import ConnectionPool
 
 # ----------------------------------------------------------------- config
 
+def _file_cfg() -> dict:
+    """~/memory/config.json, written by `memoryd install`.
+
+    Precedence everywhere is env > config.json > default — scheduled tasks
+    (schtasks/systemd/launchd) inherit no shell exports, so the file is what
+    makes autostarted daemons find the right DB. The file's *location* honors
+    MEMORYD_HOME env only; a `home` key inside it relocates data, not the file.
+    """
+    p = Path(os.environ.get("MEMORYD_HOME", "~/memory")).expanduser() / "config.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+_FILE_CFG = _file_cfg()
+# persisted env (e.g. ANTHROPIC_API_KEY) for scheduled runs; real env wins
+for _k, _v in (_FILE_CFG.get("env") or {}).items():
+    os.environ.setdefault(_k, str(_v))
+
+
+def _get(env: str, key: str, default: str) -> str:
+    return os.environ.get(env) or str(_FILE_CFG.get(key) or "") or default
+
+
 @dataclass
 class Config:
-    dsn: str = os.environ.get("MEMORYD_DSN", "postgresql://memoryd@localhost/memoryd")
-    home: Path = field(default_factory=lambda: Path(os.environ.get("MEMORYD_HOME", "~/memory")).expanduser())
-    port: int = int(os.environ.get("MEMORYD_PORT", "7437"))
-    packet_token_budget: int = int(os.environ.get("MEMORYD_PACKET_TOKENS", "1500"))
+    dsn: str = _get("MEMORYD_DSN", "dsn", "postgresql://memoryd@localhost/memoryd")
+    home: Path = field(default_factory=lambda: Path(
+        os.environ.get("MEMORYD_HOME") or _FILE_CFG.get("home") or "~/memory").expanduser())
+    port: int = int(_get("MEMORYD_PORT", "port", "7437"))
+    packet_token_budget: int = int(_get("MEMORYD_PACKET_TOKENS", "packet_tokens", "1500"))
     # per-agent memory visas (spec §6, governance). Override with
-    # MEMORYD_VISAS='{"hermes": ["work_private","public"], ...}'
+    # MEMORYD_VISAS='{"hermes": ["work_private","public"], ...}' or a
+    # "visas" object in config.json.
     default_scopes: tuple[str, ...] = ("work_private", "project_shared", "public")
 
     def visa(self, agent: str) -> list[str]:
+        visas = None
         raw = os.environ.get("MEMORYD_VISAS", "")
         if raw:
             try:
                 visas = json.loads(raw)
-                if agent in visas:
-                    return list(visas[agent])
-                if "*" in visas:
-                    return list(visas["*"])
             except json.JSONDecodeError:
-                pass
+                visas = None
+        if visas is None:
+            visas = _FILE_CFG.get("visas")
+        if isinstance(visas, dict):
+            if agent in visas:
+                return list(visas[agent])
+            if "*" in visas:
+                return list(visas["*"])
         return list(self.default_scopes)
 
     @property
@@ -61,19 +93,30 @@ class Config:
 
 CFG = Config()
 POOL: ConnectionPool | None = None
+_POOL_LOCK = threading.Lock()
 
 
 def pool() -> ConnectionPool:
     global POOL
     if POOL is None:
-        from psycopg.rows import tuple_row
+        with _POOL_LOCK:  # HTTP handler threads race the capture worker on first use
+            if POOL is None:
+                from psycopg.rows import tuple_row
 
-        def _reset(conn: psycopg.Connection) -> None:
-            # handlers may set dict_row for their checkout; never let that
-            # leak to the next borrower of the pooled connection
-            conn.row_factory = tuple_row
+                def _reset(conn: psycopg.Connection) -> None:
+                    # handlers may set dict_row for their checkout; never let that
+                    # leak to the next borrower of the pooled connection
+                    conn.row_factory = tuple_row
 
-        POOL = ConnectionPool(CFG.dsn, min_size=1, max_size=8, open=True, reset=_reset)
+                # timeout=5: while the DB is down (e.g. Docker still booting),
+                # fail requests fast instead of parking threads for 30s — the
+                # recall hook gave up at 1.5s anyway.
+                POOL = ConnectionPool(CFG.dsn, min_size=1, max_size=8, open=True,
+                                      timeout=5, reset=_reset)
+                # close at exit: Python 3.14 raises PythonFinalizationError
+                # when joining the pool's worker threads at shutdown
+                import atexit
+                atexit.register(POOL.close)
     return POOL
 
 # ----------------------------------------------------------------- ids

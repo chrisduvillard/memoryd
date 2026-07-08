@@ -54,8 +54,8 @@ def _resolve(conn, qid: int, approve: bool):
         return
     if approve and q["memory_id"]:
         if q["kind"] in ("promotion_request", "chaperone_hold"):
-            conn.execute("UPDATE memories SET status='active', last_confirmed_at=now() "
-                         "WHERE id=%s", (q["memory_id"],))
+            conn.execute("UPDATE memories SET status='active', last_confirmed_at=now(), "
+                         "useful_count = useful_count + 1 WHERE id=%s", (q["memory_id"],))
             conn.execute("INSERT INTO treatments (memory_id, kind, note) "
                          "VALUES (%s,'confirmed_by_user','approved via review CLI')",
                          (q["memory_id"],))
@@ -95,8 +95,8 @@ def main() -> None:
         elif cmd == "reject" and len(args) > 1:
             _resolve(conn, int(args[1]), False)
         elif cmd == "confirm" and len(args) > 1:
-            conn.execute("UPDATE memories SET status='active', last_confirmed_at=now() "
-                         "WHERE id=%s", (args[1],))
+            conn.execute("UPDATE memories SET status='active', last_confirmed_at=now(), "
+                         "useful_count = useful_count + 1 WHERE id=%s", (args[1],))
             conn.execute("INSERT INTO treatments (memory_id, kind, note) "
                          "VALUES (%s,'confirmed_by_user','direct confirm')", (args[1],))
             print("confirmed")

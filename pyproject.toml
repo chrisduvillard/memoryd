@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memoryd"
+dynamic = ["version"]
+description = "Shared long-term memory daemon for AI agents"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.2", "psycopg_pool>=3.2"]
+
+[project.scripts]
+memoryd = "memoryd.cli:main"
+
+[tool.hatch.version]
+path = "memoryd/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["memoryd"]
+
+# Ship migrations + the Hermes plugin inside the wheel so `pip install git+...`
+# works without a checkout. cli._resource_dir() falls back to the repo root for
+# editable installs. memoryd/hermes_plugin is copytree ammunition only — its
+# __init__ imports Hermes-runtime modules and must never be imported from here.
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "memoryd/migrations"
+"hermes_plugin/memoryd" = "memoryd/hermes_plugin"
