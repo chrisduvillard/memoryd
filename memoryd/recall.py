@@ -1,8 +1,10 @@
-"""Recall engine (M4): hot + FTS + warning lane -> court rules -> lane-budgeted packet.
+"""Recall engine (M4/M5): hot + FTS + vector + warning lane -> court rules
+-> lane-budgeted packet.
 
-Vector channel is deliberately stubbed until M5 (spec §8). Court is
-rule-based (P5): validity, activation, directive precedence, scope,
-canary. Every canary that reaches the filter is a hard alarm.
+Hybrid FTS + vector retrieval; the vector channel degrades to FTS-only if
+embedding fails (spec §4.2). Court is rule-based (P5): validity, activation,
+directive precedence, scope, canary. Every canary that reaches the filter
+is a hard alarm.
 """
 from __future__ import annotations
 
@@ -140,6 +142,15 @@ def build_packet(prompt: str, session_id: str, project: str | None,
         # FTS-only and logs the missing channel (spec §4.2 fallback).
         channels = ["hot", "fts", "warning"]
 
+        # Embed the prompt ONCE for both vector lanes (active + candidate);
+        # with a network embedder this halves per-turn latency/cost.
+        try:
+            from .embed import get_embedder, to_pgvector
+            query_vec = to_pgvector(get_embedder().embed([prompt])[0])
+            channels.append("vector")
+        except Exception:  # noqa: BLE001 — degrade to FTS-only
+            query_vec = None
+
         def _fts_rows(status: str, limit: int) -> list[dict]:
             if not fts_q:
                 return []
@@ -155,14 +166,9 @@ def build_packet(prompt: str, session_id: str, project: str | None,
                 {**params, "q": fts_q, "st": status}).fetchall()
 
         def _vec_rows(status: str, limit: int) -> list[dict]:
-            try:
-                from .embed import get_embedder, to_pgvector
-                emb = get_embedder()
-                qv = to_pgvector(emb.embed([prompt])[0])
-            except Exception:  # noqa: BLE001 — degrade to FTS-only
+            if query_vec is None:
                 return []
-            if "vector" not in channels:
-                channels.append("vector")
+            qv = query_vec
             return conn.execute(
                 f"""SELECT m.*, 1 - (e.embedding <=> %(qv)s::vector) AS cosine
                     FROM memories m JOIN mem_embeddings e ON e.memory_id = m.id
@@ -281,6 +287,9 @@ def build_packet(prompt: str, session_id: str, project: str | None,
             "channels": channels,
             "canary_alarms": canary_alarms, "ambiguity": ambiguity,
         }
+        # served is TRUE by construction: failed recalls never reach this
+        # INSERT, and a dead daemon can't log at all. Column kept for a
+        # future failure logger.
         conn.execute(
             """INSERT INTO recall_log (session_id, project, query_text, packet, latency_ms, served, agent)
                VALUES (%s,%s,%s,%s,%s,TRUE,%s)""",

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -28,9 +29,10 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts" / "_stubs"))   # verbatim upstream ABC
 sys.path.insert(0, str(REPO / "hermes_plugin"))        # the plugin package
 sys.path.insert(0, str(REPO))
+sys.stdout.reconfigure(encoding="utf-8")  # ✓/✗ on cp1252 Windows consoles
 
 os.environ["MEMORYD_LLM"] = "mock"
-MOCK = Path("/tmp/mock_llm_hermes.json")
+MOCK = Path(tempfile.gettempdir()) / "mock_llm_hermes.json"
 MOCK.write_text(json.dumps([]))  # extractor may legitimately find nothing
 os.environ["MEMORYD_LLM_MOCK_FILE"] = str(MOCK)
 
@@ -75,7 +77,7 @@ def q1(sql: str, *args):
 
 
 def main() -> int:
-    hermes_home = Path("/tmp/hermes_home_test")
+    hermes_home = Path(tempfile.gettempdir()) / "hermes_home_test"
     hermes_home.mkdir(exist_ok=True)
     (hermes_home / "memoryd.json").write_text(json.dumps(
         {"url": "http://127.0.0.1:7437", "project": "hermes-test"}))

@@ -29,11 +29,14 @@ def main() -> None:
     with pool().connection() as conn:
         conn.row_factory = dict_row
 
-        # retry: sessions captured but never successfully extracted
+        # retry: sessions captured (or failed mid-extraction — e.g. the Hermes
+        # /extract path, which never writes a capture_ack) but never
+        # successfully extracted
         pending = conn.execute(
             """SELECT DISTINCT e.session_id FROM events e
-               WHERE e.kind='capture_ack'
-                 AND e.payload->>'trigger' IN ('session_end','pre_compact')
+               WHERE ((e.kind='capture_ack'
+                       AND e.payload->>'trigger' IN ('session_end','pre_compact'))
+                      OR (e.kind='extraction_run' AND e.payload->>'ok'='false'))
                  AND NOT EXISTS (SELECT 1 FROM events x
                                  WHERE x.session_id=e.session_id
                                    AND x.kind='extraction_run'
@@ -41,7 +44,10 @@ def main() -> None:
                LIMIT 25""").fetchall()
         retried = 0
         for row in pending:
-            res = run_extraction(row["session_id"])
+            try:
+                res = run_extraction(row["session_id"])
+            except Exception:  # noqa: BLE001 — one bad session must not kill the night
+                continue
             if res.get("ok"):
                 retried += 1
         report.append(f"- extractions retried: {retried}/{len(pending)} pending")
@@ -91,13 +97,13 @@ def main() -> None:
         pend = conn.execute(
             "SELECT count(*) FROM review_queue WHERE NOT resolved").fetchone()["count"]
         report.append(f"\n## Needs you\n- pending reviews: {pend}"
-                      + ("  ← run `python -m memoryd.review queue`" if pend else ""))
+                      + ("  <- run `memoryd review queue`" if pend else ""))
 
         vetoes = conn.execute(
             """SELECT count(*) FROM events WHERE kind='veto'
                AND ts > now() - interval '1 day'""").fetchone()["count"]
         if vetoes:
-            report.append(f"- ⚠ canary/veto events in last 24h: {vetoes} — INVESTIGATE")
+            report.append(f"- [!] canary/veto events in last 24h: {vetoes} — INVESTIGATE")
 
         misses = conn.execute(
             """SELECT count(*) FROM miss_signals
@@ -105,15 +111,13 @@ def main() -> None:
         report.append(f"- retrieval-miss signals (24h): {misses}")
 
         recalls = conn.execute(
-            """SELECT count(*) AS n, coalesce(avg(latency_ms),0)::int AS avg_ms,
-                      count(*) FILTER (WHERE NOT served) AS failed
+            """SELECT count(*) AS n, coalesce(avg(latency_ms),0)::int AS avg_ms
                FROM recall_log WHERE ts > now() - interval '1 day'""").fetchone()
-        report.append(f"- recalls (24h): {recalls['n']}, avg {recalls['avg_ms']}ms, "
-                      f"fail-open: {recalls['failed']}")
+        report.append(f"- recalls (24h): {recalls['n']}, avg {recalls['avg_ms']}ms")
         conn.commit()
 
     out = CFG.home / "digest" / f"{date.today().isoformat()}.md"
-    out.write_text("\n".join(report) + "\n")
+    out.write_text("\n".join(report) + "\n", encoding="utf-8")
     print("\n".join(report))
     print(f"\nwritten: {out}")
 

@@ -46,39 +46,53 @@ sequenceDiagram
 - **Fail-open:** if the daemon is down, your agent keeps working and tells you memory was unavailable. It never blocks you.
 - **Everything is auditable:** every recalled packet is logged, every fact links back to the exact conversation that produced it.
 
-## Install (5 minutes)
+## Install (2 minutes)
 
-Requires: Linux/macOS, Python 3.11+, PostgreSQL 16 with [pgvector](https://github.com/pgvector/pgvector), `curl`, and `jq`.
+Works on **Windows, macOS, and Linux**. Requires Python 3.11+ and [Docker](https://www.docker.com/products/docker-desktop/) (for the database — or bring your own Postgres, see Appendix A).
 
 ```bash
-git clone https://github.com/chrisduvillard/memoryd && cd memoryd
-pip install -r requirements.txt
-
-# database
-./scripts/init_db.sh
-psql -d memoryd -f migrations/002_extraction.sql
-psql -d memoryd -f migrations/003_multi_agent.sql
-
-# daemon (run under systemd/launchd for real use)
-export MEMORYD_DSN="postgresql://$(whoami)@/memoryd?host=/var/run/postgresql"
-export ANTHROPIC_API_KEY=sk-...   # optional: enables fact extraction
-python3 -m memoryd.server
+export OPENROUTER_API_KEY=sk-or-...   # optional: enables fact extraction with
+                                      # any model (or ANTHROPIC_API_KEY)
+pip install git+https://github.com/chrisduvillard/memoryd
+memoryd install
+memoryd status                     # everything green? you're done.
 ```
 
-No API key? It runs in **capture-only mode**: everything is still archived, and extraction backfills later when you add a key.
+`memoryd install` does the rest, idempotently (safe to re-run any time):
+
+- starts a **PostgreSQL 16 + pgvector container** (`memoryd-pgvector`, localhost-only, persistent volume, restarts with Docker) and applies all migrations
+- writes `~/memory/config.json` so the daemon finds its database even when autostarted
+- registers the **Claude Code hooks** in `~/.claude/settings.json` (recall before every prompt, capture after every turn)
+- installs the **Hermes plugin** if `~/.hermes` exists (otherwise: re-run install after you install Hermes)
+- sets up **autostart**: the daemon at logon and the nightly consolidation at 03:05 (Task Scheduler on Windows, systemd user units on Linux, launchd on macOS) — then starts the daemon right away
+
+### Why the API key?
+
+memoryd doesn't need a key to *remember* — recording and archiving your conversations is free, local, and always on. The key powers the one step that needs intelligence: **once per session, an AI model reads the transcript and writes down the few facts worth keeping** ("prefers short commit messages", "never push to main on this repo"). Storing raw conversations is easy; deciding *what they mean* — what's a standing rule, what was just a passing thought — takes a language model, and that model runs behind an API.
+
+It's a single small API call per session (about a cent). No key? memoryd runs in **capture-only mode**: everything is still archived, nothing is lost, and the day you add a key it goes back and extracts memories from every session it recorded. Prefer no cloud at all? Point it at a local model (Ollama/LM Studio) — no key, no data leaves your machine.
+
+Pick your provider (env vars, or the `env` map in `~/memory/config.json`):
+
+| Provider | Setup |
+|---|---|
+| **OpenRouter** (recommended — one key, any vendor's model) | `OPENROUTER_API_KEY`; default model `google/gemini-3.5-flash`, override with `MEMORYD_LLM_MODEL=<any slug>` |
+| Anthropic | `ANTHROPIC_API_KEY` (default model: Claude Haiku 4.5) |
+| Local / keyless (Ollama, LM Studio) | `MEMORYD_LLM=openai` + `MEMORYD_LLM_BASE=http://localhost:11434/v1` + `MEMORYD_LLM_MODEL=<model>` |
+
+The OpenRouter default was picked empirically: six small models benchmarked through memoryd's own extraction pipeline and scored by its validator (does the standing rule land? does "might switch to X" stay uncommitted? are citations real?) — `gemini-3.5-flash` extracted the rules most reliably with zero malformed outputs.
+
+> **Semantic search note:** the default embedder is a dependency-free lexical hash — good enough to try memoryd offline, but it won't match paraphrases. For real use set `MEMORYD_EMBED=voyage` (or `openai`, incl. Ollama/LM Studio) — see [docs/REFERENCE.md](docs/REFERENCE.md).
 
 ### Connect Claude Code
 
-```bash
-mkdir -p ~/memory/hooks && cp hooks/*.sh ~/memory/hooks/
-# merge hooks/settings.snippet.json into ~/.claude/settings.json
-```
-That's it — recall and capture now run on every turn.
+Done by `memoryd install` — recall and capture run on every turn. For manual setups, see `hooks/settings.snippet.json`.
 
 ### Connect Hermes Agent
 
+If `~/.hermes` existed at install time the plugin is already in place; otherwise re-run `memoryd install`. Then activate it:
+
 ```bash
-cp -r hermes_plugin/memoryd ~/.hermes/plugins/memory/memoryd
 hermes config set memory.provider memoryd
 hermes memoryd status   # should show the daemon is healthy
 ```
@@ -90,25 +104,37 @@ Both agents now share one memory: what Claude Code learns, Hermes knows, and vic
 You mostly do nothing. Occasionally:
 
 ```bash
-python3 -m memoryd.review queue        # approve/reject pending memories (~1 min)
-python3 -m memoryd.review approve 3
-cat ~/memory/digest/$(date +%F).md     # daily health report
-```
-
-Add the nightly consolidation to cron:
-
-```bash
-5 3 * * *  MEMORYD_DSN=... python3 -m memoryd.microsleep
+memoryd status                     # is everything actually working?
+memoryd review queue               # approve/reject pending memories (~1 min)
+memoryd review approve 3
+cat ~/memory/digest/$(date +%F).md # daily health report (written nightly)
 ```
 
 ## Verify your install
 
 ```bash
-python3 scripts/smoke_test.py      # 19 checks: storage integrity, recall, canaries
-python3 scripts/test_extract.py    # 18 checks: fact extraction & promotion rules
-python3 scripts/test_vector.py     # 13 checks: semantic search & index rebuild
-python3 scripts/test_hermes.py     # 23 checks: Hermes plugin lifecycle
+memoryd status                     # daemon, DB, hooks, autostart, spool backlog
+python scripts/smoke_test.py       # 19 checks: storage integrity, recall, canaries
+python scripts/test_extract.py     # 20 checks: fact extraction & promotion rules
+python scripts/test_vector.py      # 13 checks: semantic search & index rebuild
+python scripts/test_hermes.py      # 23 checks: Hermes plugin lifecycle
 ```
+
+(The test scripts write throwaway `smoketest`/test rows into your live database; fine for a fresh install.)
+
+## Appendix A — manual install (bring your own Postgres, no Docker)
+
+Point `MEMORYD_DSN` at any PostgreSQL 16 database with pgvector **before** running `memoryd install` — it will skip Docker and use yours:
+
+```bash
+./scripts/init_db.sh               # or let `memoryd install` apply migrations
+export MEMORYD_DSN="postgresql://$(whoami)@/memoryd?host=/var/run/postgresql"
+memoryd install
+```
+
+To run everything by hand instead: `memoryd serve` in the foreground, `memoryd microsleep` nightly via cron, and merge `hooks/settings.snippet.json` into `~/.claude/settings.json` (replace `<PYTHON>` with your interpreter).
+
+**Security note:** the Docker container uses the password `memoryd` and binds `127.0.0.1` only. If you expose Postgres beyond localhost, change the password and the DSN in `~/memory/config.json`.
 
 ## Learn more
 
@@ -117,7 +143,7 @@ python3 scripts/test_hermes.py     # 23 checks: Hermes plugin lifecycle
 
 ## Status
 
-Early but real: 73 automated checks, tested end-to-end against live Postgres. Built as a "thin vertical slice" of a larger architecture — temporal knowledge graph, more agents, and an audit UI are on the roadmap, gated on evidence from real-world use.
+Early but real: 75 automated checks, tested end-to-end against live Postgres. Built as a "thin vertical slice" of a larger architecture — temporal knowledge graph, more agents, and an audit UI are on the roadmap, gated on evidence from real-world use.
 
 ## License
 

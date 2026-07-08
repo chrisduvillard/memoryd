@@ -3,9 +3,11 @@
 Deliberately zero web-framework dependencies: the daemon must be boring,
 auditable, and installable anywhere. Endpoints (spec §2):
 
-  POST /recall        sync, budgeted -> {markdown, latency_ms, ...}
-  POST /capture       ack-fast 202; ingestion queued (spool-backed)
-  POST /miss          manual/heuristic miss signal
+  POST /recall          sync, budgeted -> {markdown, latency_ms, ...}
+  POST /capture         ack-fast 202; ingestion queued (spool-backed)
+  POST /capture-events  direct event ingestion (Hermes provider)
+  POST /extract         queue extraction for a session
+  POST /miss            manual/heuristic miss signal
   GET  /health
   POST /admin/rebuild-indexes   (S12: drop + regenerate disposable indexes)
 """
@@ -181,12 +183,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
 
+def _drain_spool_bg() -> None:
+    try:
+        drained = drain_spool()
+        if drained:
+            print(f"memoryd: drained {drained} spooled capture(s)")
+    except Exception as e:  # noqa: BLE001 — spool retries on next start/microsleep
+        print(f"memoryd: spool drain failed: {e}")
+
+
 def main() -> None:
     CFG.ensure_dirs()
     threading.Thread(target=_capture_worker, daemon=True).start()
-    drained = drain_spool()
-    if drained:
-        print(f"memoryd: drained {drained} spooled capture(s)")
+    # background: with the DB down (Docker still booting at logon), a
+    # synchronous drain would block the socket bind for pool-timeout × N files
+    threading.Thread(target=_drain_spool_bg, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
     print(f"memoryd listening on 127.0.0.1:{CFG.port}  home={CFG.home}")
     try:

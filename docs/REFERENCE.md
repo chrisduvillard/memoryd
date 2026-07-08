@@ -10,7 +10,7 @@ canary fixtures for live use, the S2 pairwise-rating harness, and the frozen
 scenario repo. (Court rules, canary catching, S12 rebuild, and miss logging
 already exist and are tested.)
 
-## What is verified (73 checks: smoke 19 + extract 18 + vector/S12 13 + hermes 23)
+## What is verified (75 checks: smoke 19 + extract 20 + vector/S12 13 + hermes 23)
 
 - Ledger is append-only (UPDATE/DELETE rejected by trigger)
 - Ariadne rule: a memory cannot become `active` without a source event
@@ -21,29 +21,36 @@ already exist and are tested.)
   channel over extracted terms; packet cites `mem_` ids; <700 ms
 - Canary memories are caught by the court (never surface) **and** raise an alarm
 
-## Setup (Linux/macOS, Postgres 16)
+## Setup (Windows/macOS/Linux)
 
 ```bash
-# 1. Postgres 16 + pgvector (extension only needed from M5, but schema expects it)
-#    Ubuntu: apt install postgresql-16; build pgvector from github.com/pgvector/pgvector
-# 2. Database
-MEMORYD_DB=memoryd MEMORYD_ROLE=$(whoami) ./scripts/init_db.sh
-psql -d memoryd -f migrations/002_extraction.sql
-psql -d memoryd -f migrations/003_multi_agent.sql
+pip install git+https://github.com/chrisduvillard/memoryd
+memoryd install     # Docker pgvector DB + all migrations + hooks + autostart
+memoryd status      # verify
+python scripts/smoke_test.py    # expects daemon running; 19/19 must pass
+```
 
-# 3. Daemon
+Manual path (bring your own Postgres 16 + pgvector; no Docker):
+
+```bash
+# 1. Database (applies ALL migrations)
+MEMORYD_DB=memoryd MEMORYD_ROLE=$(whoami) ./scripts/init_db.sh
+
+# 2. Daemon
 pip install -r requirements.txt
 export MEMORYD_DSN="postgresql://$(whoami)@/memoryd?host=/var/run/postgresql"  # peer auth
 export MEMORYD_HOME="$HOME/memory"
-python3 -m memoryd.server        # run under systemd/launchd for real use
+memoryd serve                    # or: python3 -m memoryd serve
 
-# 4. Hooks
-mkdir -p ~/memory/hooks && cp hooks/*.sh ~/memory/hooks/
-# merge hooks/settings.snippet.json into ~/.claude/settings.json
-
-# 5. Verify
-python3 scripts/smoke_test.py    # expects daemon running; 19/19 must pass
+# 3. Hooks: merge hooks/settings.snippet.json into ~/.claude/settings.json
+#    (replace <PYTHON> with the interpreter that has memoryd installed)
 ```
+
+**Config precedence** (everywhere): environment variable > `~/memory/config.json`
+(written by `memoryd install`; keys `dsn`, `port`, `home`, `visas`, plus an
+`env` map applied via setdefault — how autostarted daemons get e.g.
+`ANTHROPIC_API_KEY`) > built-in default. The config file's *location* honors
+only the `MEMORYD_HOME` env var.
 
 ## Layout
 
@@ -52,10 +59,13 @@ migrations/001_init.sql   canonical schema + firebreak triggers (spec §3)
 memoryd/core.py           config, ULIDs, episodic barcodes, archive, ledger
 memoryd/ingest.py         Claude Code transcript JSONL → archive + events
 memoryd/recall.py         hot/FTS/warning channels, court rules, lane budgets
-memoryd/server.py         stdlib HTTP daemon: /recall /capture /miss /health /admin
-hooks/recall_hook.sh      UserPromptSubmit → inject packet (fail-open, visible marker)
-hooks/capture_hook.sh     Stop/SessionEnd/PreCompact → capture (spool on failure)
-scripts/init_db.sh        role + db + migration
+memoryd/server.py         stdlib HTTP daemon: /recall /capture /capture-events
+                          /extract /miss /health /admin/rebuild-indexes
+memoryd/hook.py           Claude Code hooks (stdlib, cross-platform):
+                          recall → inject packet (fail-open, visible marker);
+                          capture → POST /capture (spool on failure)
+memoryd/cli.py            memoryd install|status|serve|review|microsleep|uninstall
+scripts/init_db.sh        role + db + ALL migrations (manual/psql path)
 scripts/smoke_test.py     the 19-check verification suite
 ```
 
@@ -82,8 +92,13 @@ scripts/smoke_test.py     the 19-check verification suite
   review (never auto-supersede), idempotent re-runs.
 - `memoryd/llm.py` — provider abstraction. `MEMORYD_LLM=anthropic` (default
   when ANTHROPIC_API_KEY is set; model via MEMORYD_LLM_MODEL, default
-  claude-haiku-4-5-20251001) or `mock` for tests. No key -> capture-only
-  mode; extraction backfills later via micro-sleep retry.
+  claude-haiku-4-5-20251001), `openrouter` (default when only
+  OPENROUTER_API_KEY is set; any vendor's model via MEMORYD_LLM_MODEL slugs,
+  default `google/gemini-3.5-flash` — validator-benchmarked), `openai` (any OpenAI-compatible
+  /chat/completions — set MEMORYD_LLM_BASE, e.g.
+  `http://localhost:11434/v1` for keyless local Ollama), or `mock` for
+  tests. No key -> capture-only mode; extraction backfills later via
+  micro-sleep retry.
 - `memoryd/review.py` — human control plane CLI:
   `queue | mem <id> | approve <qid> | reject <qid> | confirm <id> | supersede <old> <new>`.
   Approving a contradiction promotes the new memory and supersedes the old.
