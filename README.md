@@ -1,5 +1,7 @@
 # memoryd
 
+[![tests](https://github.com/chrisduvillard/memoryd/actions/workflows/tests.yml/badge.svg)](https://github.com/chrisduvillard/memoryd/actions/workflows/tests.yml)
+
 **Shared long-term memory for your AI agents.**
 
 Claude Code forgets everything between sessions. So does Hermes, Codex, and every other agent. memoryd is a small local daemon that gives them all one shared, permanent memory — automatically, on every turn, with you in control of what gets remembered.
