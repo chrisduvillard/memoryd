@@ -12,8 +12,6 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-import psycopg
-
 from .core import CFG, append_event, archive_file, pool
 
 
@@ -135,6 +133,6 @@ def drain_spool() -> int:
             if res.get("ok"):
                 f.unlink()
                 drained += 1
-        except (json.JSONDecodeError, KeyError, psycopg.Error):
-            continue  # leave in spool for next drain
+        except Exception:  # noqa: BLE001 — one bad job (e.g. LLM misconfig raising
+            continue        # LLMError) must not abort the drain or the nightly run
     return drained

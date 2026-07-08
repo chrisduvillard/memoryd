@@ -207,19 +207,28 @@ def write_config(dsn: str) -> Path:
         cfg = {}
     cfg["dsn"] = dsn
     cfg.setdefault("port", 7437)
-    cfg["home"] = str(home)
-    persist = [k for k in ("ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY",
-                           "VOYAGE_API_KEY", "MEMORYD_LLM", "MEMORYD_LLM_BASE",
-                           "MEMORYD_LLM_MODEL", "MEMORYD_EMBED", "MEMORYD_EMBED_BASE",
-                           "MEMORYD_EMBED_MODEL")
-               if os.environ.get(k) and not (cfg.get("env") or {}).get(k)]
-    if persist:
+    # data dir: honor an explicit MEMORYD_HOME, else preserve any existing
+    # custom "home" (relocated archive/spool/digest) — don't reset it on re-run
+    if os.environ.get("MEMORYD_HOME") or "home" not in cfg:
+        cfg["home"] = str(home)
+    keys = ("ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY",
+            "VOYAGE_API_KEY", "MEMORYD_LLM", "MEMORYD_LLM_BASE",
+            "MEMORYD_LLM_MODEL", "MEMORYD_EMBED", "MEMORYD_EMBED_BASE",
+            "MEMORYD_EMBED_MODEL")
+    existing = cfg.get("env") or {}
+    changed = [k for k in keys if os.environ.get(k) and existing.get(k) != os.environ[k]]
+    if changed:
         env = cfg.setdefault("env", {})
-        for k in persist:
-            env[k] = os.environ[k]
-        print(f"  config     persisted {', '.join(persist)} so scheduled runs "
+        for k in changed:
+            env[k] = os.environ[k]  # env wins on install so key rotation takes effect
+        print(f"  config     persisted {', '.join(changed)} so scheduled runs "
               "use them; edit config.json's env map to change")
     p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    if sys.platform != "win32":  # the file holds API keys — keep it owner-only
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
     return p
 
 

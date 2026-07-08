@@ -118,7 +118,7 @@ class MockClient:
     def complete(self, system: str, user: str, max_tokens: int = 4000) -> str:
         if not self.fixture.exists():
             raise LLMError(f"mock fixture missing: {self.fixture}")
-        return self.fixture.read_text()
+        return self.fixture.read_text(encoding="utf-8")
 
 
 def get_client():
