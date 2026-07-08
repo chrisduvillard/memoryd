@@ -1,0 +1,9 @@
+name: memoryd
+version: 0.1.0
+description: "Agent-agnostic canonical memory substrate (memoryd daemon): deterministic per-turn recall, full-capture event ledger, governed promotion, cross-agent shared memory with per-agent visas."
+hooks:
+  - on_session_end
+  - on_session_switch
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation

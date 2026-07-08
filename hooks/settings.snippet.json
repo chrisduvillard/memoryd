@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "~/memory/hooks/recall_hook.sh", "timeout": 2 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "~/memory/hooks/capture_hook.sh stop" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "~/memory/hooks/capture_hook.sh session_end" } ] }
+    ],
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "~/memory/hooks/capture_hook.sh pre_compact" } ] }
+    ]
+  }
+}
