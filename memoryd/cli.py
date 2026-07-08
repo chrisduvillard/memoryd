@@ -214,7 +214,10 @@ def write_config(dsn: str) -> Path:
     keys = ("ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY",
             "VOYAGE_API_KEY", "MEMORYD_LLM", "MEMORYD_LLM_BASE",
             "MEMORYD_LLM_MODEL", "MEMORYD_EMBED", "MEMORYD_EMBED_BASE",
-            "MEMORYD_EMBED_MODEL")
+            "MEMORYD_EMBED_MODEL", "MEMORYD_MODEL_PROFILE",
+            "MEMORYD_EXTRACTOR_CONTRACT", "MEMORYD_SEMANTIC_POLICY",
+            "MEMORYD_RECALL_POLICY",
+            "MEMORYD_PACKET_COMPILER", "MEMORYD_EVAL_PROFILE")
     existing = cfg.get("env") or {}
     changed = [k for k in keys if os.environ.get(k) and existing.get(k) != os.environ[k]]
     if changed:

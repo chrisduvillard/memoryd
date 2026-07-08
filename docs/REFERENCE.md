@@ -10,7 +10,7 @@ canary fixtures for live use, the S2 pairwise-rating harness, and the frozen
 scenario repo. (Court rules, canary catching, S12 rebuild, and miss logging
 already exist and are tested.)
 
-## What is verified (75 checks: smoke 19 + extract 20 + vector/S12 13 + hermes 23)
+## What is verified
 
 - Ledger is append-only (UPDATE/DELETE rejected by trigger)
 - Ariadne rule: a memory cannot become `active` without a source event
@@ -20,6 +20,9 @@ already exist and are tested.)
 - Recall: directives/warnings always in Lane 1; hot set in Lane 2; FTS precision
   channel over extracted terms; packet cites `mem_` ids; <700 ms
 - Canary memories are caught by the court (never surface) **and** raise an alarm
+- Bitter-Lesson extension points are DB-free tested: model profiles,
+  extraction contracts, recall policies, adapter envelopes, source packing,
+  static eval, admin endpoint registration, and migration shape
 
 ## Setup (Windows/macOS/Linux)
 
@@ -64,6 +67,12 @@ memoryd/server.py         stdlib HTTP daemon: /recall /capture /capture-events
 memoryd/hook.py           Claude Code hooks (stdlib, cross-platform):
                           recall → inject packet (fail-open, visible marker);
                           capture → POST /capture (spool on failure)
+memoryd/model_gateway.py  model profiles + capability metadata
+memoryd/contracts.py      versioned extraction contracts
+memoryd/semantic_policies.py semantic validation + promotion policies
+memoryd/policies.py       versioned recall policies + packet compilers
+memoryd/source_pack.py    deterministic source packing for extraction/replay
+memoryd/evaluator.py      static eval core used by admin + microsleep
 memoryd/cli.py            memoryd install|status|serve|review|microsleep|uninstall
 scripts/init_db.sh        role + db + ALL migrations (manual/psql path)
 scripts/smoke_test.py     the 19-check verification suite
@@ -129,6 +138,47 @@ scripts/smoke_test.py     the 19-check verification suite
 overlap, but it is NOT semantic — paraphrases with disjoint vocabulary will
 miss. For the trial month set `MEMORYD_EMBED=voyage` or point `openai` at a
 local Ollama (e.g. nomic-embed-text) to stay fully local.
+
+## Bitter-Lesson extension layer (migration 005)
+
+The v1 safety substrate stays deterministic, but the model-facing parts are now
+versioned and replayable instead of frozen in code:
+
+- `memoryd/model_gateway.py` exposes model profiles and capabilities via
+  `MEMORYD_MODEL_PROFILE` while preserving the old `MEMORYD_LLM*` defaults.
+- `memoryd/contracts.py` holds extraction contracts such as `builtin_v1` and
+  `wide_context_v1`; extraction records `model_runs` when migration 005 exists.
+- `memoryd/semantic_policies.py` holds semantic validation and promotion
+  policies. `conservative_v1` reproduces the current hedge-preservation and
+  auto-promotion behavior.
+- `memoryd/policies.py` holds recall policies and packet compiler profiles.
+  The default `heuristic_v1` reproduces the previous fixed lanes and rerank
+  weights; `oracle_v1` exists for eval comparisons.
+- `memoryd/source_pack.py` renders deterministic extraction source packets and
+  can pull archived blobs for wide-context contracts.
+- `memoryd/adapters.py` defines the stable adapter envelope used by direct event
+  ingestion so future runtimes do not define memory semantics at the edge.
+- `memoryd/evaluator.py` powers `/admin/eval` and nightly micro-sleep evals.
+
+New config keys: `MEMORYD_MODEL_PROFILE`, `MEMORYD_EXTRACTOR_CONTRACT`,
+`MEMORYD_SEMANTIC_POLICY`, `MEMORYD_RECALL_POLICY`, `MEMORYD_PACKET_COMPILER`, and
+`MEMORYD_EVAL_PROFILE`. Defaults reproduce current behavior.
+
+New evidence/admin endpoints:
+
+```text
+POST /admin/model-profiles   list model profiles and capabilities
+POST /admin/policies         list recall policies, packet compilers, contracts
+POST /admin/eval             run static eval cases and record eval_runs
+POST /admin/replay           return recent recall_log replay material
+POST /admin/export-evidence  export recent model/policy/eval/packet runs
+```
+
+New tables: `memory_type_registry`, `event_type_registry`, `model_runs`,
+`policy_runs`, `eval_cases`, `eval_runs`, and `packet_runs`. Migration 005 also
+opens `memories.type` to text and removes the closed `events.kind` constraint;
+the current built-in ontology is seeded into registries instead of being a DB
+wall.
 
 ## Hermes Agent integration (hermes_plugin/memoryd/)
 

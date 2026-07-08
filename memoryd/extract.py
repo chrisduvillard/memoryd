@@ -14,64 +14,31 @@ the validator, so a worse model degrades recall quality, never integrity.
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from .contracts import VALID_TYPES as CONTRACT_TYPES, get_extractor_contract
 from .core import append_event, new_id, pool
 from .llm import LLMError, get_client
+from .model_gateway import get_model_profile
+from .semantic_policies import get_semantic_policy
+from .source_pack import PackedSources, pack_session_events
 
-VALID_TYPES = {
-    "identity", "preference", "writing_style", "project_state", "decision",
-    "open_question", "commitment", "person", "company", "technical_fact",
-    "workflow", "constraint", "procedure", "directive", "warning", "priming",
-}
-AUTO_ACTIVE_TYPES = {"directive", "decision", "constraint", "commitment"}
+VALID_TYPES = set(CONTRACT_TYPES)
+AUTO_ACTIVE_TYPES = set(get_semantic_policy("conservative_v1").auto_active_types)
 
 # Unrecalled, unconfirmed candidates decay after ~1 month (microsleep);
 # NULL = no decay (identity tier, ARCHITECTURE §3.3).
-CANDIDATE_HALF_LIFE_D = 30
+CANDIDATE_HALF_LIFE_D = get_semantic_policy("conservative_v1").candidate_half_life_days
 
-HEDGES = re.compile(r"\b(might|maybe|perhaps|considering|could|thinking about|"
-                    r"not sure|possibly|leaning|tempted|later)\b", re.I)
-COMMITTAL = re.compile(r"\b(will|decided|is going to|chose|has chosen|must|"
-                       r"always|definitely)\b", re.I)
+HEDGES = get_semantic_policy("conservative_v1").hedges
+COMMITTAL = get_semantic_policy("conservative_v1").committal
 
-SYSTEM_PROMPT = """You extract durable memories from an agent-session transcript.
-
-Return ONLY a JSON array. Each element:
-{
- "type": one of [identity, preference, writing_style, project_state, decision,
-         open_question, commitment, person, company, technical_fact, workflow,
-         constraint, procedure, directive, warning, priming],
- "text": one well-formed, fully-scoped sentence or short paragraph,
- "struct": {},            // REQUIRED for directive: {"directive","condition","expires","severity"}
-                          // REQUIRED for warning:   {"class","target","severity"}
-                          // decision: {"options","chosen","rationale"}
- "project": string|null,  // null = global
- "scope": "work_private"|"project_shared"|"personal_private"|"public",
- "sensitivity": "public"|"normal"|"private"|"sealed",
- "authority_claim": "A1"|"A2"|"B1"|"C1"|"D1",
- "confidence": 0..1,
- "activation": {"task_type":[],"audience":[],"exclude":[]},
- "source_event_ids": [ids from the transcript — REQUIRED, must be real],
- "evidence_quote": "verbatim snippet from a cited event (REQUIRED for A1)",
- "duplicate_of": "mem_id or null",   // if it restates an EXISTING memory below
- "contradicts": ["mem_id", ...]      // existing memories this conflicts with
-}
-
-Hard rules:
-- PRESERVE HEDGES. "might switch to Qdrant" extracts as *considering, no
-  decision made* — never as a decision or commitment.
-- A1 only for direct explicit user statements, with evidence_quote.
-- Extract FEW, DURABLE items. Session chatter, one-off details, and anything
-  already covered by an existing memory (use duplicate_of) should not become
-  new candidates. Zero candidates is a valid answer.
-- Never invent source_event_ids.
-- warnings: failed attempts, fragile files, user-stated boundaries.
-- directives: explicit standing instructions from the user."""
+SYSTEM_PROMPT = get_extractor_contract("builtin_v1").system_prompt
 
 
 # ------------------------------------------------------------------ gather
@@ -93,12 +60,35 @@ def _existing_memories(conn, project: str | None) -> list[dict]:
 
 
 def _render_transcript(events: list[dict]) -> str:
-    lines = []
-    for e in events:
-        p = e["payload"] or {}
-        body = p.get("text") or p.get("summary") or json.dumps(p)[:300]
-        lines.append(f"[{e['id']}] {e['kind']}: {body}")
-    return "\n".join(lines)[:60000]
+    return pack_session_events(events, max_chars=60000).text
+
+
+def _pack_transcript(events: list[dict], *, profile, contract) -> PackedSources:
+    default_chars = 60000
+    if contract.source_packer == "wide_context_v1" or "long_context" in profile.capabilities:
+        default_chars = min(profile.max_context_tokens * 4, 200000)
+    max_chars = int(os.environ.get("MEMORYD_SOURCE_PACK_CHARS", str(default_chars)))
+    return pack_session_events(
+        events,
+        max_chars=max_chars,
+        include_archived=contract.source_packer == "wide_context_v1",
+    )
+
+
+def _record_model_run(conn, *, profile, operation: str, contract: str | None,
+                      prompt: str, output: str = "", ok: bool = True,
+                      error: str | None = None, metadata: dict | None = None) -> None:
+    try:
+        conn.execute(
+            """INSERT INTO model_runs (id, profile, provider, model, operation,
+                                      contract, prompt_chars, output_chars, ok,
+                                      error, metadata)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (new_id("run"), profile.name, profile.provider, profile.model,
+             operation, contract, len(prompt), len(output), ok,
+             error[:1000] if error else None, Jsonb(metadata or {})))
+    except Exception:  # noqa: BLE001 - old DBs may not have migration 005 yet
+        pass
 
 
 # ------------------------------------------------------------------ validate
@@ -147,11 +137,8 @@ def _validate(cand: dict, event_ids: set[str], source_texts: dict[str, str],
         return "hold", "warning missing struct fields"
     # hedge preservation: cited sources hedge, candidate commits -> hold
     cited = " ".join(source_texts.get(s, "") for s in srcs)
-    if HEDGES.search(cited) and COMMITTAL.search(text):
-        cw = set(re.findall(r"[a-z]{4,}", text.lower()))
-        hw = set(re.findall(r"[a-z]{4,}", cited.lower()))
-        if len(cw & hw) >= 2:
-            return "hold", "possible hedge violation (source hedges, candidate commits)"
+    if get_semantic_policy().hedge_violation(cited, text):
+        return "hold", "possible hedge violation (source hedges, candidate commits)"
     return "ok", ""
 
 
@@ -159,21 +146,19 @@ def _validate(cand: dict, event_ids: set[str], source_texts: dict[str, str],
 
 def _promote(cand: dict) -> str:
     """Quorum-lite per spec §5.3. Stingy by design (P6)."""
-    if cand.get("scope") == "untrusted_external" or cand.get("authority_claim") == "Q":
-        return "quarantined"
-    if cand["type"] == "identity" and not cand.get("project"):
-        return "candidate"  # never auto-active; review row opens promotion_request
-    if cand["type"] == "priming":
-        return "active"  # time-boxed below
-    if cand.get("authority_claim") == "A1" and cand["type"] in AUTO_ACTIVE_TYPES:
-        return "active"
-    return "candidate"
+    return get_semantic_policy().promote(cand)
 
 
 # ------------------------------------------------------------------ main
 
 def run_extraction(session_id: str) -> dict:
-    client = get_client()
+    profile = get_model_profile()
+    contract = get_extractor_contract(
+        os.environ.get("MEMORYD_EXTRACTOR_CONTRACT")
+        or profile.preferred_extractor_contract)
+    # Preserve legacy capture-only behavior: an inferred mock profile is only
+    # metadata unless the user explicitly selected MEMORYD_MODEL_PROFILE=mock.
+    client = get_client(profile if os.environ.get("MEMORYD_MODEL_PROFILE") else None)
     if client is None:
         return {"ok": False, "skipped": "no LLM configured (capture-only mode)"}
 
@@ -189,14 +174,20 @@ def run_extraction(session_id: str) -> dict:
             return {"ok": True, "skipped": "already extracted"}
 
         existing = _existing_memories(conn, project)
+        packed = _pack_transcript(events, profile=profile, contract=contract)
         user_msg = (
             "EXISTING MEMORIES (for duplicate_of / contradicts):\n"
             + "\n".join(f"[{m['id']}] ({m['type']},{m['status']}) {m['text']}" for m in existing)
-            + "\n\nTRANSCRIPT EVENTS:\n" + _render_transcript(events)
+            + "\n\nTRANSCRIPT EVENTS:\n" + packed.text
         )
         try:
-            raw = client.complete(SYSTEM_PROMPT, user_msg)
+            raw = client.complete(
+                contract.system_prompt, user_msg, max_tokens=contract.max_output_tokens)
         except LLMError as e:
+            _record_model_run(
+                conn, profile=profile, operation="extract",
+                contract=contract.name, prompt=user_msg, ok=False,
+                error=str(e), metadata=packed.to_dict())
             append_event(conn, kind="extraction_run", session_id=session_id, project=project,
                          meta=True, payload={"ok": False, "error": str(e)[:500]})
             conn.commit()
@@ -208,10 +199,18 @@ def run_extraction(session_id: str) -> dict:
             candidates = json.loads(raw)
             assert isinstance(candidates, list)
         except (json.JSONDecodeError, AssertionError):
+            _record_model_run(
+                conn, profile=profile, operation="extract",
+                contract=contract.name, prompt=user_msg, output=raw,
+                ok=False, error="unparseable LLM output",
+                metadata=packed.to_dict())
             append_event(conn, kind="extraction_run", session_id=session_id, project=project,
                          meta=True, payload={"ok": False, "error": "unparseable LLM output"})
             conn.commit()
             return {"ok": False, "error": "unparseable LLM output"}
+        _record_model_run(
+            conn, profile=profile, operation="extract", contract=contract.name,
+            prompt=user_msg, output=raw, ok=True, metadata=packed.to_dict())
 
         event_ids = {e["id"] for e in events}
         source_texts = {e["id"]: json.dumps(e["payload"]) for e in events}
@@ -246,6 +245,7 @@ def run_extraction(session_id: str) -> dict:
             mid = new_id("mem")
             status = "candidate" if verdict == "hold" else _promote(cand)
             valid_to = (date.today() + timedelta(days=1)) if cand["type"] == "priming" else None
+            semantic_policy = get_semantic_policy()
             conn.execute(
                 """INSERT INTO memories (id,type,text,struct,project,scope,sensitivity,
                                          authority,confidence,status,valid_to,half_life_d,
@@ -255,8 +255,8 @@ def run_extraction(session_id: str) -> dict:
                  cand.get("project") or project, cand.get("scope", "work_private"),
                  cand.get("sensitivity", "normal"), cand.get("authority_claim", "D1"),
                  float(cand["confidence"]), valid_to,
-                 None if cand["type"] == "identity" else CANDIDATE_HALF_LIFE_D,
-                 Jsonb(cand.get("activation") or {})))
+                  None if cand["type"] == "identity" else semantic_policy.candidate_half_life_days,
+                  Jsonb(cand.get("activation") or {})))
             for s in cand["source_event_ids"]:
                 conn.execute(
                     "INSERT INTO memory_sources (memory_id,event_id) VALUES (%s,%s) "
@@ -310,6 +310,11 @@ def run_extraction(session_id: str) -> dict:
             stats["statuses"][mid] = status
 
         append_event(conn, kind="extraction_run", session_id=session_id, project=project,
-                     meta=True, payload={k: v for k, v in stats.items() if k != "statuses"})
+                     meta=True, payload={
+                         **{k: v for k, v in stats.items() if k != "statuses"},
+                         "model_profile": profile.name,
+                         "extractor_contract": contract.name,
+                         "source_pack": packed.to_dict(),
+                     })
         conn.commit()
         return stats

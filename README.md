@@ -137,7 +137,7 @@ cat ~/memory/digest/$(date +%F).md # daily health report (written nightly)
 ## ✅ Verify your install
 
 <details>
-<summary><strong>Run the full check suite</strong> — <code>memoryd status</code> + four test scripts (75 checks)</summary>
+<summary><strong>Run the full check suite</strong> — <code>memoryd status</code> + test scripts</summary>
 
 <br>
 
@@ -147,9 +147,12 @@ python scripts/smoke_test.py       # 19 checks: storage integrity, recall, canar
 python scripts/test_extract.py     # 20 checks: fact extraction & promotion rules
 python scripts/test_vector.py      # 13 checks: semantic search & index rebuild
 python scripts/test_hermes.py      # 23 checks: Hermes plugin lifecycle
+python scripts/test_bitter_lesson.py # DB-free checks: model/policy/eval extension points
 ```
 
 (The test scripts write throwaway `smoketest`/test rows into your live database; fine for a fresh install.)
+`test_bitter_lesson.py` is the exception: it is DB-free and safe to run without
+a daemon.
 
 </details>
 
@@ -187,7 +190,7 @@ To run everything by hand instead: `memoryd serve` in the foreground, `memoryd m
 
 ## 🚦 Status
 
-Early but real: 75 automated checks, tested end-to-end against live Postgres. Built as a "thin vertical slice" of a larger architecture — temporal knowledge graph, more agents, and an audit UI are on the roadmap, gated on evidence from real-world use.
+Early but real: 100+ automated checks, tested end-to-end against live Postgres plus DB-free extension-point regressions. Built as a "thin vertical slice" of a larger architecture — temporal knowledge graph, more agents, and an audit UI are on the roadmap, gated on evidence from real-world use.
 
 ---
 

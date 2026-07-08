@@ -18,6 +18,10 @@ import os
 import tempfile
 import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .model_gateway import ModelProfile
 
 
 class LLMError(RuntimeError):
@@ -121,8 +125,12 @@ class MockClient:
         return self.fixture.read_text(encoding="utf-8")
 
 
-def get_client():
-    mode = os.environ.get("MEMORYD_LLM", "").lower()
+def get_client(profile: "ModelProfile | None" = None):
+    if profile is not None:
+        from .model_gateway import profile_to_llm_mode
+        mode = profile_to_llm_mode(profile)
+    else:
+        mode = os.environ.get("MEMORYD_LLM", "").lower()
     if mode == "mock":
         return MockClient()
     if mode in ("openrouter", "openai"):

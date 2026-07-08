@@ -13,8 +13,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
-from .core import CFG, pool
+from .core import CFG, new_id, pool
 from .extract import run_extraction
 from .ingest import drain_spool
 
@@ -114,6 +115,30 @@ def main() -> None:
             """SELECT count(*) AS n, coalesce(avg(latency_ms),0)::int AS avg_ms
                FROM recall_log WHERE ts > now() - interval '1 day'""").fetchone()
         report.append(f"- recalls (24h): {recalls['n']}, avg {recalls['avg_ms']}ms")
+
+        try:
+            from .evaluator import run_static_eval
+            cases = conn.execute(
+                "SELECT id, kind, input, expected FROM eval_cases "
+                "WHERE enabled ORDER BY created_at, id LIMIT 50").fetchall()
+            eval_result = run_static_eval(cases=[
+                {"id": r["id"], "kind": r["kind"], "input": r["input"], "expected": r["expected"]}
+                for r in cases
+            ])
+            conn.execute(
+                "INSERT INTO eval_runs (id, profile, status, summary, metrics) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (new_id("eval"), eval_result["model_profile"],
+                 "pass" if eval_result["failed"] == 0 else "fail",
+                 Jsonb(eval_result), Jsonb({
+                     "cases": eval_result["cases"],
+                     "passed": eval_result["passed"],
+                     "failed": eval_result["failed"],
+                 })))
+            report.append("- nightly eval: "
+                          f"{eval_result['passed']}/{eval_result['cases']} passed")
+        except Exception as e:  # noqa: BLE001 - migration may not be applied yet
+            report.append(f"- nightly eval: skipped ({str(e)[:120]})")
         conn.commit()
 
     out = CFG.home / "digest" / f"{date.today().isoformat()}.md"
