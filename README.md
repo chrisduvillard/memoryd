@@ -48,10 +48,10 @@ sequenceDiagram
 
 ## Install (5 minutes)
 
-Requires: Linux/macOS, Python 3.11+, PostgreSQL 16 with [pgvector](https://github.com/pgvector/pgvector).
+Requires: Linux/macOS, Python 3.11+, PostgreSQL 16 with [pgvector](https://github.com/pgvector/pgvector), `curl`, and `jq`.
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/memoryd && cd memoryd
+git clone https://github.com/chrisduvillard/memoryd && cd memoryd
 pip install -r requirements.txt
 
 # database
@@ -121,4 +121,7 @@ Early but real: 73 automated checks, tested end-to-end against live Postgres. Bu
 
 ## License
 
-MIT
+Apache-2.0. See [LICENSE](LICENSE).
+
+Third-party notices for vendored compatibility stubs are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
