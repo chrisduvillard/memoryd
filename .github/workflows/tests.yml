@@ -1,0 +1,73 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    # PostgreSQL 16 + pgvector, matching the daemon's datastore. Same image
+    # `memoryd install` provisions locally.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: memoryd
+          POSTGRES_DB: memoryd
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MEMORYD_DSN: postgresql://postgres:memoryd@localhost:5432/memoryd
+      MEMORYD_LLM: mock                       # deterministic extractor, no API key
+      MEMORYD_LLM_MOCK_FILE: /tmp/mock_llm.json
+      # embedder defaults to the offline hash embedder — no external calls
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: pip install .            # also validates the wheel builds/installs
+
+      - name: Compile check
+        run: python -m compileall memoryd scripts
+
+      - name: Apply migrations
+        run: python -c "import os; from memoryd.cli import apply_migrations; print('applied:', apply_migrations(os.environ['MEMORYD_DSN']))"
+
+      - name: Run the suite (77 checks)
+        run: |
+          set -euo pipefail
+          echo "[]" > /tmp/mock_llm.json            # valid fixture for the daemon's extractor
+          python -m memoryd.server > memoryd.out 2>&1 &
+          daemon=$!
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:7437/health >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "${ok:-}" != "1" ]; then echo "daemon did not become healthy"; cat memoryd.out; exit 1; fi
+          python scripts/smoke_test.py    # 19
+          python scripts/test_extract.py  # 22
+          python scripts/test_vector.py   # 13
+          python scripts/test_hermes.py   # 23
+          kill "$daemon" 2>/dev/null || true
+
+      - name: Daemon log on failure
+        if: failure()
+        run: cat memoryd.out || true
