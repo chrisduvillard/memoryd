@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 200" width="880" height="200" role="img" aria-label="memoryd — shared long-term memory for your AI agents">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e1b4b"/>
+      <stop offset="0.55" stop-color="#312e81"/>
+      <stop offset="1" stop-color="#4c1d95"/>
+    </linearGradient>
+    <linearGradient id="teal" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+
+  <!-- panel -->
+  <rect x="2" y="2" width="876" height="196" rx="24" fill="url(#bg)"/>
+
+  <!-- faint agent-network, top-right: three agents sharing one hub -->
+  <g stroke="#a5b4fc" stroke-width="1.5" opacity="0.18" fill="none">
+    <line x1="760" y1="42" x2="812" y2="72"/>
+    <line x1="812" y1="72" x2="772" y2="112"/>
+    <line x1="812" y1="72" x2="836" y2="120"/>
+  </g>
+  <g fill="#a5b4fc" opacity="0.4">
+    <circle cx="760" cy="42" r="5"/>
+    <circle cx="772" cy="112" r="5"/>
+    <circle cx="836" cy="120" r="5"/>
+  </g>
+  <circle cx="812" cy="72" r="7" fill="#2dd4bf" opacity="0.6"/>
+
+  <!-- database glyph (shared memory store) -->
+  <g transform="translate(0,10)">
+    <path d="M62 62 v70 a38 12 0 0 0 76 0 v-70" fill="#2dd4bf" opacity="0.12"/>
+    <g stroke="url(#teal)" stroke-width="3.2" fill="none" stroke-linecap="round">
+      <ellipse cx="100" cy="62" rx="38" ry="12"/>
+      <path d="M62 62 v70 a38 12 0 0 0 76 0 v-70"/>
+      <path d="M62 97 a38 12 0 0 0 76 0"/>
+    </g>
+  </g>
+
+  <!-- kicker -->
+  <text x="196" y="60" font-family="ui-monospace, 'Cascadia Code', Consolas, 'Segoe UI', monospace" font-size="14" letter-spacing="4" fill="#5eead4" font-weight="600">LOCAL · PERSISTENT · SHARED</text>
+
+  <!-- wordmark -->
+  <text x="194" y="118" font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="60" font-weight="800" letter-spacing="-1" fill="#ffffff">memory<tspan fill="#2dd4bf">d</tspan></text>
+
+  <!-- accent underline -->
+  <rect x="198" y="132" width="64" height="5" rx="2.5" fill="url(#teal)"/>
+
+  <!-- tagline -->
+  <text x="198" y="162" font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="21" fill="#c7d2fe">Shared long-term memory for your AI agents</text>
+</svg>
