@@ -50,8 +50,14 @@ def _capture_worker() -> None:
                 from .extract import run_extraction
                 run_extraction(job["session_id"])  # no-op if no LLM configured
         except Exception:  # noqa: BLE001 — spool for retry, never crash the worker
-            spool_file = CFG.spool / f"{new_id('job')}.json"
-            spool_file.write_text(json.dumps(job))
+            # the spool write itself can fail (disk full, perms). If it escaped
+            # here it would kill the worker thread and stop ALL captures until a
+            # daemon restart, so it must be swallowed too — drop one job, live.
+            try:
+                spool_file = CFG.spool / f"{new_id('job')}.json"
+                spool_file.write_text(json.dumps(job), encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             CAPTURE_Q.task_done()
 

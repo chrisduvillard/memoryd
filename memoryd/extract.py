@@ -29,6 +29,13 @@ from .semantic_policies import get_semantic_policy
 from .source_pack import PackedSources, pack_session_events
 
 VALID_TYPES = set(CONTRACT_TYPES)
+# memories.scope / memories.sensitivity CHECK enums (migration 001). Like
+# authority, an out-of-enum value from the LLM would violate the CHECK and
+# abort the WHOLE extraction transaction (poison pill: every candidate from
+# the session lost, retried failing forever). The validator clamps instead.
+VALID_SCOPES = frozenset({"personal_private", "work_private", "project_shared",
+                          "agent_internal", "public", "untrusted_external"})
+VALID_SENSITIVITY = frozenset({"public", "normal", "private", "sealed"})
 AUTO_ACTIVE_TYPES = set(get_semantic_policy("conservative_v1").auto_active_types)
 
 # Unrecalled, unconfirmed candidates decay after ~1 month (microsleep);
@@ -79,14 +86,18 @@ def _record_model_run(conn, *, profile, operation: str, contract: str | None,
                       prompt: str, output: str = "", ok: bool = True,
                       error: str | None = None, metadata: dict | None = None) -> None:
     try:
-        conn.execute(
-            """INSERT INTO model_runs (id, profile, provider, model, operation,
-                                      contract, prompt_chars, output_chars, ok,
-                                      error, metadata)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (new_id("run"), profile.name, profile.provider, profile.model,
-             operation, contract, len(prompt), len(output), ok,
-             error[:1000] if error else None, Jsonb(metadata or {})))
+        # savepoint: on a pre-migration-005 DB this table is missing; without
+        # the nested transaction the failed INSERT would abort the OUTER
+        # extraction transaction and lose every candidate (poison pill).
+        with conn.transaction():
+            conn.execute(
+                """INSERT INTO model_runs (id, profile, provider, model, operation,
+                                          contract, prompt_chars, output_chars, ok,
+                                          error, metadata)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (new_id("run"), profile.name, profile.provider, profile.model,
+                 operation, contract, len(prompt), len(output), ok,
+                 error[:1000] if error else None, Jsonb(metadata or {})))
     except Exception:  # noqa: BLE001 - old DBs may not have migration 005 yet
         pass
 
@@ -122,6 +133,13 @@ def _validate(cand: dict, event_ids: set[str], source_texts: dict[str, str],
     if claim not in {"A1", "A2", "B1", "C1", "D1", "Q"}:
         claim = "D1"
     cand["authority_claim"] = claim
+    # scope/sensitivity: same CHECK-constraint poison-pill hazard as authority.
+    # Clamp unknown values to a safe default (valid values, incl. the ones the
+    # prompt omits like untrusted_external, are preserved so promote() sees them).
+    if cand.get("scope") not in VALID_SCOPES:
+        cand["scope"] = "work_private"
+    if cand.get("sensitivity") not in VALID_SENSITIVITY:
+        cand["sensitivity"] = "normal"
     if claim == "A1":
         # A1 = direct explicit USER statement: the quote must come from a
         # cited user_message — agent text must not launder into top authority
@@ -267,11 +285,12 @@ def run_extraction(session_id: str) -> dict:
                 from .embed import get_embedder, to_pgvector
                 emb = get_embedder()
                 vec = emb.embed([cand["text"].strip()])[0]
-                conn.execute(
-                    "INSERT INTO mem_embeddings (memory_id, model, embedding) "
-                    "VALUES (%s,%s,%s::vector) ON CONFLICT (memory_id) DO UPDATE "
-                    "SET model=EXCLUDED.model, embedding=EXCLUDED.embedding",
-                    (mid, emb.model, to_pgvector(vec)))
+                with conn.transaction():  # isolate: a write failure must not
+                    conn.execute(         # poison the outer memory-insert txn
+                        "INSERT INTO mem_embeddings (memory_id, model, embedding) "
+                        "VALUES (%s,%s,%s::vector) ON CONFLICT (memory_id) DO UPDATE "
+                        "SET model=EXCLUDED.model, embedding=EXCLUDED.embedding",
+                        (mid, emb.model, to_pgvector(vec)))
             except Exception:  # noqa: BLE001 — embeddings are disposable; microsleep backfills
                 pass
             if status != "candidate":

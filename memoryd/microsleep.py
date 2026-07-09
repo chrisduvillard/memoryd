@@ -118,23 +118,28 @@ def main() -> None:
 
         try:
             from .evaluator import run_static_eval
-            cases = conn.execute(
-                "SELECT id, kind, input, expected FROM eval_cases "
-                "WHERE enabled ORDER BY created_at, id LIMIT 50").fetchall()
-            eval_result = run_static_eval(cases=[
-                {"id": r["id"], "kind": r["kind"], "input": r["input"], "expected": r["expected"]}
-                for r in cases
-            ])
-            conn.execute(
-                "INSERT INTO eval_runs (id, profile, status, summary, metrics) "
-                "VALUES (%s,%s,%s,%s,%s)",
-                (new_id("eval"), eval_result["model_profile"],
-                 "pass" if eval_result["failed"] == 0 else "fail",
-                 Jsonb(eval_result), Jsonb({
-                     "cases": eval_result["cases"],
-                     "passed": eval_result["passed"],
-                     "failed": eval_result["failed"],
-                 })))
+            # savepoint: eval_cases/eval_runs are migration-005 tables. Without
+            # the nested transaction a missing table aborts the OUTER
+            # transaction, so the conn.commit() below silently rolls back the
+            # whole night's consolidation (priming expiry, decay, backfill).
+            with conn.transaction():
+                cases = conn.execute(
+                    "SELECT id, kind, input, expected FROM eval_cases "
+                    "WHERE enabled ORDER BY created_at, id LIMIT 50").fetchall()
+                eval_result = run_static_eval(cases=[
+                    {"id": r["id"], "kind": r["kind"], "input": r["input"], "expected": r["expected"]}
+                    for r in cases
+                ])
+                conn.execute(
+                    "INSERT INTO eval_runs (id, profile, status, summary, metrics) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (new_id("eval"), eval_result["model_profile"],
+                     "pass" if eval_result["failed"] == 0 else "fail",
+                     Jsonb(eval_result), Jsonb({
+                         "cases": eval_result["cases"],
+                         "passed": eval_result["passed"],
+                         "failed": eval_result["failed"],
+                     })))
             report.append("- nightly eval: "
                           f"{eval_result['passed']}/{eval_result['cases']} passed")
         except Exception as e:  # noqa: BLE001 - migration may not be applied yet

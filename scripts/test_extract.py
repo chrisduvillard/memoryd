@@ -159,18 +159,28 @@ def main() -> int:
             "evidence_quote": "use a three-stage cache",
             "duplicate_of": None, "contradicts": [],
         },
+        {  # 11: out-of-enum scope/sensitivity from the model -> clamped, still
+            #     stored. Regression: raw values violate the memories CHECK and
+            #     would abort the whole extraction transaction (poison pill).
+            "type": "technical_fact",
+            "text": "The acme-app deploy uses a blue-green rollout across two clusters.",
+            "struct": {}, "project": "acme-app", "scope": "internal-only",
+            "sensitivity": "confidential", "authority_claim": "A2", "confidence": 0.7,
+            "activation": {}, "source_event_ids": [e4], "evidence_quote": "",
+            "duplicate_of": None, "contradicts": [],
+        },
     ]
     MOCK.write_text(json.dumps(candidates))
 
     print("== extraction run ==")
     stats = run_extraction(sid)
     check("extraction ok", stats.get("ok") is True, str(stats))
-    check("proposed 10", stats.get("proposed") == 10, str(stats))
+    check("proposed 11", stats.get("proposed") == 11, str(stats))
     check("1 rejected (fake source)", stats.get("rejected") == 1, str(stats))
     check("1 dedup affirmation", stats.get("dedup") == 1, str(stats))
     check("1 held (hedge violation)", stats.get("held") == 1, str(stats))
     check("1 contradiction review", stats.get("contradictions") == 1, str(stats))
-    check("8 stored", stats.get("stored") == 8, str(stats))
+    check("9 stored", stats.get("stored") == 9, str(stats))
 
     with pool().connection() as conn:
         conn.row_factory = dict_row
@@ -213,6 +223,13 @@ def main() -> int:
                           "WHERE text LIKE '%%three-stage cache%%'").fetchone()
         check("agent-sourced A1 downgraded to A2", ag and ag["authority"] == "A2", str(ag))
         check("agent-sourced fact not auto-active", ag and ag["status"] == "candidate", str(ag))
+
+        pp = conn.execute("SELECT scope, sensitivity, status FROM memories "
+                          "WHERE text LIKE '%%blue-green rollout%%'").fetchone()
+        check("out-of-enum scope/sensitivity clamped (no poison pill)",
+              bool(pp) and pp["scope"] == "work_private" and pp["sensitivity"] == "normal",
+              str(pp))
+
         qe = conn.execute("SELECT count(*) AS n FROM events WHERE session_id=%s "
                           "AND kind='quarantine'", (sid,)).fetchone()
         check("quarantine ledger event written", qe["n"] == 1, str(qe))
