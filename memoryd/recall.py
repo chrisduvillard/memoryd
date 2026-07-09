@@ -245,7 +245,17 @@ def build_packet(prompt: str, session_id: str, project: str | None,
         lane3 = court(retrieved)
         lane4 = court(candidates)
         lane5 = court(loops)
-        lane1 = [r for r in lane1 if not r["is_canary"] or canary_alarms.append(r["id"])]
+        # canary suppression for lane 1 (S7): a canary directive/warning must
+        # never surface — alarm and drop. Explicit loop, not a side-effecting
+        # comprehension, so this security-critical filter can't be silently
+        # broken by a future "simplification".
+        kept_lane1 = []
+        for r in lane1:
+            if r["is_canary"]:
+                canary_alarms.append(r["id"])
+                continue
+            kept_lane1.append(r)
+        lane1 = kept_lane1
 
         # ---- render under lane budgets -----------------------------
         def fit(rows: list[dict], budget: int, label: str | None = None) -> list[str]:
@@ -303,23 +313,29 @@ def build_packet(prompt: str, session_id: str, project: str | None,
         ).fetchone()
         recall_log_id = recall_row["id"] if recall_row else None
         try:
-            conn.execute(
-                """INSERT INTO packet_runs (id, recall_log_id, session_id, project, agent,
-                                            policy, compiler, rendered_packet,
-                                            selected_memory_ids, rejected, channels,
-                                            latency_ms)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (new_id("pkt"), recall_log_id, session_id, project, agent,
-                 policy.name, compiler.name, markdown, shown_ids,
-                 Jsonb({"ambiguity": ambiguity, "canary_alarms": canary_alarms}),
-                 channels, latency_ms))
-            conn.execute(
-                """INSERT INTO policy_runs (id, policy, operation, input, output,
-                                            latency_ms, ok)
-                   VALUES (%s,%s,%s,%s,%s,%s,TRUE)""",
-                (new_id("pol"), policy.name, "recall",
-                 Jsonb({"prompt": prompt[:2000], "project": project, "agent": agent}),
-                 Jsonb(packet_meta), latency_ms))
+            # savepoint: on a pre-migration-005 DB these tables are missing.
+            # Without the nested transaction the failed INSERT would abort the
+            # outer transaction, so the append_event below (and commit) would
+            # raise InFailedSqlTransaction and turn EVERY recall into a 500 —
+            # silently defeating fail-open recall until migrations are re-run.
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO packet_runs (id, recall_log_id, session_id, project, agent,
+                                                policy, compiler, rendered_packet,
+                                                selected_memory_ids, rejected, channels,
+                                                latency_ms)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (new_id("pkt"), recall_log_id, session_id, project, agent,
+                     policy.name, compiler.name, markdown, shown_ids,
+                     Jsonb({"ambiguity": ambiguity, "canary_alarms": canary_alarms}),
+                     channels, latency_ms))
+                conn.execute(
+                    """INSERT INTO policy_runs (id, policy, operation, input, output,
+                                                latency_ms, ok)
+                       VALUES (%s,%s,%s,%s,%s,%s,TRUE)""",
+                    (new_id("pol"), policy.name, "recall",
+                     Jsonb({"prompt": prompt[:2000], "project": project, "agent": agent}),
+                     Jsonb(packet_meta), latency_ms))
         except Exception:  # noqa: BLE001 - old DBs may not have migration 005 yet
             pass
         append_event(conn, kind="recall_packet", session_id=session_id, project=project,
