@@ -6,11 +6,13 @@ blocks on anything downstream (spec §4.3).
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
 import secrets
 import shutil
+import stat
 import threading
 import time
 from dataclasses import dataclass, field
@@ -173,47 +175,114 @@ def _manifest_file_lock(manifest: Path):
     lock = manifest.with_suffix(".lock")
     deadline = time.monotonic() + 5
     fd = None
+    last_error = None
     while fd is None:
+        candidate = None
         try:
-            candidate = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except (FileExistsError, PermissionError) as error:
-            try:
-                if time.time() - lock.stat().st_mtime > 900:
-                    try:
-                        lock.unlink(missing_ok=True)
-                    except PermissionError as unlink_error:
-                        error = unlink_error
-                    else:
-                        continue
-            except FileNotFoundError:
-                pass
-            except PermissionError as stat_error:
-                error = stat_error
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"manifest lock timeout: {lock}") from error
-            time.sleep(0.01)
-        else:
-            try:
-                os.write(candidate, f"{os.getpid()}\n".encode())
-            except BaseException:
-                os.close(candidate)
-                lock.unlink(missing_ok=True)
+            candidate = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(candidate).st_size == 0:
+                    os.write(candidate, b"\0")
+                    os.fsync(candidate)
+                os.lseek(candidate, 0, os.SEEK_SET)
+                msvcrt.locking(candidate, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except PermissionError as error:
+            last_error = error
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                if candidate is not None:
+                    os.close(candidate)
                 raise
+            last_error = error
+        else:
             fd = candidate
+            break
+        if candidate is not None:
+            os.close(candidate)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"manifest lock timeout: {lock}") from last_error
+        time.sleep(0.01)
     try:
         yield
     finally:
-        os.close(fd)
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                lock.unlink(missing_ok=True)
-            except PermissionError as error:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"manifest lock timeout: {lock}") from error
-                time.sleep(0.01)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
             else:
-                break
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _verify_archive_object(obj_path: Path, sha: str,
+                           expected_bytes: int) -> os.stat_result:
+    path_stat = obj_path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise ValueError(f"archive object integrity mismatch: {obj_path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(obj_path, flags)
+    with os.fdopen(fd, "rb") as handle:
+        opened_stat = os.fstat(handle.fileno())
+        same_file = ((path_stat.st_dev, path_stat.st_ino) ==
+                     (opened_stat.st_dev, opened_stat.st_ino))
+        if (not same_file or not stat.S_ISREG(opened_stat.st_mode) or
+                opened_stat.st_size != expected_bytes):
+            raise ValueError(f"archive object integrity mismatch: {obj_path}")
+        actual_sha = hashlib.file_digest(handle, "sha256").hexdigest()
+    if actual_sha != sha:
+        raise ValueError(f"archive object integrity mismatch: {obj_path}")
+    return opened_stat
+
+
+def _safe_fonds_links_supported() -> bool:
+    required = (os.open, os.mkdir, os.stat, os.symlink)
+    return bool(
+        os.name == "posix" and
+        hasattr(os, "O_DIRECTORY") and
+        hasattr(os, "O_NOFOLLOW") and
+        all(operation in os.supports_dir_fd for operation in required) and
+        os.stat in os.supports_follow_symlinks
+    )
+
+
+def _create_fonds_link(obj_path: Path, link: Path, fonds_path: str) -> None:
+    if not _safe_fonds_links_supported():
+        return
+
+    parts = fonds_path.replace("\\", "/").split("/")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors = []
+    try:
+        archive_root = link.parents[len(parts)]
+        current = os.open(archive_root, flags)
+        descriptors.append(current)
+        current = os.open("fonds", flags, dir_fd=current)
+        descriptors.append(current)
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, dir_fd=current)
+            except FileExistsError:
+                pass
+            current = os.open(part, flags, dir_fd=current)
+            descriptors.append(current)
+        try:
+            os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
+        except FileNotFoundError:
+            os.symlink(os.path.relpath(obj_path, link.parent), parts[-1],
+                       dir_fd=current)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def append_manifest_occurrence(archive_root: Path, occurrence: dict) -> None:
@@ -237,7 +306,7 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
     obj_dir = CFG.archive / "objects" / "sha256" / sha[:2] / sha[2:4]
     obj_path = obj_dir / sha
     obj_dir.mkdir(parents=True, exist_ok=True)
-    if not obj_path.exists():
+    if not os.path.lexists(obj_path):
         tmp = obj_dir / f".{sha}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
         try:
             with tmp.open("xb") as handle:
@@ -245,26 +314,28 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                 handle.flush()
                 os.fsync(handle.fileno())
             try:
-                os.replace(tmp, obj_path)
-            except (FileExistsError, PermissionError):
+                os.link(tmp, obj_path)
+            except FileExistsError:
+                pass
+            except PermissionError:
                 deadline = time.monotonic() + 5
-                while not obj_path.is_file():
+                while not os.path.lexists(obj_path):
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(0.01)
         finally:
             tmp.unlink(missing_ok=True)
 
+    obj_stat = _verify_archive_object(obj_path, sha, len(data))
+
     # fonds symlink (original-order view); best effort, never fatal
     link = validate_fonds_path(CFG.archive, fonds_path)
-    link.parent.mkdir(parents=True, exist_ok=True)
     try:
-        if not link.exists():
-            os.symlink(os.path.relpath(obj_path, link.parent), link)
+        _create_fonds_link(obj_path, link, fonds_path)
     except OSError:
         pass
 
-    seen = datetime.fromtimestamp(obj_path.stat().st_mtime, timezone.utc).isoformat()
+    seen = datetime.fromtimestamp(obj_stat.st_mtime, timezone.utc).isoformat()
     occurrence = {
         "sha256": sha,
         "bytes": len(data),

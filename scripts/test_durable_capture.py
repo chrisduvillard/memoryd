@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import multiprocessing
@@ -31,17 +32,21 @@ def _archive_with_synchronized_publication(
         ready: multiprocessing.synchronize.Barrier) -> None:
     core.CFG.home = Path(home)
     core.CFG.ensure_dirs()
+    real_link = core.os.link
     real_replace = core.os.replace
 
-    def synchronized_replace(source: Path, target: Path) -> None:
-        ready.wait(timeout=10)
-        if winner:
-            core.time.sleep(0.05)
-            real_replace(source, target)
-        else:
-            raise PermissionError("simulated Windows publication loser")
+    def synchronized_publish(real_publish):
+        def publish(source: Path, target: Path) -> None:
+            ready.wait(timeout=10)
+            if winner:
+                core.time.sleep(0.05)
+                real_publish(source, target)
+            else:
+                raise PermissionError("simulated Windows publication loser")
+        return publish
 
-    core.os.replace = synchronized_replace
+    core.os.link = synchronized_publish(real_link)
+    core.os.replace = synchronized_publish(real_replace)
     core.archive_bytes(b"concurrent", "text/plain", f"parallel/{job_id}.txt",
                        ingest_job_id=job_id)
 
@@ -71,6 +76,93 @@ def _assert_manifest_permission_contention_is_bounded(manifest: Path) -> None:
             pass
         else:
             raise AssertionError("persistent manifest lock denial did not time out")
+
+
+def _manifest_lock_contender(manifest: str,
+                             acquired: multiprocessing.synchronize.Event) -> None:
+    with core._manifest_file_lock(Path(manifest)):
+        acquired.set()
+
+
+def _assert_manifest_lock_ownership_is_safe(manifest: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    acquired = context.Event()
+    contender = context.Process(
+        target=_manifest_lock_contender,
+        args=(str(manifest), acquired),
+    )
+    lock = manifest.with_suffix(".lock")
+    with core._manifest_file_lock(manifest):
+        os.utime(lock, (0, 0))
+        contender.start()
+        entered_while_owned = acquired.wait(timeout=0.5)
+
+    acquired_after_release = acquired.wait(timeout=10)
+    contender.join(timeout=10)
+    if contender.is_alive():
+        contender.terminate()
+        contender.join()
+    assert not entered_while_owned
+    assert acquired_after_release
+    assert contender.exitcode == 0
+    assert lock.exists()
+
+
+def _join_processes(processes: list[multiprocessing.Process]) -> None:
+    timed_out = False
+    for process in processes:
+        process.join(timeout=15)
+        timed_out = process.is_alive() or timed_out
+    if timed_out:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join()
+        raise AssertionError("archive publication process timed out")
+
+
+def _assert_corrupt_objects_are_rejected() -> None:
+    manifest = core.CFG.archive / "manifest.jsonl"
+    before = manifest.read_text().splitlines()
+    cases = (
+        (b"size-good", b"x", "corrupt/size.txt"),
+        (b"hash-good", b"hash-baad", "corrupt/hash.txt"),
+    )
+    for data, corrupt, fonds_path in cases:
+        sha = hashlib.sha256(data).hexdigest()
+        obj_path = (core.CFG.archive / "objects" / "sha256" /
+                    sha[:2] / sha[2:4] / sha)
+        obj_path.parent.mkdir(parents=True, exist_ok=True)
+        obj_path.write_bytes(corrupt)
+        try:
+            core.archive_bytes(data, "text/plain", fonds_path)
+        except ValueError as error:
+            assert "integrity" in str(error)
+        else:
+            raise AssertionError("corrupt canonical object accepted")
+        assert obj_path.read_bytes() == corrupt
+        assert manifest.read_text().splitlines() == before
+
+    data = b"converged-good"
+    sha = hashlib.sha256(data).hexdigest()
+    obj_path = (core.CFG.archive / "objects" / "sha256" /
+                sha[:2] / sha[2:4] / sha)
+
+    def publish_corrupt_then_lose(source: Path, target: Path) -> None:
+        Path(target).write_bytes(b"X" * len(data))
+        raise PermissionError("simulated corrupt publication winner")
+
+    with patch.object(core.os, "link", side_effect=publish_corrupt_then_lose), \
+         patch.object(core.os, "replace", side_effect=publish_corrupt_then_lose):
+        try:
+            core.archive_bytes(data, "text/plain", "corrupt/converged.txt")
+        except ValueError as error:
+            assert "integrity" in str(error)
+        else:
+            raise AssertionError("corrupt converged object accepted")
+    assert obj_path.read_bytes() == b"X" * len(data)
+    assert manifest.read_text().splitlines() == before
 
 
 def test_snapshot_survives_original_deletion() -> None:
@@ -165,7 +257,9 @@ def test_mixed_transcript_line_preserves_text_and_tools() -> None:
 def test_fonds_paths_cannot_escape_archive() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / "archive"
-        for unsafe in ("../escape", "/absolute/path", r"C:\escape", r"a\..\escape"):
+        for unsafe in (
+                "", ".", "../escape", "/absolute/path", "a//b", "a/",
+                r"C:\escape", r"C:escape", r"a\..\escape"):
             try:
                 core.validate_fonds_path(root, unsafe)
             except ValueError:
@@ -194,6 +288,72 @@ def test_fonds_paths_cannot_escape_archive() -> None:
         else:
             raise AssertionError("unsafe parent symlink accepted")
 
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            outside = Path(td) / "swap-outside"
+            outside.mkdir()
+            parent = core.CFG.archive / "fonds" / "swap"
+            parent.mkdir()
+            original_validate = core.validate_fonds_path
+            swapped = False
+
+            def validate_then_swap(archive_root: Path, fonds_path: str) -> Path:
+                nonlocal swapped
+                target = original_validate(archive_root, fonds_path)
+                if not swapped:
+                    parent.rmdir()
+                    if os.name == "nt":
+                        import _winapi
+                        _winapi.CreateJunction(str(outside), str(parent))
+                    else:
+                        _create_directory_link(outside, parent)
+                    swapped = True
+                return target
+
+            def windows_link_marker(target: str, link: str, **kwargs) -> None:
+                if kwargs:
+                    raise AssertionError("unsafe Windows fonds mutation attempted")
+                Path(link).write_text(target)
+
+            link_patch = (
+                patch.object(core.os, "symlink", side_effect=windows_link_marker)
+                if os.name == "nt" else contextlib.nullcontext()
+            )
+            with patch.object(core, "validate_fonds_path",
+                              side_effect=validate_then_swap), link_patch:
+                core.archive_bytes(b"swap", "text/plain", "swap/capture.txt")
+            assert not os.path.lexists(outside / "capture.txt")
+
+            core.CFG.home = Path(td) / "root-swap-memory"
+            core.CFG.ensure_dirs()
+            outside_root = Path(td) / "root-swap-outside"
+            outside_root.mkdir()
+            fonds_root = core.CFG.archive / "fonds"
+            swapped = False
+
+            def validate_then_swap_root(archive_root: Path,
+                                        fonds_path: str) -> Path:
+                nonlocal swapped
+                target = original_validate(archive_root, fonds_path)
+                if not swapped:
+                    fonds_root.rmdir()
+                    if os.name == "nt":
+                        import _winapi
+                        _winapi.CreateJunction(str(outside_root), str(fonds_root))
+                    else:
+                        _create_directory_link(outside_root, fonds_root)
+                    swapped = True
+                return target
+
+            with patch.object(core, "validate_fonds_path",
+                              side_effect=validate_then_swap_root), link_patch:
+                core.archive_bytes(b"root-swap", "text/plain", "capture.txt")
+            assert not os.path.lexists(outside_root / "capture.txt")
+        finally:
+            core.CFG.home = old_home
+
 
 def test_archive_records_each_occurrence() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -220,12 +380,7 @@ def test_archive_records_each_occurrence() -> None:
             ]
             for process in processes:
                 process.start()
-            for process in processes:
-                process.join(timeout=15)
-                if process.is_alive():
-                    process.terminate()
-                    process.join()
-                    raise AssertionError("archive publication process timed out")
+            _join_processes(processes)
             assert [process.exitcode for process in processes] == [0, 0]
 
             entries = [json.loads(line) for line in
@@ -237,7 +392,9 @@ def test_archive_records_each_occurrence() -> None:
                             if path.is_file()]
             assert len(object_files) == 2
 
-            with patch.object(core.os, "replace",
+            with patch.object(core.os, "link",
+                              side_effect=PermissionError("persistent denial")), \
+                 patch.object(core.os, "replace",
                               side_effect=PermissionError("persistent denial")), \
                  patch.object(core.time, "monotonic", side_effect=(0, 6)):
                 try:
@@ -249,6 +406,9 @@ def test_archive_records_each_occurrence() -> None:
 
             _assert_manifest_permission_contention_is_bounded(
                 core.CFG.archive / "manifest.jsonl")
+            _assert_manifest_lock_ownership_is_safe(
+                core.CFG.archive / "manifest.jsonl")
+            _assert_corrupt_objects_are_rejected()
         finally:
             core.CFG.home = old_home
 
