@@ -17,9 +17,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memoryd import core, ingest, server, spool
+from memoryd.doctor import (
+    inspect_archive,
+    inspect_spool,
+    main as doctor_main,
+    repair_archive,
+    repair_spool,
+)
 from memoryd.hook import capture
 from memoryd.ingest import _classify_all
-from memoryd.spool import enqueue_capture, ensure_layout, validate_blob
+from memoryd.spool import (
+    dead_letter_reason_path,
+    enqueue_capture,
+    ensure_layout,
+    validate_blob,
+)
 
 
 def _write_extraction_job(root: Path, name: str, session_id: str) -> Path:
@@ -1297,6 +1309,291 @@ def test_archive_records_each_occurrence() -> None:
             core.CFG.home = old_home
 
 
+def _tree_snapshot(root: Path) -> dict[str, tuple[int, int, int, bytes]] | None:
+    if not root.exists():
+        return None
+    snapshot = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        path_stat = path.stat(follow_symlinks=False)
+        content = path.read_bytes() if path.is_file() else b""
+        snapshot[str(path.relative_to(root))] = (
+            path_stat.st_mode,
+            path_stat.st_size,
+            path_stat.st_mtime_ns,
+            content,
+        )
+    return snapshot
+
+
+def _doctor_job(job_id: str, *, kind: str = "extraction", **fields) -> dict:
+    job = {
+        "schema_version": 2,
+        "job_id": job_id,
+        "kind": kind,
+        "created_at": "2026-07-10T08:00:00+00:00",
+        "session_id": f"session-{job_id}",
+        "attempts": 0,
+        "last_error": None,
+        "next_attempt_at": None,
+    }
+    job.update(fields)
+    return job
+
+
+def test_doctor_inspection_is_read_only_and_reports_defects() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        old_home = core.CFG.home
+        missing_home = base / "missing-home"
+        try:
+            core.CFG.home = missing_home
+            stdout = io.StringIO()
+            with patch("memoryd.core.pool", side_effect=OSError("database down")), \
+                 patch("memoryd.doctor.urllib.request.urlopen",
+                       side_effect=OSError("daemon down")), \
+                 contextlib.redirect_stdout(stdout):
+                assert doctor_main() == 1
+            assert not missing_home.exists()
+            assert "database_unreachable" in stdout.getvalue()
+            assert "daemon_unreachable" in stdout.getvalue()
+        finally:
+            core.CFG.home = old_home
+
+        empty_home = base / "empty-home"
+        empty_home.mkdir()
+        before_empty = _tree_snapshot(empty_home)
+        assert inspect_spool(empty_home / "spool") == []
+        assert inspect_archive(empty_home / "archive") == []
+        assert _tree_snapshot(empty_home) == before_empty
+
+        cli_home = base / "invalid-cli-home"
+        env = {**os.environ, "MEMORYD_HOME": str(cli_home)}
+        invalid_cli = subprocess.run(
+            [sys.executable, "-m", "memoryd", "doctor", "--unknown"],
+            capture_output=True, text=True, timeout=15, env=env, check=False)
+        assert invalid_cli.returncode == 2
+        assert "usage: memoryd doctor [--repair]" in invalid_cli.stderr
+        assert not cli_home.exists()
+
+        home = base / "defects"
+        paths = ensure_layout(home / "spool")
+        legacy = home / "spool" / "legacy.json"
+        legacy.write_text(json.dumps({
+            "transcript_path": str(home / "gone.jsonl"),
+            "session_id": "legacy",
+            "trigger": "stop",
+        }), encoding="utf-8")
+        (home / "spool" / "malformed.json").write_text(
+            "{", encoding="utf-8")
+        (paths["incoming"] / "unexpected.json").write_text(
+            "[]", encoding="utf-8")
+        (paths["incoming"] / "unreadable.json").mkdir()
+        missing_blob_job = _doctor_job(
+            "missing-blob", kind="capture_snapshot", project=None,
+            trigger="stop", original_transcript_path="C:/gone.jsonl",
+            blob_sha256="b" * 64, blob_bytes=1)
+        (paths["incoming"] / "missing-blob.json").write_text(
+            json.dumps(missing_blob_job), encoding="utf-8")
+
+        stale = paths["processing"] / "stale.json"
+        stale.write_text(json.dumps(_doctor_job("stale")), encoding="utf-8")
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).timestamp()
+        os.utime(stale, (old, old))
+
+        dead_evidence = paths["dead-letter"] / "evidence.json"
+        dead_evidence.write_text(
+            json.dumps(_doctor_job("evidence")), encoding="utf-8")
+        sidecar = dead_letter_reason_path(dead_evidence)
+        sidecar.write_text(json.dumps({
+            "dead_lettered_at": "2026-07-10T08:05:00+00:00",
+            "reason": "preserved",
+            "manifest": dead_evidence.name,
+        }), encoding="utf-8")
+        named_like_sidecar = paths["dead-letter"] / "capture.reason.json"
+        named_like_sidecar.write_text(
+            json.dumps(_doctor_job("named-like-sidecar")), encoding="utf-8")
+
+        archive = home / "archive"
+        object_root = archive / "objects" / "sha256"
+        corrupt_sha = "c" * 64
+        corrupt = object_root / corrupt_sha[:2] / corrupt_sha[2:4] / corrupt_sha
+        corrupt.parent.mkdir(parents=True)
+        corrupt.write_bytes(b"corrupt")
+        orphan_data = b"orphan"
+        orphan_sha = hashlib.sha256(orphan_data).hexdigest()
+        orphan = object_root / orphan_sha[:2] / orphan_sha[2:4] / orphan_sha
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(orphan_data)
+        bad_name = object_root / "bad-object-name"
+        bad_name.write_bytes(b"evidence")
+        (archive / "manifest.jsonl").write_text("\n".join((
+            json.dumps({"sha256": "a" * 64, "fonds_path": "safe/path"}),
+            json.dumps({"sha256": corrupt_sha, "fonds_path": "../escape"}),
+            "{",
+            "[]",
+            json.dumps({"sha256": ["bad"], "fonds_path": "safe/path"}),
+        )) + "\n", encoding="utf-8")
+
+        before = _tree_snapshot(home)
+        spool_findings = inspect_spool(home / "spool")
+        archive_findings = inspect_archive(archive)
+        assert _tree_snapshot(home) == before
+
+        spool_codes = {item.code for item in spool_findings}
+        assert {
+            "invalid_manifest", "legacy_source_missing", "spool_blob_invalid",
+            "stale_processing_job", "dead_letter_jobs",
+        } <= spool_codes
+        dead_count = next(
+            item for item in spool_findings if item.code == "dead_letter_jobs")
+        assert dead_count.detail == "2"
+        assert all(item.path != str(sidecar) for item in spool_findings)
+
+        archive_codes = {item.code for item in archive_findings}
+        assert {
+            "invalid_manifest_line", "unsafe_fonds_path",
+            "manifest_object_missing", "object_hash_mismatch", "orphan_object",
+            "invalid_object_name",
+        } <= archive_codes
+
+
+def test_doctor_repair_preserves_and_requeues_spool_evidence() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        root = base / "spool"
+        paths = ensure_layout(root)
+        source = base / "source.jsonl"
+        source.write_bytes(b"source evidence")
+        upgrade = root / "upgrade.json"
+        upgrade_value = {
+            "transcript_path": str(source),
+            "session_id": "upgrade",
+            "trigger": "stop",
+        }
+        upgrade.write_text(json.dumps(upgrade_value), encoding="utf-8")
+        missing = root / "missing.json"
+        missing_value = {
+            "transcript_path": str(base / "gone.jsonl"),
+            "session_id": "missing",
+            "trigger": "stop",
+        }
+        missing.write_text(json.dumps(missing_value), encoding="utf-8")
+        malformed = paths["incoming"] / "malformed.json"
+        malformed.write_bytes(b"{original malformed evidence")
+        named_like_sidecar = paths["incoming"] / "capture.reason.json"
+        corrupt_value = _doctor_job(
+            "corrupt", kind="capture_snapshot", project=None, trigger="stop",
+            original_transcript_path="C:/gone.jsonl",
+            blob_sha256="d" * 64, blob_bytes=1)
+        named_like_sidecar.write_text(
+            json.dumps(corrupt_value), encoding="utf-8")
+        stale = paths["processing"] / "stale.json"
+        stale.write_text(json.dumps(_doctor_job("stale")), encoding="utf-8")
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).timestamp()
+        os.utime(stale, (old, old))
+
+        preserved_dead = paths["dead-letter"] / "preserved.json"
+        preserved_dead.write_text(
+            json.dumps(_doctor_job("preserved")), encoding="utf-8")
+        preserved_reason = dead_letter_reason_path(preserved_dead)
+        preserved_reason.write_text(json.dumps({
+            "dead_lettered_at": "2026-07-10T08:05:00+00:00",
+            "reason": "existing evidence",
+            "manifest": preserved_dead.name,
+        }), encoding="utf-8")
+        dead_before = {
+            preserved_dead.name: preserved_dead.read_bytes(),
+            preserved_reason.name: preserved_reason.read_bytes(),
+        }
+
+        actions = repair_spool(root)
+        action_codes = {item.code for item in actions}
+        assert {
+            "stale_jobs_requeued", "legacy_upgraded", "legacy_dead_lettered",
+            "invalid_job_dead_lettered", "corrupt_job_dead_lettered",
+        } <= action_codes
+        assert source.read_bytes() == b"source evidence"
+        assert (paths["incoming"] / "stale.json").exists()
+
+        dead_files = list(paths["dead-letter"].glob("*.json"))
+        evidence = [path for path in dead_files
+                    if path.name not in {preserved_reason.name} and
+                    not spool.is_dead_letter_sidecar(path)]
+        evidence_contents = {path.read_bytes() for path in evidence}
+        assert json.dumps(upgrade_value).encode() in evidence_contents
+        assert json.dumps(missing_value).encode() in evidence_contents
+        assert b"{original malformed evidence" in evidence_contents
+        assert json.dumps(corrupt_value).encode() in evidence_contents
+        assert any(path.name.startswith("capture.reason") for path in evidence)
+        assert all(dead_letter_reason_path(path).is_file() for path in evidence)
+        assert {
+            preserved_dead.name: preserved_dead.read_bytes(),
+            preserved_reason.name: preserved_reason.read_bytes(),
+        } == dead_before
+
+
+def test_doctor_reconstructs_each_supported_occurrence_idempotently() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        spool_root = home / "spool"
+        paths = ensure_layout(spool_root)
+        data = b"archived"
+        sha = hashlib.sha256(data).hexdigest()
+        obj = home / "archive" / "objects" / "sha256" / sha[:2] / sha[2:4] / sha
+        obj.parent.mkdir(parents=True)
+        obj.write_bytes(data)
+        jobs = (
+            _doctor_job(
+                "job-one", kind="capture_snapshot", project="memoryd",
+                trigger="stop", original_transcript_path="C:/one.jsonl",
+                blob_sha256=sha, blob_bytes=len(data), session_id="same-session"),
+            _doctor_job(
+                "job-two", kind="capture_snapshot", project="memoryd",
+                trigger="stop", original_transcript_path="C:/two.jsonl",
+                blob_sha256=sha, blob_bytes=len(data), session_id="same-session"),
+        )
+        (paths["dead-letter"] / "job-one.json").write_text(
+            json.dumps(jobs[0]), encoding="utf-8")
+        (paths["dead-letter"] / "job-two.reason.json").write_text(
+            json.dumps(jobs[1]), encoding="utf-8")
+
+        legacy_source = home / "legacy-source.jsonl"
+        legacy_source.write_bytes(data)
+        legacy = {
+            "transcript_path": str(legacy_source),
+            "session_id": "legacy-session",
+            "trigger": "stop",
+            "created_at": "2026-07-10T09:00:00+00:00",
+            "blob_sha256": sha,
+            "blob_bytes": len(data),
+        }
+        (spool_root / "legacy.json").write_text(
+            json.dumps(legacy), encoding="utf-8")
+        fonds_evidence = home / "archive" / "fonds" / "preserved.txt"
+        fonds_evidence.parent.mkdir(parents=True)
+        fonds_evidence.write_bytes(b"fonds evidence")
+        manifest = home / "archive" / "manifest.jsonl"
+        manifest.write_text("{preserved malformed line\n", encoding="utf-8")
+
+        actions = repair_archive(home / "archive", spool_root)
+        reconstructed = [
+            item for item in actions
+            if item.code == "manifest_occurrence_reconstructed"]
+        assert len(reconstructed) == 3
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == "{preserved malformed line"
+        entries = [json.loads(line) for line in lines[1:]]
+        assert {entry["ingest_job_id"] for entry in entries} == {
+            "job-one", "job-two", None}
+        assert all(entry["sha256"] == sha for entry in entries)
+        assert legacy_source.read_bytes() == data
+        assert fonds_evidence.read_bytes() == b"fonds evidence"
+
+        before_second_repair = _tree_snapshot(home)
+        assert repair_archive(home / "archive", spool_root) == []
+        assert _tree_snapshot(home) == before_second_repair
+
+
 if __name__ == "__main__":
     test_snapshot_survives_original_deletion()
     test_identical_snapshots_share_one_blob()
@@ -1309,4 +1606,7 @@ if __name__ == "__main__":
     test_mixed_transcript_line_preserves_text_and_tools()
     test_fonds_paths_cannot_escape_archive()
     test_archive_records_each_occurrence()
-    print("11 passed, 0 failed")
+    test_doctor_inspection_is_read_only_and_reports_defects()
+    test_doctor_repair_preserves_and_requeues_spool_evidence()
+    test_doctor_reconstructs_each_supported_occurrence_idempotently()
+    print("14 passed, 0 failed")

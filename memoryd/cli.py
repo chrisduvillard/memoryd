@@ -4,6 +4,9 @@
                        hooks + autostart + Hermes plugin (when ~/.hermes exists)
   memoryd status       is it actually working? (the antidote to fail-open silence)
   memoryd serve        run the daemon in the foreground
+  memoryd doctor       inspect spool and archive integrity (read-only)
+  memoryd doctor --repair
+                       apply conservative, evidence-preserving repairs
   memoryd review ...   human review CLI (delegates to memoryd.review)
   memoryd microsleep   nightly consolidation (normally runs on a schedule)
   memoryd uninstall    remove hooks/autostart; data is never touched
@@ -607,6 +610,13 @@ def main() -> None:
         sys.exit(install())
     elif cmd == "status":
         sys.exit(status())
+    elif cmd == "doctor":
+        args = sys.argv[2:]
+        if args not in ([], ["--repair"]):
+            print("usage: memoryd doctor [--repair]", file=sys.stderr)
+            sys.exit(2)
+        from .doctor import main as doctor_main
+        sys.exit(doctor_main(repair=args == ["--repair"]))
     elif cmd == "review":
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         from .review import main as review_main
