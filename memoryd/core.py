@@ -474,11 +474,14 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
     sha = hashlib.sha256(data).hexdigest()
     obj_dir, obj_path = _archive_object_namespace(
         CFG.archive, sha, create=True)
+    trusted_archive_root = CFG.archive.resolve()
+    link = validate_fonds_path(trusted_archive_root, fonds_path)
     tmp = obj_dir / f".{sha}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     with tmp.open("xb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
+    keep_temp = False
     try:
         try:
             os.link(tmp, obj_path)
@@ -491,29 +494,45 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                     raise
                 time.sleep(0.01)
         _fsync_directory(obj_dir)
-        trusted_archive_root = CFG.archive.resolve()
-        link = validate_fonds_path(trusted_archive_root, fonds_path)
 
-        obj_handle, obj_stat = _open_verified_archive_object(
-            obj_path, sha, len(data))
         try:
-            seen = datetime.fromtimestamp(
-                obj_stat.st_mtime, timezone.utc).isoformat()
-            occurrence = {
-                "sha256": sha,
-                "bytes": len(data),
-                "mime": mime,
-                "first_seen": seen,
-                "occurrence_at": datetime.now(timezone.utc).isoformat(),
-                "fonds_path": fonds_path.replace("\\", "/"),
-                "ingest_job_id": ingest_job_id,
-            }
-            append_manifest_occurrence(
-                CFG.archive, occurrence,
-                pre_append=lambda: _archive_object_still_bound(
-                    obj_handle, obj_path, obj_stat, CFG.archive, sha),
-                post_append=lambda: _archive_object_still_bound(
-                    obj_handle, obj_path, obj_stat, CFG.archive, sha))
+            obj_handle, obj_stat = _open_verified_archive_object(
+                obj_path, sha, len(data))
+        except Exception:
+            keep_temp = os.path.lexists(obj_path)
+            raise
+        try:
+            try:
+                seen = datetime.fromtimestamp(
+                    obj_stat.st_mtime, timezone.utc).isoformat()
+                occurrence = {
+                    "sha256": sha,
+                    "bytes": len(data),
+                    "mime": mime,
+                    "first_seen": seen,
+                    "occurrence_at": datetime.now(timezone.utc).isoformat(),
+                    "fonds_path": fonds_path.replace("\\", "/"),
+                    "ingest_job_id": ingest_job_id,
+                }
+                append_manifest_occurrence(
+                    CFG.archive, occurrence,
+                    pre_append=lambda: _archive_object_still_bound(
+                        obj_handle, obj_path, obj_stat, CFG.archive, sha),
+                    post_append=lambda: _archive_object_still_bound(
+                        obj_handle, obj_path, obj_stat, CFG.archive, sha))
+            except Exception as exc:
+                binding_failure = (
+                    isinstance(exc, ValueError) and
+                    str(exc) in {
+                        "manifest append precondition failed",
+                        "manifest append postcondition failed",
+                    }
+                )
+                if (binding_failure or
+                        not _archive_object_still_bound(
+                            obj_handle, obj_path, obj_stat, CFG.archive, sha)):
+                    keep_temp = True
+                raise
         finally:
             obj_handle.close()
 
@@ -525,12 +544,11 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
         except OSError:
             pass
 
-        tmp.unlink(missing_ok=True)
-        _fsync_directory(obj_dir)
         return sha
-    except Exception:
-        # Keep the fsynced temporary inode as recovery evidence.
-        raise
+    finally:
+        if not keep_temp:
+            tmp.unlink(missing_ok=True)
+            _fsync_directory(obj_dir)
 
 
 def archive_file(path: Path, fonds_path: str,

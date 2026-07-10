@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from memoryd import core, doctor, ingest, server, spool
 from memoryd.cli import _spool_counts, status
 from memoryd.doctor import (
@@ -34,6 +36,26 @@ from memoryd.spool import (
     ensure_layout,
     validate_blob,
 )
+
+
+def test_script_bootstrap_prefers_checkout() -> None:
+    script = Path(__file__).resolve()
+    checkout = script.parents[1] / "memoryd"
+    probe = (
+        "import runpy,sys; "
+        "ns=runpy.run_path(sys.argv[1], run_name='bootstrap_probe'); "
+        "print(ns['core'].__file__)"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(script)],
+            cwd=td, env=env, capture_output=True, text=True,
+            timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
+    imported = Path(result.stdout.strip()).resolve()
+    assert imported.is_relative_to(checkout.resolve()), imported
 
 
 def _write_extraction_job(root: Path, name: str, session_id: str) -> Path:
@@ -1232,6 +1254,51 @@ def test_spool_state_transitions_sync_directories_and_leases() -> None:
             ("dir", paths["processing"]),
         ]
 
+        claim_failure_root = Path(td) / "claim-fsync-failure"
+        claim_failure_paths = ensure_layout(claim_failure_root)
+        _write_extraction_job(
+            claim_failure_root, "claim-failure.json", "claim-failure")
+        try:
+            with patch.object(
+                    spool, "ensure_layout",
+                    return_value=claim_failure_paths), \
+                 patch.object(
+                    spool, "_fsync_directory",
+                    side_effect=PermissionError("post-rename fsync")), \
+                 patch.object(
+                    spool, "_fsync_file",
+                    side_effect=AssertionError("lease touch must not run")):
+                spool.claim_next(claim_failure_root)
+        except PermissionError as exc:
+            assert "post-rename fsync" in str(exc)
+        else:
+            raise AssertionError("claim swallowed post-rename fsync failure")
+        assert not list(claim_failure_paths["incoming"].glob("*.json"))
+        assert list(claim_failure_paths["processing"].glob("*.json"))
+
+        stale_failure_root = Path(td) / "stale-fsync-failure"
+        stale_failure_paths = ensure_layout(stale_failure_root)
+        _write_extraction_job(
+            stale_failure_root, "stale-failure.json", "stale-failure")
+        stale_failure = spool.claim_next(stale_failure_root)
+        assert stale_failure is not None
+        os.utime(stale_failure, (old, old))
+        try:
+            with patch.object(
+                    spool, "ensure_layout",
+                    return_value=stale_failure_paths), \
+                 patch.object(
+                    spool, "_fsync_directory",
+                    side_effect=FileNotFoundError("post-rename fsync")):
+                spool.requeue_stale(
+                    stale_failure_root, stale_after_s=900)
+        except FileNotFoundError as exc:
+            assert "post-rename fsync" in str(exc)
+        else:
+            raise AssertionError("stale requeue swallowed post-rename fsync failure")
+        assert not list(stale_failure_paths["processing"].glob("*.json"))
+        assert list(stale_failure_paths["incoming"].glob("*.json"))
+
 
 def _assert_nonobject_manifest_does_not_block_drain() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -2058,6 +2125,45 @@ def test_archive_leaf_swap_rolls_back_manifest_and_preserves_temp() -> None:
             preserved = list(obj.parent.glob(f".{sha}.*.tmp"))
             assert preserved
             assert any(path.read_bytes() == data for path in preserved)
+        finally:
+            core.CFG.home = old_home
+
+
+def test_archive_unrelated_failures_do_not_accumulate_temps() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            data = b"manifest timeout cleanup"
+            sha = hashlib.sha256(data).hexdigest()
+            obj_dir = (core.CFG.archive / "objects" / "sha256" /
+                       sha[:2] / sha[2:4])
+            with patch.object(
+                    core, "append_manifest_occurrence",
+                    side_effect=TimeoutError("manifest lock timeout")):
+                for _attempt in range(3):
+                    try:
+                        core.archive_bytes(
+                            data, "text/plain", "timeouts/capture.txt")
+                    except TimeoutError as exc:
+                        assert "manifest lock timeout" in str(exc)
+                    else:
+                        raise AssertionError("manifest timeout was swallowed")
+                    assert not list(obj_dir.glob(f".{sha}.*.tmp"))
+
+            invalid = b"invalid fonds cleanup"
+            invalid_sha = hashlib.sha256(invalid).hexdigest()
+            invalid_obj = (core.CFG.archive / "objects" / "sha256" /
+                           invalid_sha[:2] / invalid_sha[2:4] / invalid_sha)
+            try:
+                core.archive_bytes(invalid, "text/plain", "../unsafe.txt")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("unsafe fonds path was accepted")
+            assert not os.path.lexists(invalid_obj)
+            assert not list(invalid_obj.parent.glob(f".{invalid_sha}.*.tmp"))
         finally:
             core.CFG.home = old_home
 
@@ -2986,6 +3092,7 @@ def test_doctor_rechecks_occurrence_identity_under_manifest_lock() -> None:
 
 
 if __name__ == "__main__":
+    test_script_bootstrap_prefers_checkout()
     test_status_counts_spool_states()
     test_snapshot_survives_original_deletion()
     test_identical_snapshots_share_one_blob()
@@ -3007,6 +3114,7 @@ if __name__ == "__main__":
     test_fonds_paths_cannot_escape_archive()
     test_archive_object_ancestors_cannot_redirect_publication_or_gc()
     test_archive_leaf_swap_rolls_back_manifest_and_preserves_temp()
+    test_archive_unrelated_failures_do_not_accumulate_temps()
     test_archive_records_each_occurrence()
     test_session_separator_fonds_identity_matches_doctor_repair()
     test_doctor_reports_unmanifested_capture_evidence()
@@ -3014,4 +3122,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("28 passed, 0 failed")
+    print("30 passed, 0 failed")

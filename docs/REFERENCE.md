@@ -120,6 +120,9 @@ Claims move jobs from `incoming/` to `processing/` under `state.lock` and touch
 and file-sync the manifest mtime. Each cross-directory state move syncs the
 destination before the source directory; completion syncs the processing
 directory after unlink. A worker requeues a processing lease older than 15 minutes.
+Rename-race handling covers only the rename syscall. If a post-rename sync or
+lease touch fails, the error propagates with the manifest already in its new
+state; it is never misreported as a missing-source no-op.
 Transient failures increment `attempts`, record `last_error`, set an
 exponential `next_attempt_at`, and return the job to `incoming/`. Permanent
 validation failures move the manifest to `dead-letter/`.
@@ -157,6 +160,9 @@ canonical descriptor through manifest-lock preconditions before and after the
 append. A leaf replacement rolls back the occurrence and retains the temporary
 file as evidence. Successful publication removes and directory-syncs the
 temporary name only after the occurrence is durable.
+Unrelated failures, such as manifest-lock timeout or I/O while the canonical
+leaf remains verified, remove the temporary file. Fonds paths are validated
+before object bytes are published, preventing invalid-path temp accumulation.
 Capture fonds dates come from the job's UTC `created_at`, so a retry after
 midnight retains the same path. Repair derives the path from the same field and
 rechecks occurrence identity while holding the manifest append lock. Fonds

@@ -304,11 +304,15 @@ def _fsync_file(path: Path) -> None:
         os.close(fd)
 
 
-def _durable_replace(source: Path, target: Path) -> None:
-    os.replace(source, target)
+def _sync_replaced_path(source: Path, target: Path) -> None:
     _fsync_directory(target.parent)
     if source.parent != target.parent:
         _fsync_directory(source.parent)
+
+
+def _durable_replace(source: Path, target: Path) -> None:
+    os.replace(source, target)
+    _sync_replaced_path(source, target)
 
 
 def _durable_unlink(path: Path) -> None:
@@ -529,7 +533,7 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
             deadline = time.monotonic() + 5
             while True:
                 try:
-                    _durable_replace(source, target)
+                    os.replace(source, target)
                 except FileNotFoundError:
                     break
                 except PermissionError as exc:
@@ -539,6 +543,7 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
                         raise exc
                     time.sleep(0.005)
                     continue
+                _sync_replaced_path(source, target)
                 _durable_touch(target)
                 return target
     return None
@@ -615,13 +620,18 @@ def requeue_stale(spool_root: Path, *, stale_after_s: int = 900) -> int:
         moved = 0
         for source in paths["processing"].glob("*.json"):
             try:
-                if source.stat().st_mtime >= cutoff:
-                    continue
-                target = _collision_safe_target(paths["incoming"], source.name)
-                _durable_replace(source, target)
-                moved += 1
+                modified = source.stat().st_mtime
             except FileNotFoundError:
                 continue
+            if modified >= cutoff:
+                continue
+            target = _collision_safe_target(paths["incoming"], source.name)
+            try:
+                os.replace(source, target)
+            except FileNotFoundError:
+                continue
+            _sync_replaced_path(source, target)
+            moved += 1
         return moved
 
 
