@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -354,6 +355,54 @@ def test_capture_persists_snapshot_before_acknowledgement() -> None:
             assert len(extraction_jobs) == 1
             assert extraction_jobs[0]["schema_version"] == 2
             assert extraction_jobs[0]["session_id"] == "extract-durable"
+
+            validation_source = Path(td) / "validation.jsonl"
+            validation_source.write_text("validation", encoding="utf-8")
+            before_invalid = {
+                path.name for path in
+                (core.CFG.spool / "incoming").glob("*.json")}
+
+            def invalid_post(path: str, payload: object) -> int:
+                invalid_request = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_port}{path}",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(invalid_request, timeout=5)
+                except urllib.error.HTTPError as exc:
+                    exc.read()
+                    return exc.code
+                raise AssertionError(f"invalid request accepted: {path} {payload!r}")
+
+            invalid_values = (None, ["bad"], {"bad": 1}, "", "   ", 7)
+            for field in ("transcript_path", "session_id", "trigger"):
+                for invalid_value in invalid_values:
+                    body = {
+                        "transcript_path": str(validation_source),
+                        "session_id": "valid-session",
+                        "trigger": "stop",
+                    }
+                    body[field] = invalid_value
+                    assert invalid_post("/capture", body) == 400
+            for invalid_value in (["bad"], {"bad": 1}, 7):
+                assert invalid_post("/capture", {
+                    "transcript_path": str(validation_source),
+                    "session_id": "valid-session",
+                    "trigger": "stop",
+                    "project": invalid_value,
+                }) == 400
+            assert invalid_post("/capture", []) == 400
+
+            for invalid_value in invalid_values:
+                assert invalid_post(
+                    "/extract", {"session_id": invalid_value}) == 400
+            assert invalid_post("/extract", []) == 400
+            after_invalid = {
+                path.name for path in
+                (core.CFG.spool / "incoming").glob("*.json")}
+            assert after_invalid == before_invalid
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -412,6 +461,28 @@ def test_claim_retry_and_dead_letter_preserve_manifest() -> None:
             assert not spool.gc_blob_if_unreferenced(
                 uncertain_root, uncertain_job["blob_sha256"], canonical)
         assert (uncertain_root / "blobs" / uncertain_job["blob_sha256"]).exists()
+
+        reason_named_root = Path(td) / "reason-named-spool"
+        reason_named_job = enqueue_capture(
+            spool_root=reason_named_root, transcript_path=gc_source,
+            session_id="reason-named", project=None, trigger="stop")
+        next((reason_named_root / "incoming").glob("*.json")).unlink()
+        dead = reason_named_root / "dead-letter"
+        reason_named_manifest = dead / "job.reason.json"
+        reason_named_manifest.write_text(
+            json.dumps(reason_named_job), encoding="utf-8")
+        reason_named_sidecar = dead / "job.reason.reason.json"
+        reason_named_sidecar.write_text(json.dumps({
+            "dead_lettered_at": datetime.now(timezone.utc).isoformat(),
+            "reason": "genuine reason-named manifest",
+            "manifest": reason_named_manifest.name,
+        }), encoding="utf-8")
+        assert not spool.gc_blob_if_unreferenced(
+            reason_named_root, reason_named_job["blob_sha256"], canonical)
+        assert (reason_named_root / "blobs" /
+                reason_named_job["blob_sha256"]).exists()
+        assert spool.is_dead_letter_sidecar(reason_named_sidecar)
+        assert not spool.is_dead_letter_sidecar(reason_named_manifest)
 
         gc_race_root = Path(td) / "gc-race-spool"
         gc_race_source = Path(td) / "gc-race.jsonl"
@@ -731,6 +802,132 @@ def _assert_extraction_replay_classification() -> None:
             core.CFG.home = old_home
 
 
+def _assert_strict_manifest_types_are_preserved() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "strict-manifests"
+        try:
+            core.CFG.ensure_dirs()
+            incoming = ensure_layout(core.CFG.spool)["incoming"]
+            common = {
+                "schema_version": 2,
+                "job_id": "job-valid",
+                "kind": "capture_snapshot",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "session_id": "session-valid",
+                "attempts": 0,
+                "last_error": None,
+                "next_attempt_at": None,
+            }
+            capture = {
+                **common,
+                "project": None,
+                "trigger": "stop",
+                "original_transcript_path": "C:/valid/session.jsonl",
+                "blob_sha256": "0" * 64,
+                "blob_bytes": 1,
+            }
+            extraction = {**common, "kind": "extraction"}
+            invalid_values = (None, [], {}, "")
+            cases: list[tuple[str, str, dict]] = []
+            for field in (
+                    "job_id", "kind", "session_id", "trigger",
+                    "original_transcript_path", "blob_sha256", "blob_bytes"):
+                for index, invalid_value in enumerate(invalid_values):
+                    cases.append((
+                        f"capture-{field}-{index}", field,
+                        {**capture, field: invalid_value}))
+            for field in ("job_id", "kind", "session_id"):
+                for index, invalid_value in enumerate(invalid_values):
+                    cases.append((
+                        f"extraction-{field}-{index}", field,
+                        {**extraction, field: invalid_value}))
+            cases.extend((
+                ("schema-bool", "schema_version",
+                 {**capture, "schema_version": True}),
+                ("schema-float", "schema_version",
+                 {**capture, "schema_version": 2.0}),
+                ("bytes-bool", "blob_bytes",
+                 {**capture, "blob_bytes": True}),
+                ("bytes-negative", "blob_bytes",
+                 {**capture, "blob_bytes": -1}),
+                ("attempts-bool", "attempts",
+                 {**capture, "attempts": True}),
+                ("project-list", "project",
+                 {**capture, "project": ["bad"]}),
+                ("next-attempt-dict", "next_attempt_at",
+                 {**extraction, "next_attempt_at": {"bad": 1}}),
+            ))
+            originals: dict[str, dict] = {}
+            for ordinal, (label, _field, value) in enumerate(cases):
+                name = f"invalid-{ordinal:03d}-{label}.json"
+                originals[name] = value
+                (incoming / name).write_text(
+                    json.dumps(value), encoding="utf-8")
+            _write_extraction_job(
+                core.CFG.spool, "zz-valid-extraction.json", "later-valid")
+
+            with patch("memoryd.extract.run_extraction",
+                       return_value={"ok": True, "stored": 0}):
+                stats = ingest.drain_spool()
+            assert stats == {
+                "processed": 1, "retried": 0,
+                "dead_lettered": len(cases), "requeued": 0,
+            }
+            dead = core.CFG.spool / "dead-letter"
+            for name, original in originals.items():
+                preserved = dead / name
+                assert json.loads(preserved.read_text(encoding="utf-8")) == original
+                reason = json.loads(
+                    preserved.with_suffix(".reason.json").read_text(
+                        encoding="utf-8"))["reason"]
+                expected_field = next(
+                    field for label, field, _value in cases
+                    if name.endswith(f"{label}.json"))
+                assert expected_field in reason, (name, reason)
+        finally:
+            core.CFG.home = old_home
+
+
+def _assert_legacy_path_types_are_preserved() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "legacy-types"
+        try:
+            core.CFG.ensure_dirs()
+            invalid_paths = (None, ["bad"], {"bad": 1}, "")
+            originals = {}
+            for index, invalid_path in enumerate(invalid_paths):
+                name = f"legacy-invalid-{index}.json"
+                value = {
+                    "transcript_path": invalid_path,
+                    "session_id": "legacy",
+                    "trigger": "stop",
+                }
+                originals[name] = value
+                (core.CFG.spool / name).write_text(
+                    json.dumps(value), encoding="utf-8")
+            _write_extraction_job(
+                core.CFG.spool, "zz-valid-extraction.json", "later-valid")
+            with patch("memoryd.extract.run_extraction",
+                       return_value={"ok": True, "stored": 0}):
+                stats = ingest.drain_spool()
+            assert stats == {
+                "processed": 1, "retried": 0,
+                "dead_lettered": len(invalid_paths), "requeued": 0,
+            }
+            dead = core.CFG.spool / "dead-letter"
+            for name, original in originals.items():
+                preserved = dead / name
+                assert json.loads(preserved.read_text(encoding="utf-8")) == original
+                reason = json.loads(
+                    preserved.with_suffix(".reason.json").read_text())[
+                        "reason"]
+                assert "transcript_path" in reason
+        finally:
+            core.CFG.home = old_home
+
+
 def test_legacy_missing_source_is_preserved() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / "spool"
@@ -746,6 +943,8 @@ def test_legacy_missing_source_is_preserved() -> None:
         assert preserved.with_suffix(".reason.json").exists()
     _assert_nonobject_manifest_does_not_block_drain()
     _assert_extraction_replay_classification()
+    _assert_strict_manifest_types_are_preserved()
+    _assert_legacy_path_types_are_preserved()
 
 
 def test_stale_processing_job_is_requeued() -> None:

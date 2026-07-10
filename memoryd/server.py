@@ -38,6 +38,10 @@ ADMIN_POST_ENDPOINTS = {
 }
 
 
+def _nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _capture_worker() -> None:
     while True:
         job = CAPTURE_Q.get()
@@ -86,6 +90,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         body = self._body()
+        if not isinstance(body, dict):
+            self._json(400, {"error": "request body must be an object"})
+            return
         if self.path == "/recall":
             try:
                 pkt = build_packet(
@@ -102,13 +109,26 @@ class Handler(BaseHTTPRequestHandler):
             if not required <= body.keys():
                 self._json(400, {"error": f"missing fields: {required - body.keys()}"})
                 return
+            trigger = body.get("trigger", "unknown")
+            project = body.get("project")
+            invalid = [
+                field for field, value in (
+                    ("transcript_path", body["transcript_path"]),
+                    ("session_id", body["session_id"]),
+                    ("trigger", trigger),
+                ) if not _nonempty_string(value)]
+            if project is not None and not _nonempty_string(project):
+                invalid.append("project")
+            if invalid:
+                self._json(400, {"error": f"invalid fields: {sorted(invalid)}"})
+                return
             try:
                 enqueue_capture(
                     spool_root=CFG.spool,
                     transcript_path=Path(body["transcript_path"]),
                     session_id=body["session_id"],
-                    project=body.get("project"),
-                    trigger=body.get("trigger", "unknown"),
+                    project=project,
+                    trigger=trigger,
                 )
             except Exception as exc:  # noqa: BLE001 — report persistence failure
                 self._json(
@@ -173,7 +193,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(e)})
         elif self.path == "/extract":
             sid = body.get("session_id")
-            if not sid:
+            if not _nonempty_string(sid):
                 self._json(400, {"error": "session_id required"})
                 return
             try:

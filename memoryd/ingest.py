@@ -153,8 +153,13 @@ def drain_spool() -> dict[str, int]:
             if not isinstance(value, dict):
                 raise ValueError("invalid job manifest: expected object")
             raw = value
-            attempts = int(raw.get("attempts", 0))
             if raw.get("extract_only"):
+                if (not isinstance(raw.get("session_id"), str) or
+                        not raw["session_id"].strip()):
+                    raise PermanentSpoolError("invalid session_id")
+                if type(raw.get("attempts", 0)) is not int:
+                    raise PermanentSpoolError("invalid attempts")
+                attempts = raw.get("attempts", 0)
                 from .extract import run_extraction
                 result = run_extraction(raw["session_id"])
                 if (not result.get("ok") and not result.get("skipped") and
@@ -164,11 +169,12 @@ def drain_spool() -> dict[str, int]:
                 complete_job(job_path)
                 stats["processed"] += 1
                 continue
-            if raw.get("schema_version") != 2:
+            if "schema_version" not in raw:
                 upgraded = upgrade_legacy_job(CFG.spool, job_path)
                 stats["dead_lettered"] += int(upgraded is None)
                 continue
             job = load_job(job_path)
+            attempts = job.get("attempts", 0)
             if job["kind"] == "extraction":
                 from .extract import run_extraction
                 result = run_extraction(job["session_id"])

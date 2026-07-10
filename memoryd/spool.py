@@ -25,6 +25,72 @@ class PermanentSpoolError(SpoolError):
     pass
 
 
+def _require_nonempty_string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PermanentSpoolError(f"invalid {field}: expected nonempty string")
+    return value
+
+
+def _require_nonnegative_int(value: object, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise PermanentSpoolError(f"invalid {field}: expected nonnegative integer")
+    return value
+
+
+def validate_job(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise PermanentSpoolError("invalid job manifest: expected object")
+    if (type(value.get("schema_version")) is not int or
+            value["schema_version"] != SCHEMA_VERSION):
+        raise PermanentSpoolError(
+            f"invalid schema_version: expected integer {SCHEMA_VERSION}")
+    for field in ("job_id", "kind", "created_at", "session_id"):
+        if field not in value:
+            raise PermanentSpoolError(f"missing manifest field: {field}")
+        _require_nonempty_string(value[field], field)
+    kind = value["kind"]
+    if kind not in ("capture_snapshot", "extraction"):
+        raise PermanentSpoolError(f"invalid kind: {kind!r}")
+    _require_nonnegative_int(value.get("attempts", 0), "attempts")
+    last_error = value.get("last_error")
+    if last_error is not None and not isinstance(last_error, str):
+        raise PermanentSpoolError("invalid last_error: expected string or null")
+    next_attempt = value.get("next_attempt_at")
+    if next_attempt is not None:
+        _require_nonempty_string(next_attempt, "next_attempt_at")
+    project = value.get("project")
+    if project is not None:
+        _require_nonempty_string(project, "project")
+
+    if kind == "capture_snapshot":
+        for field in ("trigger", "original_transcript_path", "blob_sha256"):
+            if field not in value:
+                raise PermanentSpoolError(f"missing manifest field: {field}")
+            _require_nonempty_string(value[field], field)
+        sha = value["blob_sha256"]
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+            raise PermanentSpoolError("invalid blob_sha256: expected lowercase SHA-256")
+        if "blob_bytes" not in value:
+            raise PermanentSpoolError("missing manifest field: blob_bytes")
+        _require_nonnegative_int(value["blob_bytes"], "blob_bytes")
+    return value
+
+
+def validate_legacy_job(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise PermanentSpoolError("invalid legacy manifest: expected object")
+    if "transcript_path" not in value:
+        raise PermanentSpoolError("invalid transcript_path: missing field")
+    _require_nonempty_string(value["transcript_path"], "transcript_path")
+    for field in ("session_id", "trigger"):
+        if field in value:
+            _require_nonempty_string(value[field], field)
+    project = value.get("project")
+    if project is not None:
+        _require_nonempty_string(project, "project")
+    return value
+
+
 def ensure_layout(spool_root: Path) -> dict[str, Path]:
     paths = {name: spool_root / name for name in
              ("blobs", "incoming", "processing", "dead-letter")}
@@ -115,6 +181,12 @@ def _state_lock(spool_root: Path):
 def enqueue_capture(*, spool_root: Path, transcript_path: Path,
                     session_id: str, project: str | None,
                     trigger: str) -> dict:
+    if not isinstance(transcript_path, Path):
+        raise PermanentSpoolError("invalid transcript_path: expected Path")
+    _require_nonempty_string(session_id, "session_id")
+    _require_nonempty_string(trigger, "trigger")
+    if project is not None:
+        _require_nonempty_string(project, "project")
     paths = ensure_layout(spool_root)
     source = transcript_path.expanduser()
     if not source.is_file():
@@ -153,6 +225,7 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
                 "last_error": None,
                 "next_attempt_at": None,
             }
+            validate_job(job)
             _atomic_json(paths["incoming"] / f"{job_id}.json", job)
         return job
     finally:
@@ -160,6 +233,7 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
 
 
 def enqueue_extraction(*, spool_root: Path, session_id: str) -> dict:
+    _require_nonempty_string(session_id, "session_id")
     paths = ensure_layout(spool_root)
     job_id = _job_id()
     job = {
@@ -172,6 +246,7 @@ def enqueue_extraction(*, spool_root: Path, session_id: str) -> dict:
         "last_error": None,
         "next_attempt_at": None,
     }
+    validate_job(job)
     with _state_lock(spool_root):
         _atomic_json(paths["incoming"] / f"{job_id}.json", job)
     return job
@@ -182,37 +257,18 @@ def load_job(path: Path) -> dict:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise PermanentSpoolError(f"invalid job manifest: {exc}") from exc
-    if not isinstance(value, dict):
-        raise PermanentSpoolError("invalid job manifest: expected object")
-    if value.get("schema_version") != SCHEMA_VERSION:
-        raise PermanentSpoolError("unsupported job schema")
-    required = {"job_id", "kind", "session_id"}
-    missing = required - value.keys()
-    if missing:
-        raise PermanentSpoolError(f"missing manifest fields: {sorted(missing)}")
-    if not str(value["session_id"]):
-        raise PermanentSpoolError("invalid job identity")
-    if value["kind"] == "capture_snapshot":
-        capture_required = {"trigger", "blob_sha256", "blob_bytes"}
-        missing = capture_required - value.keys()
-        if missing:
-            raise PermanentSpoolError(
-                f"missing manifest fields: {sorted(missing)}")
-        if not isinstance(value["blob_bytes"], int) or value["blob_bytes"] < 0:
-            raise PermanentSpoolError("invalid blob byte count")
-    elif value["kind"] != "extraction":
-        raise PermanentSpoolError("unsupported job kind")
-    return value
+    return validate_job(value)
 
 
 def validate_blob(spool_root: Path, job: dict) -> Path:
-    sha = str(job.get("blob_sha256", ""))
-    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
-        raise PermanentSpoolError("invalid blob checksum")
+    job = validate_job(job)
+    if job["kind"] != "capture_snapshot":
+        raise PermanentSpoolError("invalid kind: blob validation requires capture")
+    sha = job["blob_sha256"]
     blob = ensure_layout(spool_root)["blobs"] / sha
     if not blob.is_file():
         raise PermanentSpoolError(f"missing spool blob: {sha}")
-    if blob.stat().st_size != int(job["blob_bytes"]):
+    if blob.stat().st_size != job["blob_bytes"]:
         raise PermanentSpoolError(f"spool blob size mismatch: {sha}")
     digest = hashlib.sha256()
     with blob.open("rb") as handle:
@@ -286,15 +342,43 @@ def release_job(spool_root: Path, processing_path: Path, error: str,
         return target
 
 
+def dead_letter_reason_path(manifest_path: Path) -> Path:
+    reason_path = manifest_path.with_suffix(".reason.json")
+    if reason_path == manifest_path:
+        reason_path = manifest_path.with_name(
+            manifest_path.name + ".reason.json")
+    return reason_path
+
+
+def is_dead_letter_sidecar(path: Path) -> bool:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(value, dict):
+        return False
+    manifest_name = value.get("manifest")
+    reason = value.get("reason")
+    dead_lettered_at = value.get("dead_lettered_at")
+    if (not isinstance(manifest_name, str) or not manifest_name or
+            Path(manifest_name).name != manifest_name or
+            not isinstance(reason, str) or
+            not isinstance(dead_lettered_at, str) or not dead_lettered_at):
+        return False
+    manifest_path = path.parent / manifest_name
+    return (manifest_path != path and manifest_path.is_file() and
+            dead_letter_reason_path(manifest_path) == path)
+
+
 def dead_letter(spool_root: Path, job_path: Path, reason: str) -> Path:
     with _state_lock(spool_root):
         paths = ensure_layout(spool_root)
         target = paths["dead-letter"] / job_path.name
-        reason_path = target.with_suffix(".reason.json")
+        reason_path = dead_letter_reason_path(target)
         while target.exists() or reason_path.exists():
             target = target.with_name(
                 f"{target.stem}-{secrets.token_hex(4)}{target.suffix}")
-            reason_path = target.with_suffix(".reason.json")
+            reason_path = dead_letter_reason_path(target)
         _atomic_json(reason_path, {
             "dead_lettered_at": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
@@ -327,8 +411,12 @@ def requeue_stale(spool_root: Path, *, stale_after_s: int = 900) -> int:
 
 
 def upgrade_legacy_job(spool_root: Path, legacy_path: Path) -> Path | None:
-    job = json.loads(legacy_path.read_text(encoding="utf-8"))
-    source = Path(job.get("transcript_path", "")).expanduser()
+    try:
+        value = json.loads(legacy_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PermanentSpoolError(f"invalid legacy manifest: {exc}") from exc
+    job = validate_legacy_job(value)
+    source = Path(job["transcript_path"]).expanduser()
     if not source.is_file():
         dead_letter(spool_root, legacy_path, "legacy transcript source missing")
         return None
@@ -341,6 +429,30 @@ def upgrade_legacy_job(spool_root: Path, legacy_path: Path) -> Path | None:
     )
     dead_letter(spool_root, legacy_path, "upgraded to schema 2")
     return ensure_layout(spool_root)["incoming"] / f"{upgraded['job_id']}.json"
+
+
+def _candidate_blob_sha(value: object) -> str | None:
+    if not isinstance(value, dict):
+        raise PermanentSpoolError("invalid candidate manifest: expected object")
+    if "schema_version" in value:
+        job = validate_job(value)
+        return (job["blob_sha256"]
+                if job["kind"] == "capture_snapshot" else None)
+    if value.get("extract_only") is True:
+        _require_nonempty_string(value.get("session_id"), "session_id")
+        _require_nonnegative_int(value.get("attempts", 0), "attempts")
+        return None
+    if "transcript_path" in value:
+        job = validate_legacy_job(value)
+        legacy_sha = job.get("blob_sha256")
+        if legacy_sha is None:
+            return None
+        _require_nonempty_string(legacy_sha, "blob_sha256")
+        if (len(legacy_sha) != 64 or
+                any(c not in "0123456789abcdef" for c in legacy_sha)):
+            raise PermanentSpoolError("invalid blob_sha256 in legacy manifest")
+        return legacy_sha
+    raise PermanentSpoolError("unrecognized candidate manifest")
 
 
 def gc_blob_if_unreferenced(spool_root: Path, sha: str,
@@ -362,18 +474,16 @@ def gc_blob_if_unreferenced(spool_root: Path, sha: str,
             paths = ensure_layout(spool_root)
             manifests = [*spool_root.glob("*.json")]
             for state in ("incoming", "processing", "dead-letter"):
-                manifests.extend(
-                    path for path in paths[state].glob("*.json")
-                    if not path.name.endswith(".reason.json"))
+                manifests.extend(paths[state].glob("*.json"))
             for manifest in manifests:
+                if (manifest.parent == paths["dead-letter"] and
+                        is_dead_letter_sidecar(manifest)):
+                    continue
                 try:
                     value = json.loads(manifest.read_text())
-                    if (isinstance(value, dict) and
-                            value.get("blob_sha256") == sha):
+                    if _candidate_blob_sha(value) == sha:
                         return False
-                except (OSError, ValueError):
-                    return False
-                if not isinstance(value, dict):
+                except (OSError, ValueError, PermanentSpoolError):
                     return False
             blob = paths["blobs"] / sha
             blob.unlink(missing_ok=True)
