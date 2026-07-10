@@ -356,12 +356,40 @@ def _dead_letter_evidence(
     return sorted(evidence), len(evidence), findings
 
 
+def _unmanifested_capture_evidence(blob_root: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    try:
+        with os.scandir(blob_root) as entries:
+            candidates = [
+                blob_root / entry.name for entry in entries
+                if (entry.name.startswith(".collision.") or
+                    (entry.name.startswith(".job_") and
+                     entry.name.endswith(".tmp")))
+            ]
+    except FileNotFoundError:
+        return findings
+    except OSError as exc:
+        return [Finding(
+            "spool_topology_unreadable", "error", str(blob_root), str(exc))]
+    for path in sorted(candidates):
+        topology = _topology_finding(
+            path, "regular file", "spool_topology_invalid")
+        if topology is not None:
+            findings.append(topology)
+            continue
+        findings.append(Finding(
+            "unmanifested_capture_evidence", "error", str(path),
+            "preserved capture bytes have no job manifest; retain for review"))
+    return findings
+
+
 def inspect_spool(spool_root: Path) -> list[Finding]:
     """Inspect spool evidence without creating directories or lock files."""
     paths = _spool_paths(spool_root)
     findings = _spool_topology(spool_root, repair=False)
     if findings:
         return findings
+    findings.extend(_unmanifested_capture_evidence(paths["blobs"]))
     manifests, enumeration_error = _json_files(spool_root)
     if enumeration_error is not None:
         findings.append(enumeration_error)

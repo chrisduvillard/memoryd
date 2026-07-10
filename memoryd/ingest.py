@@ -26,13 +26,15 @@ def _parse_ts(entry: dict) -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _block_text(block: dict) -> str:
+def _block_text(block: dict) -> str | None:
     value = block.get("text")
     if value is None:
-        value = block.get("content", "")
+        value = block.get("content")
+    if isinstance(value, str):
+        return value
     if isinstance(value, list):
         return _text_of(value)
-    return str(value or "")
+    return None
 
 
 def _classify_all(entry: object) -> list[tuple[str, dict]]:
@@ -62,7 +64,10 @@ def _classify_all(entry: object) -> list[tuple[str, dict]]:
             continue
         elif block.get("type") == "text":
             kind = "user_message" if etype == "user" else "agent_response"
-            text = _block_text(block)[:4000]
+            block_text = _block_text(block)
+            if block_text is None:
+                continue
+            text = block_text[:4000]
             if text:
                 events.append((kind, {"text": text}))
         elif etype == "assistant" and block.get("type") == "tool_use":
@@ -77,11 +82,13 @@ def _classify_all(entry: object) -> list[tuple[str, dict]]:
                 "input_keys": sorted(tool_input),
             }]}))
         elif etype == "user" and block.get("type") == "tool_result":
-            events.append(("tool_result", {"summary": _block_text(block)[:2000]}))
+            summary = _block_text(block)
+            if summary is not None:
+                events.append(("tool_result", {"summary": summary[:2000]}))
     return events
 
 
-def _text_of(content: list) -> str:
+def _text_of(content: list) -> str | None:
     parts = []
     for b in content:
         if isinstance(b, dict) and b.get("type") == "text":
@@ -90,7 +97,7 @@ def _text_of(content: list) -> str:
                 parts.append(text)
         elif isinstance(b, str):
             parts.append(b)
-    return "\n".join(parts)
+    return "\n".join(parts) if parts else None
 
 
 def capture_fonds_path(
@@ -106,7 +113,8 @@ def capture_fonds_path(
     if captured.tzinfo is None:
         captured = captured.replace(tzinfo=timezone.utc)
     captured = captured.astimezone(timezone.utc)
-    return f"claude-code/{captured:%Y/%m/%d}/{session_id}.jsonl"
+    normalized_session = session_id.replace("\\", "/")
+    return f"claude-code/{captured:%Y/%m/%d}/{normalized_session}.jsonl"
 
 
 def ingest_transcript(transcript_path: str, session_id: str, project: str | None,

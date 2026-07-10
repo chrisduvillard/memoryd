@@ -95,10 +95,10 @@ class Config:
         return self.home / "spool"
 
     def ensure_dirs(self) -> None:
-        (self.archive / "objects" / "sha256").mkdir(parents=True, exist_ok=True)
-        (self.archive / "fonds").mkdir(parents=True, exist_ok=True)
-        self.spool.mkdir(parents=True, exist_ok=True)
-        (self.home / "digest").mkdir(parents=True, exist_ok=True)
+        _mkdir_durable(self.archive / "objects" / "sha256")
+        _mkdir_durable(self.archive / "fonds")
+        _mkdir_durable(self.spool)
+        _mkdir_durable(self.home / "digest")
 
 
 CFG = Config()
@@ -228,22 +228,94 @@ def _manifest_file_lock(manifest: Path):
             os.close(fd)
 
 
+def _directory_fsync_unsupported(exc: OSError) -> bool:
+    unsupported = {
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    if os.name == "nt":
+        unsupported.update({errno.EACCES, errno.EPERM, errno.EBADF})
+    return exc.errno in unsupported
+
+
 def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     try:
         fd = os.open(path, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        if _directory_fsync_unsupported(exc):
+            return
+        raise
     try:
         try:
             os.fsync(fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            if not _directory_fsync_unsupported(exc):
+                raise
     finally:
+        os.close(fd)
+
+
+def _redirected_directory(path: Path, path_stat: os.stat_result) -> bool:
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None:
         try:
-            os.close(fd)
+            if is_junction():
+                return True
         except OSError:
-            pass
+            return True
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(path_stat, "st_file_attributes", 0) & reparse)
+
+
+def _require_plain_directory(path: Path) -> None:
+    path_stat = path.stat(follow_symlinks=False)
+    if (_redirected_directory(path, path_stat) or
+            not stat.S_ISDIR(path_stat.st_mode)):
+        raise ValueError(f"unsafe archive directory: {path}")
+
+
+def _mkdir_durable(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not os.path.lexists(current):
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            _require_plain_directory(directory)
+            _fsync_directory(directory.parent)
+        else:
+            _fsync_directory(directory.parent)
+
+
+def _archive_object_namespace(
+        archive_root: Path, sha: str, *, create: bool) -> tuple[Path, Path]:
+    if create:
+        _mkdir_durable(archive_root)
+    _require_plain_directory(archive_root)
+    current = archive_root
+    for component in ("objects", "sha256", sha[:2], sha[2:4]):
+        child = current / component
+        if create and not os.path.lexists(child):
+            try:
+                child.mkdir()
+            except FileExistsError:
+                _require_plain_directory(child)
+                _fsync_directory(current)
+            else:
+                _fsync_directory(current)
+        _require_plain_directory(child)
+        current = child
+    return current, current / sha
 
 
 def _verify_archive_object(obj_path: Path, sha: str,
@@ -362,9 +434,8 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
     archive call records its own occurrence.
     """
     sha = hashlib.sha256(data).hexdigest()
-    obj_dir = CFG.archive / "objects" / "sha256" / sha[:2] / sha[2:4]
-    obj_path = obj_dir / sha
-    obj_dir.mkdir(parents=True, exist_ok=True)
+    obj_dir, obj_path = _archive_object_namespace(
+        CFG.archive, sha, create=True)
     if not os.path.lexists(obj_path):
         tmp = obj_dir / f".{sha}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
         try:
@@ -386,6 +457,10 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
             tmp.unlink(missing_ok=True)
 
     obj_stat = _verify_archive_object(obj_path, sha, len(data))
+    verified_dir, verified_path = _archive_object_namespace(
+        CFG.archive, sha, create=False)
+    if verified_dir != obj_dir or verified_path != obj_path:
+        raise ValueError("archive object namespace changed during publication")
     _fsync_directory(obj_dir)
 
     # fonds symlink (original-order view); best effort, never fatal

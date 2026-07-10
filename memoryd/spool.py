@@ -98,7 +98,10 @@ def ensure_layout(spool_root: Path) -> dict[str, Path]:
     paths = {name: spool_root / name for name in
              ("blobs", "incoming", "processing", "dead-letter")}
     for path in paths.values():
-        path.mkdir(parents=True, exist_ok=True)
+        _mkdir_durable(path)
+    _require_plain_directory(spool_root)
+    for path in paths.values():
+        _require_plain_directory(path)
     return paths
 
 
@@ -156,10 +159,29 @@ def _require_plain_directory(path: Path) -> None:
         path_stat = path.stat(follow_symlinks=False)
     except OSError as exc:
         raise PermanentSpoolError(
-            f"untrusted spool directory: {path}: {exc}") from exc
+            f"untrusted directory: {path}: {exc}") from exc
     if (_redirected(path, path_stat) or
             not stat.S_ISDIR(path_stat.st_mode)):
-        raise PermanentSpoolError(f"untrusted spool directory: {path}")
+        raise PermanentSpoolError(f"untrusted directory: {path}")
+
+
+def _require_canonical_archive_namespace(path: Path, sha: str) -> None:
+    parent = path.parent
+    shard_a = parent.parent
+    sha_root = shard_a.parent
+    objects = sha_root.parent
+    archive = objects.parent
+    shaped = (
+        path.name == sha and parent.name == sha[2:4] and
+        shard_a.name == sha[:2] and sha_root.name == "sha256" and
+        objects.name == "objects"
+    )
+    directories = (
+        (archive, objects, sha_root, shard_a, parent)
+        if shaped else (parent,)
+    )
+    for directory in directories:
+        _require_plain_directory(directory)
 
 
 def _read_verified_file(path: Path, sha: str,
@@ -196,22 +218,56 @@ def _read_verified_file(path: Path, sha: str,
     return data
 
 
+def _directory_fsync_unsupported(exc: OSError) -> bool:
+    unsupported = {
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    if os.name == "nt":
+        unsupported.update({errno.EACCES, errno.EPERM, errno.EBADF})
+    return exc.errno in unsupported
+
+
 def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     try:
         fd = os.open(path, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        if _directory_fsync_unsupported(exc):
+            return
+        raise
     try:
         try:
             os.fsync(fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            if not _directory_fsync_unsupported(exc):
+                raise
     finally:
+        os.close(fd)
+
+
+def _mkdir_durable(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not os.path.lexists(current):
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for directory in reversed(missing):
         try:
-            os.close(fd)
-        except OSError:
-            pass
+            directory.mkdir()
+        except FileExistsError:
+            path_stat = directory.stat(follow_symlinks=False)
+            if (_redirected(directory, path_stat) or
+                    not stat.S_ISDIR(path_stat.st_mode)):
+                raise PermanentSpoolError(
+                    f"untrusted spool directory: {directory}")
+            _fsync_directory(directory.parent)
+        else:
+            _fsync_directory(directory.parent)
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -301,33 +357,39 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
             sha, size = _copy_and_hash(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
+
+        def preserve_temporary() -> Path:
+            nonlocal remove_tmp
+            evidence = paths["blobs"] / f".collision.{sha}.{job_id}"
+            try:
+                os.replace(tmp_blob, evidence)
+            except OSError:
+                # The fsynced temporary file remains durable evidence.
+                remove_tmp = False
+                return tmp_blob
+            _fsync_directory(paths["blobs"])
+            return evidence
+
         with _state_lock(spool_root):
             blob = paths["blobs"] / sha
             try:
-                os.link(tmp_blob, blob)
-            except OSError as exc:
-                if exc.errno not in (errno.EEXIST, errno.EACCES, errno.EPERM):
-                    raise
                 try:
+                    os.link(tmp_blob, blob)
+                except OSError as exc:
+                    if exc.errno not in (
+                            errno.EEXIST, errno.EACCES, errno.EPERM):
+                        raise
                     _read_verified_file(blob, sha, size)
-                except PermanentSpoolError as collision:
-                    evidence = (paths["blobs"] /
-                                f".collision.{sha}.{job_id}")
-                    preserved_at = tmp_blob
-                    try:
-                        os.replace(tmp_blob, evidence)
-                        _fsync_directory(paths["blobs"])
-                        preserved_at = evidence
-                    except OSError:
-                        # The fsynced temporary file remains durable evidence.
-                        remove_tmp = False
-                    raise PermanentSpoolError(
-                        f"invalid spool blob collision for {sha}; "
-                        f"capture bytes preserved at {preserved_at}") from collision
                 _fsync_directory(paths["blobs"])
-            else:
-                _fsync_directory(paths["blobs"])
-            _read_verified_file(blob, sha, size)
+                _read_verified_file(blob, sha, size)
+            except PermanentSpoolError as collision:
+                preserved_at = preserve_temporary()
+                raise PermanentSpoolError(
+                    f"invalid spool blob collision for {sha}; "
+                    f"capture bytes preserved at {preserved_at}") from collision
+            except OSError:
+                preserve_temporary()
+                raise
             job = {
                 "schema_version": SCHEMA_VERSION,
                 "job_id": job_id,
@@ -579,7 +641,7 @@ def gc_blob_if_unreferenced(spool_root: Path, sha: str,
           ("blobs", "incoming", "processing", "dead-letter")),
     ]
     try:
-        _require_plain_directory(canonical_object.parent)
+        _require_canonical_archive_namespace(canonical_object, sha)
         _read_verified_file(canonical_object, sha, None)
         for directory in expected_layout:
             _require_plain_directory(directory)
@@ -611,7 +673,7 @@ def gc_blob_if_unreferenced(spool_root: Path, sha: str,
             except PermanentSpoolError:
                 return False
             try:
-                _require_plain_directory(canonical_object.parent)
+                _require_canonical_archive_namespace(canonical_object, sha)
                 _read_verified_file(canonical_object, sha, None)
             except PermanentSpoolError:
                 return False

@@ -39,7 +39,7 @@ spool/
   dead-letter/    preserved jobs that cannot be processed
 ```
 
-The hook first attempts the existing `/capture` request. On failure, it streams the transcript into a temporary file under `blobs/`, calculates SHA-256, flushes the file, and publishes it without overwriting `blobs/<sha256>`. It syncs the containing directory where the platform permits it. An existing regular file wins only after its size and digest match. If the incumbent is corrupt, redirected, or not a regular file, memoryd preserves the known-good temporary bytes and refuses to acknowledge the capture.
+The hook first attempts the existing `/capture` request. On failure, it streams the transcript into a temporary file under `blobs/`, calculates SHA-256, flushes the file, and publishes it without overwriting `blobs/<sha256>`. It syncs each newly created parent entry and the containing directory where the platform permits it. Known unsupported directory-sync errors are safe fallbacks; genuine I/O errors abort acknowledgement. An existing regular file wins only after its size and digest match. If the incumbent is corrupt, redirected, not a regular file, or replaced before final validation, memoryd preserves the known-good temporary bytes and refuses to acknowledge the capture.
 
 After the blob is durable, the hook writes a versioned job manifest to a temporary file under `incoming/` and atomically renames it to `<job_id>.json`. A visible warning reports failure if the hook can neither reach the daemon nor persist the bundle.
 
@@ -112,8 +112,8 @@ Replace the one-result classifier with a classifier that returns a list of event
 - their order within the source line.
 
 Unknown transcript shapes remain in the raw snapshot even when the ledger classifier cannot interpret them.
-Malformed top-level values, messages, content blocks, and tool inputs emit no
-ledger event. They complete as raw-only captures instead of entering a
+Malformed top-level values, messages, content blocks, tool inputs, typed text,
+and typed tool results emit no ledger event. They complete as raw-only captures instead of entering a
 transient retry loop.
 
 ## Archive Safety
@@ -126,11 +126,11 @@ All archive fonds paths pass through one validator before filesystem access. The
 - `.` and `..` components; and
 - any resolved path outside `archive/fonds`.
 
-Archive object writes use unique temporary names, file flush, `fsync` where the platform supports it, and no-overwrite publication. Concurrent writers of identical bytes converge on the same checksum object. Namespace publication syncs the containing directory where supported.
+Archive object writes use unique temporary names, file flush, `fsync` where the platform supports it, and no-overwrite publication. Concurrent writers of identical bytes converge on the same checksum object. Publication and garbage collection validate the archive root, `objects`, `sha256`, and both shard directories without following redirects. Namespace publication syncs every new parent entry and the containing directory where supported.
 
 The manifest records each archival occurrence. Object content remains deduplicated, but repeated captures retain separate provenance records. Each record includes checksum, byte count, MIME type, first-seen time for the object, occurrence time, fonds path, and ingest job ID when available.
 
-Capture fonds paths use the capture job's UTC `created_at`, not processing time. Retries therefore retain one stable path across midnight. Repair derives the same path and rechecks exact occurrence identity while holding the manifest append lock.
+Capture fonds paths use the capture job's UTC `created_at`, not processing time. Retries therefore retain one stable path across midnight. Fonds construction normalizes session backslashes before both ingestion and repair. Repair derives the same path and rechecks exact occurrence identity while holding the manifest append lock.
 
 ## Failure Handling
 
