@@ -73,6 +73,22 @@ def _mask(dsn: str) -> str:
     return re.sub(r"(://[^:/@]+:)[^@]+@", r"\1***@", dsn)
 
 
+def _spool_counts(spool_root: Path) -> dict[str, int]:
+    from .spool import is_dead_letter_sidecar
+
+    legacy = len(list(spool_root.glob("*.json")))
+    dead_letter = sum(
+        1 for path in (spool_root / "dead-letter").glob("*.json")
+        if not is_dead_letter_sidecar(path))
+    return {
+        "incoming": legacy + len(list(
+            (spool_root / "incoming").glob("*.json"))),
+        "processing": len(list(
+            (spool_root / "processing").glob("*.json"))),
+        "dead_letter": dead_letter,
+    }
+
+
 def _health(timeout: float = 2) -> dict | None:
     from .hook import _cfg
     port, _ = _cfg()
@@ -519,10 +535,15 @@ def status() -> int:
     hp = Path("~/.hermes/plugins/memory/memoryd").expanduser()
     print(f"  hermes     {'plugin installed' if hp.is_dir() else 'not installed (~/.hermes missing)'}")
 
-    spool = home / "spool"
-    n_spool = len(list(spool.glob("*.json"))) if spool.is_dir() else 0
-    print(f"  spool      {n_spool} pending capture(s)"
-          + ("  <- captures are failing; is the daemon up?" if n_spool else ""))
+    spool_counts = _spool_counts(home / "spool")
+    if spool_counts["dead_letter"]:
+        ok = False
+    print("  spool      "
+          f"incoming={spool_counts['incoming']} "
+          f"processing={spool_counts['processing']} "
+          f"dead-letter={spool_counts['dead_letter']}"
+          + ("  <- run `memoryd doctor`"
+             if spool_counts["dead_letter"] else ""))
 
     mem_line = " ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none yet"
     print(f"  memories   {mem_line}"

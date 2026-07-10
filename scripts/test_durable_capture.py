@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memoryd import core, doctor, ingest, server, spool
+from memoryd.cli import _spool_counts
 from memoryd.doctor import (
     inspect_archive,
     inspect_spool,
@@ -57,6 +58,49 @@ def _create_directory_link(target: Path, link: Path) -> None:
             raise
         import _winapi
         _winapi.CreateJunction(str(target), str(link))
+
+
+def test_status_counts_spool_states() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        paths = ensure_layout(root)
+        created_at = "2026-07-10T00:00:00+00:00"
+
+        def extraction_job(job_id: str) -> dict:
+            return {
+                "schema_version": 2,
+                "job_id": job_id,
+                "kind": "extraction",
+                "created_at": created_at,
+                "session_id": "status-session",
+                "attempts": 0,
+                "last_error": None,
+                "next_attempt_at": None,
+            }
+
+        (root / "legacy-flat.json").write_text(
+            json.dumps({"transcript_path": "C:/legacy.jsonl"}),
+            encoding="utf-8")
+        (paths["incoming"] / "incoming.json").write_text(
+            json.dumps(extraction_job("incoming")), encoding="utf-8")
+        (paths["processing"] / "processing.json").write_text(
+            json.dumps(extraction_job("processing")), encoding="utf-8")
+        (paths["dead-letter"] / "genuine.reason.json").write_text(
+            json.dumps(extraction_job("genuine-reason-name")), encoding="utf-8")
+        dead_manifest = paths["dead-letter"] / "dead.json"
+        dead_manifest.write_text(
+            json.dumps(extraction_job("dead")), encoding="utf-8")
+        dead_letter_reason_path(dead_manifest).write_text(json.dumps({
+            "dead_lettered_at": created_at,
+            "reason": "permanent failure",
+            "manifest": dead_manifest.name,
+        }), encoding="utf-8")
+
+        assert _spool_counts(root) == {
+            "incoming": 2,
+            "processing": 1,
+            "dead_letter": 2,
+        }
 
 
 def _archive_with_synchronized_publication(
@@ -2065,6 +2109,7 @@ def test_doctor_reconstructs_each_supported_occurrence_idempotently() -> None:
 
 
 if __name__ == "__main__":
+    test_status_counts_spool_states()
     test_snapshot_survives_original_deletion()
     test_identical_snapshots_share_one_blob()
     test_hook_spools_bytes_when_daemon_is_down()
@@ -2079,4 +2124,4 @@ if __name__ == "__main__":
     test_doctor_inspection_is_read_only_and_reports_defects()
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
-    print("14 passed, 0 failed")
+    print("15 passed, 0 failed")
