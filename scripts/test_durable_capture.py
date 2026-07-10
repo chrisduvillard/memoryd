@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memoryd.hook import capture
+from memoryd.ingest import _classify_all
 from memoryd.spool import enqueue_capture, ensure_layout, validate_blob
 
 
@@ -86,9 +87,25 @@ def test_hook_warns_when_delivery_and_spooling_fail() -> None:
     assert "capture not durably saved" in stderr.getvalue()
 
 
+def test_mixed_transcript_line_preserves_text_and_tools() -> None:
+    assistant = {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "final answer"},
+        {"type": "tool_use", "name": "shell", "input": {"command": "pwd"}},
+    ]}}
+    user = {"type": "user", "message": {"content": [
+        {"type": "text", "text": "remember this"},
+        {"type": "tool_result", "content": "ok"},
+    ]}}
+    assert [kind for kind, _ in _classify_all(assistant)] == [
+        "agent_response", "tool_call"]
+    assert [kind for kind, _ in _classify_all(user)] == [
+        "user_message", "tool_result"]
+
+
 if __name__ == "__main__":
     test_snapshot_survives_original_deletion()
     test_identical_snapshots_share_one_blob()
     test_hook_spools_bytes_when_daemon_is_down()
     test_hook_warns_when_delivery_and_spooling_fail()
-    print("4 passed, 0 failed")
+    test_mixed_transcript_line_preserves_text_and_tools()
+    print("5 passed, 0 failed")

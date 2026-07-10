@@ -4,10 +4,11 @@ Raw archival is step one and unconditional (spec §4.3). The parser is
 deliberately tolerant: unknown line shapes are still archived inside the
 raw blob; only ledger event extraction is best-effort. Re-running ingestion
 on the same transcript is idempotent at the ledger level via a per-line
-content check against already-ingested barcodes for the session.
+source identity derived from the transcript line.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,30 +26,48 @@ def _parse_ts(entry: dict) -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _classify(entry: dict) -> tuple[str, dict] | None:
-    """Map a transcript line to (event_kind, small_payload) or None to skip."""
+def _block_text(block: dict) -> str:
+    value = block.get("text")
+    if value is None:
+        value = block.get("content", "")
+    if isinstance(value, list):
+        return _text_of(value)
+    return str(value or "")
+
+
+def _classify_all(entry: dict) -> list[tuple[str, dict]]:
     etype = entry.get("type")
-    msg = entry.get("message") or {}
-    if etype == "user":
-        content = msg.get("content")
-        if isinstance(content, list):
-            # tool_result blocks come back on user turns
-            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-                return "tool_result", {"summary": _text_of(content)[:2000]}
-            return "user_message", {"text": _text_of(content)[:4000]}
-        return "user_message", {"text": str(content)[:4000]}
-    if etype == "assistant":
-        content = msg.get("content")
-        if isinstance(content, list):
-            tools = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
-            if tools:
-                return "tool_call", {
-                    "tools": [{"name": t.get("name"), "input_keys": sorted((t.get("input") or {}).keys())}
-                              for t in tools][:10]
-                }
-            return "agent_response", {"text": _text_of(content)[:4000]}
-        return "agent_response", {"text": str(content)[:4000]}
-    return None  # summaries, meta lines etc. live in the raw blob only
+    content = (entry.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        text = str(content or "")[:4000]
+        if not text:
+            return []
+        if etype == "user":
+            return [("user_message", {"text": text})]
+        if etype == "assistant":
+            return [("agent_response", {"text": text})]
+        return []
+
+    events: list[tuple[str, dict]] = []
+    for block in content:
+        if isinstance(block, str):
+            kind = "user_message" if etype == "user" else "agent_response"
+            events.append((kind, {"text": block[:4000]}))
+        elif not isinstance(block, dict):
+            continue
+        elif block.get("type") == "text":
+            kind = "user_message" if etype == "user" else "agent_response"
+            text = _block_text(block)[:4000]
+            if text:
+                events.append((kind, {"text": text}))
+        elif etype == "assistant" and block.get("type") == "tool_use":
+            events.append(("tool_call", {"tools": [{
+                "name": block.get("name"),
+                "input_keys": sorted((block.get("input") or {}).keys()),
+            }]}))
+        elif etype == "user" and block.get("type") == "tool_result":
+            events.append(("tool_result", {"summary": _block_text(block)[:2000]}))
+    return events
 
 
 def _text_of(content: list) -> str:
@@ -62,7 +81,8 @@ def _text_of(content: list) -> str:
 
 
 def ingest_transcript(transcript_path: str, session_id: str, project: str | None,
-                      trigger: str) -> dict:
+                      trigger: str, *, ingest_job_id: str | None = None,
+                      source_adapter: str = "claude-code") -> dict:
     """Archive the transcript file and append ledger events for new lines."""
     path = Path(transcript_path).expanduser()
     if not path.exists():
@@ -74,44 +94,43 @@ def ingest_transcript(transcript_path: str, session_id: str, project: str | None
 
     new_events = 0
     with pool().connection() as conn:
-        seen: set[str] = {
-            r[0] for r in conn.execute(
-                "SELECT barcode FROM events WHERE session_id = %s", (session_id,)
-            )
-        }
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
+        for line_no, raw_line in enumerate(
+                path.read_text(encoding="utf-8", errors="replace").splitlines()):
+            line = raw_line.strip()
             if not line:
                 continue
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            mapped = _classify(entry)
-            if mapped is None:
-                continue
-            kind, payload = mapped
+            native = entry.get("uuid")
+            base_id = (f"uuid:{native}" if native else
+                       f"line:{line_no}:{hashlib.sha256(raw_line.encode()).hexdigest()}")
             ts = _parse_ts(entry)
-            # cheap idempotency probe: same ts+kind+payload hash -> same barcode
-            import hashlib
-            content_hash = hashlib.sha256(
-                json.dumps(payload, sort_keys=True, default=str).encode()
-            ).hexdigest()
-            probe = f"{ts.strftime('%Y%m%dT%H%M%S')}|{session_id[:8]}|{kind}|{content_hash[:8]}"
-            if probe in seen:
-                continue
-            append_event(conn, kind=kind, session_id=session_id, ts=ts,
-                         project=project, raw_sha256=sha, payload=payload)
-            seen.add(probe)
-            new_events += 1
+            for ordinal, (kind, payload) in enumerate(_classify_all(entry)):
+                event_id = f"{base_id}:{ordinal}:{kind}"
+                inserted = append_event(
+                    conn, kind=kind, session_id=session_id, ts=ts,
+                    project=project, raw_sha256=sha, payload=payload,
+                    source_adapter=source_adapter,
+                    source_event_id=event_id,
+                    source_seq=line_no,
+                    ingest_job_id=ingest_job_id,
+                )
+                new_events += int(inserted is not None)
         # ack only when there's something to acknowledge — a per-turn Stop
         # capture with zero new events would otherwise append one meta row
         # per idle turn. session_end/pre_compact always ack (microsleep's
         # extraction-retry query keys on those triggers).
         if new_events or trigger in ("session_end", "pre_compact"):
-            append_event(conn, kind="capture_ack", session_id=session_id,
-                         project=project, raw_sha256=sha, meta=True,
-                         payload={"trigger": trigger, "new_events": new_events})
+            append_event(
+                conn, kind="capture_ack", session_id=session_id,
+                project=project, raw_sha256=sha, meta=True,
+                payload={"trigger": trigger, "new_events": new_events},
+                source_adapter=source_adapter,
+                source_event_id=f"capture_ack:{sha}:{trigger}",
+                ingest_job_id=ingest_job_id,
+            )
         conn.commit()
     return {"ok": True, "sha256": sha, "new_events": new_events}
 

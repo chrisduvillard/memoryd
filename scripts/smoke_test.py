@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +20,7 @@ sys.stdout.reconfigure(encoding="utf-8")  # ✓/✗ on cp1252 Windows consoles
 import psycopg  # noqa: E402
 from memoryd.core import CFG, append_event, new_id, pool  # noqa: E402
 
+DSN = CFG.dsn
 PASS: list[str] = []
 FAIL: list[str] = []
 
@@ -144,24 +146,57 @@ def main() -> int:
             f.write(json.dumps(line) + "\n")
         tpath = f.name
 
-    code, resp = http("/capture", {"transcript_path": tpath, "session_id": "smoketest-s2",
+    capture_session = f"smoketest-s2-{int(time.time())}"
+    code, resp = http("/capture", {"transcript_path": tpath, "session_id": capture_session,
                                    "project": "smoketest", "trigger": "session_end"})
     check("capture returns 202", code == 202, str(resp))
     time.sleep(1.0)  # async worker
 
     with pool().connection() as conn:
-        n = conn.execute("SELECT count(*) FROM events WHERE session_id='smoketest-s2' AND NOT meta").fetchone()[0]
+        n = conn.execute(
+            "SELECT count(*) FROM events WHERE session_id=%s AND NOT meta",
+            (capture_session,)).fetchone()[0]
         check("ledger events written from transcript", n == 3, f"got {n}")
         # idempotency: capture same transcript again
-        http("/capture", {"transcript_path": tpath, "session_id": "smoketest-s2",
+        http("/capture", {"transcript_path": tpath, "session_id": capture_session,
                           "project": "smoketest", "trigger": "session_end"})
         time.sleep(1.0)
-        n2 = conn.execute("SELECT count(*) FROM events WHERE session_id='smoketest-s2' AND NOT meta").fetchone()[0]
+        n2 = conn.execute(
+            "SELECT count(*) FROM events WHERE session_id=%s AND NOT meta",
+            (capture_session,)).fetchone()[0]
         check("re-ingestion is idempotent", n2 == n, f"{n} -> {n2}")
         sha = conn.execute(
-            "SELECT raw_sha256 FROM events WHERE session_id='smoketest-s2' AND NOT meta LIMIT 1").fetchone()[0]
+            "SELECT raw_sha256 FROM events WHERE session_id=%s AND NOT meta LIMIT 1",
+            (capture_session,)).fetchone()[0]
         blob = CFG.archive / "objects" / "sha256" / sha[:2] / sha[2:4] / sha
         check("raw blob archived, content-addressed", blob.exists())
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        td = Path(temp_dir)
+        mixed_session = f"smoke-mixed-{int(time.time())}"
+        mixed = td / "mixed.jsonl"
+        mixed.write_text(json.dumps({
+            "uuid": "stable-mixed-line",
+            "type": "assistant",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"content": [
+                {"type": "text", "text": "kept answer"},
+                {"type": "tool_use", "name": "shell", "input": {"command": "pwd"}},
+            ]},
+        }) + "\n", encoding="utf-8")
+        body = {"transcript_path": str(mixed), "session_id": mixed_session,
+                "project": "smoketest", "trigger": "stop"}
+        http("/capture", body)
+        time.sleep(1)
+        http("/capture", body)
+        time.sleep(1)
+        with psycopg.connect(DSN) as conn:
+            kinds = [r[0] for r in conn.execute(
+                "SELECT kind FROM events WHERE session_id=%s ORDER BY source_event_id",
+                (mixed_session,)).fetchall() if r[0] != "capture_ack"]
+        check("mixed transcript preserves text and tool call",
+              sorted(kinds) == ["agent_response", "tool_call"], str(kinds))
+        check("stable source ids prevent duplicate replay", len(kinds) == 2, str(kinds))
 
     print("== 3. recall packet ==")
     code, pkt = http("/recall", {"prompt": "should I modify the backfill cron for the indicator job?",

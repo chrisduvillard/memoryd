@@ -207,18 +207,31 @@ def append_event(
     raw_sha256: str | None = None,
     payload: dict | None = None,
     meta: bool = False,
-) -> str:
+    source_adapter: str | None = None,
+    source_event_id: str | None = None,
+    source_seq: int | None = None,
+    ingest_job_id: str | None = None,
+) -> str | None:
     ts = ts or datetime.now(timezone.utc)
     payload = payload or {}
     content_hash = hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode()
     ).hexdigest()
     eid = new_id("evt")
-    conn.execute(
+    row = conn.execute(
         """INSERT INTO events (id, ts, kind, session_id, agent, project,
-                               raw_sha256, payload, meta, barcode)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                               raw_sha256, payload, meta, barcode,
+                               source_adapter, source_event_id, source_seq,
+                               ingest_job_id)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (source_adapter, session_id, source_event_id)
+             WHERE source_adapter IS NOT NULL AND source_event_id IS NOT NULL
+           DO NOTHING
+           RETURNING id""",
         (eid, ts, kind, session_id, agent, project, raw_sha256,
-         Jsonb(payload), meta, barcode(ts, session_id, kind, content_hash)),
-    )
-    return eid
+         Jsonb(payload), meta, barcode(ts, session_id, kind, content_hash),
+         source_adapter, source_event_id, source_seq, ingest_job_id),
+    ).fetchone()
+    if not row:
+        return None
+    return row["id"] if isinstance(row, dict) else row[0]
