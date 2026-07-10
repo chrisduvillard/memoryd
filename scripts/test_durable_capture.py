@@ -602,6 +602,15 @@ def test_first_use_namespaces_sync_parents_and_eio_propagates() -> None:
             spool._mkdir_durable(raced)
         assert raced.parent in raced_syncs
 
+        existing_spool = base / "existing-spool-directory"
+        existing_spool.mkdir()
+        observed_spool_syncs: list[Path] = []
+        with patch.object(
+                spool, "_fsync_directory",
+                side_effect=lambda path: observed_spool_syncs.append(Path(path))):
+            spool._mkdir_durable(existing_spool)
+        assert existing_spool.parent in observed_spool_syncs
+
         old_home = core.CFG.home
         core.CFG.home = base / "fresh" / "memory"
         archive_syncs: list[Path] = []
@@ -623,6 +632,21 @@ def test_first_use_namespaces_sync_parents_and_eio_propagates() -> None:
                 archive / "objects" / "sha256" / sha[:2] / sha[2:4],
             }
             assert expected.issubset(set(archive_syncs))
+
+            observed_archive_syncs: list[Path] = []
+            with patch.object(
+                    core, "_fsync_directory",
+                    side_effect=lambda path: observed_archive_syncs.append(
+                        Path(path))):
+                core._archive_object_namespace(
+                    archive, sha, create=True)
+            assert {
+                archive.parent,
+                archive,
+                archive / "objects",
+                archive / "objects" / "sha256",
+                archive / "objects" / "sha256" / sha[:2],
+            }.issubset(set(observed_archive_syncs))
         finally:
             core.CFG.home = old_home
 
@@ -1133,6 +1157,82 @@ def test_claim_retry_and_dead_letter_preserve_manifest() -> None:
         assert not (sidecar_paths["dead-letter"] / "recoverable.json").exists()
 
 
+def test_spool_state_transitions_sync_directories_and_leases() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        paths = ensure_layout(root)
+        _write_extraction_job(root, "state.json", "state-session")
+        events: list[tuple[str, Path]] = []
+
+        def sync_directory(path: Path) -> None:
+            events.append(("dir", Path(path)))
+
+        def sync_file(path: Path) -> None:
+            events.append(("file", Path(path)))
+
+        patches = (
+            patch.object(spool, "ensure_layout", return_value=paths),
+            patch.object(spool, "_fsync_directory", side_effect=sync_directory),
+            patch.object(
+                spool, "_fsync_file", side_effect=sync_file, create=True),
+        )
+        with patches[0], patches[1], patches[2]:
+            claimed = spool.claim_next(root)
+        assert claimed is not None
+        assert events == [
+            ("dir", paths["processing"]),
+            ("dir", paths["incoming"]),
+            ("file", claimed),
+        ]
+
+        events.clear()
+        with patch.object(spool, "ensure_layout", return_value=paths), \
+             patch.object(spool, "_fsync_directory", side_effect=sync_directory):
+            released = spool.release_job(root, claimed, "retry", delay_s=1)
+        assert events == [
+            ("dir", paths["processing"]),
+            ("dir", paths["incoming"]),
+            ("dir", paths["processing"]),
+        ]
+
+        claimed = spool.claim_next(root, ignore_schedule=True)
+        assert claimed is not None
+        events.clear()
+        with patch.object(spool, "ensure_layout", return_value=paths), \
+             patch.object(spool, "_fsync_directory", side_effect=sync_directory):
+            dead = spool.dead_letter(root, claimed, "permanent")
+        assert events == [
+            ("dir", paths["dead-letter"]),
+            ("dir", paths["dead-letter"]),
+            ("dir", paths["processing"]),
+        ]
+        assert dead.exists()
+
+        _write_extraction_job(root, "complete.json", "complete-session")
+        claimed = spool.claim_next(root)
+        assert claimed is not None
+        events.clear()
+        with patch.object(spool, "ensure_layout", return_value=paths), \
+             patch.object(spool, "_fsync_directory", side_effect=sync_directory):
+            spool.complete_job(claimed)
+        assert events == [("dir", paths["processing"])]
+        assert not claimed.exists()
+
+        stale = _write_extraction_job(root, "stale.json", "stale-session")
+        stale = spool.claim_next(root)
+        assert stale is not None
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).timestamp()
+        os.utime(stale, (old, old))
+        events.clear()
+        with patch.object(spool, "ensure_layout", return_value=paths), \
+             patch.object(spool, "_fsync_directory", side_effect=sync_directory):
+            assert spool.requeue_stale(root, stale_after_s=900) == 1
+        assert events == [
+            ("dir", paths["incoming"]),
+            ("dir", paths["processing"]),
+        ]
+
+
 def _assert_nonobject_manifest_does_not_block_drain() -> None:
     with tempfile.TemporaryDirectory() as td:
         old_home = core.CFG.home
@@ -1641,6 +1741,13 @@ def test_validated_blob_bytes_survive_path_swap_and_gc_rechecks_blob() -> None:
         _create_directory_link(redirected_outside, redirected_root)
         outside_before = set(redirected_outside.iterdir())
         try:
+            ensure_layout(redirected_root)
+        except spool.PermanentSpoolError:
+            pass
+        else:
+            raise AssertionError("redirected root accepted during layout creation")
+        assert set(redirected_outside.iterdir()) == outside_before
+        try:
             spool.read_validated_blob(redirected_root, job)
         except spool.PermanentSpoolError:
             pass
@@ -1898,6 +2005,61 @@ def test_archive_object_ancestors_cannot_redirect_publication_or_gc() -> None:
             spool_root, sha, canonical)
         assert blob.read_bytes() == data
         assert external_object.read_bytes() == data
+
+
+def test_archive_leaf_swap_rolls_back_manifest_and_preserves_temp() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            data = b"known-good archive leaf"
+            sha = hashlib.sha256(data).hexdigest()
+            obj = (core.CFG.archive / "objects" / "sha256" /
+                   sha[:2] / sha[2:4] / sha)
+            real_append = core.append_manifest_occurrence
+            swapped = False
+
+            def swap_before_locked_append(
+                    archive_root: Path, occurrence: dict, **kwargs) -> bool:
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    try:
+                        obj.unlink()
+                        obj.write_bytes(b"X" * len(data))
+                    except PermissionError:
+                        # Windows denies replacement while the verified leaf
+                        # descriptor is open. Force the same lock-bound
+                        # precondition failure to exercise rollback/preservation.
+                        with patch.object(
+                                core, "_archive_object_still_bound",
+                                return_value=False):
+                            return real_append(
+                                archive_root, occurrence, **kwargs)
+                return real_append(archive_root, occurrence, **kwargs)
+
+            with patch.object(
+                    core, "append_manifest_occurrence",
+                    side_effect=swap_before_locked_append):
+                try:
+                    core.archive_bytes(
+                        data, "text/plain", "swap/final-leaf.txt",
+                        ingest_job_id="leaf-swap")
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("swapped archive leaf was manifested")
+
+            assert swapped
+            manifest = core.CFG.archive / "manifest.jsonl"
+            assert not manifest.exists() or not manifest.read_bytes()
+            assert obj.read_bytes() in (data, b"X" * len(data))
+            preserved = list(obj.parent.glob(f".{sha}.*.tmp"))
+            assert preserved
+            assert any(path.read_bytes() == data for path in preserved)
+        finally:
+            core.CFG.home = old_home
 
 
 def test_archive_records_each_occurrence() -> None:
@@ -2835,6 +2997,7 @@ if __name__ == "__main__":
     test_hook_warns_when_delivery_and_spooling_fail()
     test_capture_persists_snapshot_before_acknowledgement()
     test_claim_retry_and_dead_letter_preserve_manifest()
+    test_spool_state_transitions_sync_directories_and_leases()
     test_legacy_missing_source_is_preserved()
     test_stale_processing_job_is_requeued()
     test_mixed_transcript_line_preserves_text_and_tools()
@@ -2843,6 +3006,7 @@ if __name__ == "__main__":
     test_validated_blob_bytes_survive_path_swap_and_gc_rechecks_blob()
     test_fonds_paths_cannot_escape_archive()
     test_archive_object_ancestors_cannot_redirect_publication_or_gc()
+    test_archive_leaf_swap_rolls_back_manifest_and_preserves_temp()
     test_archive_records_each_occurrence()
     test_session_separator_fonds_identity_matches_doctor_repair()
     test_doctor_reports_unmanifested_capture_evidence()
@@ -2850,4 +3014,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("26 passed, 0 failed")
+    print("28 passed, 0 failed")

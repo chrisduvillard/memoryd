@@ -287,6 +287,10 @@ def _mkdir_durable(path: Path) -> None:
         if parent == current:
             break
         current = parent
+    if not missing:
+        _require_plain_directory(path)
+        _fsync_directory(path.parent)
+        return
     for directory in reversed(missing):
         try:
             directory.mkdir()
@@ -309,36 +313,70 @@ def _archive_object_namespace(
             try:
                 child.mkdir()
             except FileExistsError:
-                _require_plain_directory(child)
-                _fsync_directory(current)
-            else:
-                _fsync_directory(current)
+                pass
         _require_plain_directory(child)
+        if create:
+            _fsync_directory(current)
         current = child
     return current, current / sha
 
 
-def _verify_archive_object(obj_path: Path, sha: str,
-                           expected_bytes: int) -> os.stat_result:
+def _same_archive_identity(
+        left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(left.st_mode) and stat.S_ISREG(right.st_mode) and
+        (left.st_dev, left.st_ino, left.st_size, left.st_mtime_ns) ==
+        (right.st_dev, right.st_ino, right.st_size, right.st_mtime_ns)
+    )
+
+
+def _open_verified_archive_object(
+        obj_path: Path, sha: str,
+        expected_bytes: int) -> tuple[object, os.stat_result]:
     path_stat = obj_path.stat(follow_symlinks=False)
-    if not stat.S_ISREG(path_stat.st_mode):
+    if (not stat.S_ISREG(path_stat.st_mode) or
+            path_stat.st_size != expected_bytes):
         raise ValueError(f"archive object integrity mismatch: {obj_path}")
 
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(obj_path, flags)
-    with os.fdopen(fd, "rb") as handle:
+    handle = os.fdopen(fd, "rb")
+    try:
         opened_stat = os.fstat(handle.fileno())
-        same_file = ((path_stat.st_dev, path_stat.st_ino) ==
-                     (opened_stat.st_dev, opened_stat.st_ino))
-        if (not same_file or not stat.S_ISREG(opened_stat.st_mode) or
-                opened_stat.st_size != expected_bytes):
+        if not _same_archive_identity(path_stat, opened_stat):
             raise ValueError(f"archive object integrity mismatch: {obj_path}")
         actual_sha = hashlib.file_digest(handle, "sha256").hexdigest()
-    if actual_sha != sha:
-        raise ValueError(f"archive object integrity mismatch: {obj_path}")
-    return opened_stat
+        opened_after = os.fstat(handle.fileno())
+        if (actual_sha != sha or
+                not _same_archive_identity(opened_stat, opened_after)):
+            raise ValueError(f"archive object integrity mismatch: {obj_path}")
+        path_after = obj_path.stat(follow_symlinks=False)
+        if not _same_archive_identity(opened_after, path_after):
+            raise ValueError(f"archive object integrity mismatch: {obj_path}")
+        return handle, opened_after
+    except Exception:
+        handle.close()
+        raise
+
+
+def _archive_object_still_bound(
+        handle: object, obj_path: Path, verified: os.stat_result,
+        archive_root: Path, sha: str) -> bool:
+    try:
+        obj_dir, expected_path = _archive_object_namespace(
+            archive_root, sha, create=False)
+        if expected_path != obj_path or obj_dir != obj_path.parent:
+            return False
+        opened = os.fstat(handle.fileno())
+        current = obj_path.stat(follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+    return (
+        _same_archive_identity(verified, opened) and
+        _same_archive_identity(verified, current)
+    )
 
 
 def _safe_fonds_links_supported() -> bool:
@@ -436,53 +474,63 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
     sha = hashlib.sha256(data).hexdigest()
     obj_dir, obj_path = _archive_object_namespace(
         CFG.archive, sha, create=True)
-    if not os.path.lexists(obj_path):
-        tmp = obj_dir / f".{sha}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-        try:
-            with tmp.open("xb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            try:
-                os.link(tmp, obj_path)
-            except FileExistsError:
-                pass
-            except PermissionError:
-                deadline = time.monotonic() + 5
-                while not os.path.lexists(obj_path):
-                    if time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.01)
-        finally:
-            tmp.unlink(missing_ok=True)
-
-    obj_stat = _verify_archive_object(obj_path, sha, len(data))
-    verified_dir, verified_path = _archive_object_namespace(
-        CFG.archive, sha, create=False)
-    if verified_dir != obj_dir or verified_path != obj_path:
-        raise ValueError("archive object namespace changed during publication")
-    _fsync_directory(obj_dir)
-
-    # fonds symlink (original-order view); best effort, never fatal
-    trusted_archive_root = CFG.archive.resolve()
-    link = validate_fonds_path(trusted_archive_root, fonds_path)
+    tmp = obj_dir / f".{sha}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    with tmp.open("xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
     try:
-        _create_fonds_link(trusted_archive_root, obj_path, link, fonds_path)
-    except OSError:
-        pass
+        try:
+            os.link(tmp, obj_path)
+        except FileExistsError:
+            pass
+        except PermissionError:
+            deadline = time.monotonic() + 5
+            while not os.path.lexists(obj_path):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+        _fsync_directory(obj_dir)
+        trusted_archive_root = CFG.archive.resolve()
+        link = validate_fonds_path(trusted_archive_root, fonds_path)
 
-    seen = datetime.fromtimestamp(obj_stat.st_mtime, timezone.utc).isoformat()
-    occurrence = {
-        "sha256": sha,
-        "bytes": len(data),
-        "mime": mime,
-        "first_seen": seen,
-        "occurrence_at": datetime.now(timezone.utc).isoformat(),
-        "fonds_path": fonds_path.replace("\\", "/"),
-        "ingest_job_id": ingest_job_id,
-    }
-    append_manifest_occurrence(CFG.archive, occurrence)
-    return sha
+        obj_handle, obj_stat = _open_verified_archive_object(
+            obj_path, sha, len(data))
+        try:
+            seen = datetime.fromtimestamp(
+                obj_stat.st_mtime, timezone.utc).isoformat()
+            occurrence = {
+                "sha256": sha,
+                "bytes": len(data),
+                "mime": mime,
+                "first_seen": seen,
+                "occurrence_at": datetime.now(timezone.utc).isoformat(),
+                "fonds_path": fonds_path.replace("\\", "/"),
+                "ingest_job_id": ingest_job_id,
+            }
+            append_manifest_occurrence(
+                CFG.archive, occurrence,
+                pre_append=lambda: _archive_object_still_bound(
+                    obj_handle, obj_path, obj_stat, CFG.archive, sha),
+                post_append=lambda: _archive_object_still_bound(
+                    obj_handle, obj_path, obj_stat, CFG.archive, sha))
+        finally:
+            obj_handle.close()
+
+        # Fonds is a best-effort derived view, created only after the durable
+        # occurrence binds the verified object to its canonical pathname.
+        try:
+            _create_fonds_link(
+                trusted_archive_root, obj_path, link, fonds_path)
+        except OSError:
+            pass
+
+        tmp.unlink(missing_ok=True)
+        _fsync_directory(obj_dir)
+        return sha
+    except Exception:
+        # Keep the fsynced temporary inode as recovery evidence.
+        raise
 
 
 def archive_file(path: Path, fonds_path: str,

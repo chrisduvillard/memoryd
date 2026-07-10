@@ -117,7 +117,9 @@ check fails, memoryd preserves the known-good bytes separately and refuses the
 capture instead of acknowledging untrusted evidence.
 
 Claims move jobs from `incoming/` to `processing/` under `state.lock` and touch
-the manifest mtime. A worker requeues a processing lease older than 15 minutes.
+and file-sync the manifest mtime. Each cross-directory state move syncs the
+destination before the source directory; completion syncs the processing
+directory after unlink. A worker requeues a processing lease older than 15 minutes.
 Transient failures increment `attempts`, record `last_error`, set an
 exponential `next_attempt_at`, and return the job to `incoming/`. Permanent
 validation failures move the manifest to `dead-letter/`.
@@ -150,6 +152,11 @@ can append another occurrence with the same job ID even when the object bytes
 already exist. The `archive/fonds/` view is a platform-safe, best-effort
 symlink view. Unsupported platforms or a link failure do not invalidate the
 verified object or occurrence manifest.
+Archive publication keeps its fsynced temporary inode and an open verified
+canonical descriptor through manifest-lock preconditions before and after the
+append. A leaf replacement rolls back the occurrence and retains the temporary
+file as evidence. Successful publication removes and directory-syncs the
+temporary name only after the occurrence is durable.
 Capture fonds dates come from the job's UTC `created_at`, so a retry after
 midnight retains the same path. Repair derives the path from the same field and
 rechecks occurrence identity while holding the manifest append lock. Fonds

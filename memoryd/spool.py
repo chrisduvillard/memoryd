@@ -97,10 +97,10 @@ def validate_legacy_job(value: object) -> dict:
 def ensure_layout(spool_root: Path) -> dict[str, Path]:
     paths = {name: spool_root / name for name in
              ("blobs", "incoming", "processing", "dead-letter")}
-    for path in paths.values():
-        _mkdir_durable(path)
+    _mkdir_durable(spool_root)
     _require_plain_directory(spool_root)
     for path in paths.values():
+        _mkdir_durable(path)
         _require_plain_directory(path)
     return paths
 
@@ -256,6 +256,10 @@ def _mkdir_durable(path: Path) -> None:
         if parent == current:
             break
         current = parent
+    if not missing:
+        _require_plain_directory(path)
+        _fsync_directory(path.parent)
+        return
     for directory in reversed(missing):
         try:
             directory.mkdir()
@@ -281,6 +285,40 @@ def _atomic_json(path: Path, value: dict) -> None:
         _fsync_directory(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _fsync_file(path: Path) -> None:
+    before = path.stat(follow_symlinks=False)
+    if (_redirected(path, before) or not stat.S_ISREG(before.st_mode)):
+        raise PermanentSpoolError(f"untrusted file: {path}")
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not _same_regular_identity(before, opened):
+            raise PermanentSpoolError(f"file changed before fsync: {path}")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _durable_replace(source: Path, target: Path) -> None:
+    os.replace(source, target)
+    _fsync_directory(target.parent)
+    if source.parent != target.parent:
+        _fsync_directory(source.parent)
+
+
+def _durable_unlink(path: Path) -> None:
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _durable_touch(path: Path) -> None:
+    os.utime(path, None)
+    _fsync_file(path)
 
 
 @contextlib.contextmanager
@@ -488,11 +526,10 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
             if not ignore_schedule and _scheduled(job):
                 continue
             target = _collision_safe_target(paths["processing"], source.name)
-            os.utime(source, None)
             deadline = time.monotonic() + 5
             while True:
                 try:
-                    os.replace(source, target)
+                    _durable_replace(source, target)
                 except FileNotFoundError:
                     break
                 except PermissionError as exc:
@@ -502,7 +539,7 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
                         raise exc
                     time.sleep(0.005)
                     continue
-                os.utime(target, None)
+                _durable_touch(target)
                 return target
     return None
 
@@ -518,7 +555,7 @@ def release_job(spool_root: Path, processing_path: Path, error: str,
         _atomic_json(processing_path, job)
         target = _collision_safe_target(
             ensure_layout(spool_root)["incoming"], processing_path.name)
-        os.replace(processing_path, target)
+        _durable_replace(processing_path, target)
         return target
 
 
@@ -562,13 +599,13 @@ def dead_letter(spool_root: Path, job_path: Path, reason: str) -> Path:
             "reason": reason,
             "manifest": target.name,
         })
-        os.replace(job_path, target)
+        _durable_replace(job_path, target)
         return target
 
 
 def complete_job(job_path: Path) -> None:
     with _state_lock(job_path.parent.parent):
-        job_path.unlink()
+        _durable_unlink(job_path)
 
 
 def requeue_stale(spool_root: Path, *, stale_after_s: int = 900) -> int:
@@ -581,7 +618,7 @@ def requeue_stale(spool_root: Path, *, stale_after_s: int = 900) -> int:
                 if source.stat().st_mtime >= cutoff:
                     continue
                 target = _collision_safe_target(paths["incoming"], source.name)
-                os.replace(source, target)
+                _durable_replace(source, target)
                 moved += 1
             except FileNotFoundError:
                 continue
@@ -681,8 +718,7 @@ def gc_blob_if_unreferenced(spool_root: Path, sha: str,
             if (_redirected(blob, before_delete) or
                     not stat.S_ISREG(before_delete.st_mode)):
                 return False
-            blob.unlink()
-            _fsync_directory(paths["blobs"])
+            _durable_unlink(blob)
             return True
     except (OSError, PermanentSpoolError):
         return False
