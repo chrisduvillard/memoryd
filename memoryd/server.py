@@ -20,10 +20,12 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from .core import CFG, new_id, pool
-from .ingest import drain_spool, ingest_transcript
+from .ingest import drain_spool
 from .recall import build_packet
+from .spool import enqueue_capture
 
 CAPTURE_Q: "queue.Queue[dict]" = queue.Queue()
 ADMIN_POST_ENDPOINTS = {
@@ -43,21 +45,10 @@ def _capture_worker() -> None:
             if job.get("extract_only"):
                 from .extract import run_extraction
                 run_extraction(job["session_id"])
-                continue  # finally still runs task_done()
-            ingest_transcript(job["transcript_path"], job["session_id"],
-                              job.get("project"), job.get("trigger", "unknown"))
-            if job.get("trigger") in ("session_end", "pre_compact"):
-                from .extract import run_extraction
-                run_extraction(job["session_id"])  # no-op if no LLM configured
-        except Exception:  # noqa: BLE001 — spool for retry, never crash the worker
-            # the spool write itself can fail (disk full, perms). If it escaped
-            # here it would kill the worker thread and stop ALL captures until a
-            # daemon restart, so it must be swallowed too — drop one job, live.
-            try:
-                spool_file = CFG.spool / f"{new_id('job')}.json"
-                spool_file.write_text(json.dumps(job), encoding="utf-8")
-            except Exception:  # noqa: BLE001
-                pass
+            elif job.get("drain_spool"):
+                drain_spool()
+        except Exception as exc:  # noqa: BLE001 — keep the worker alive
+            print(f"memoryd: capture worker failed: {exc}")
         finally:
             CAPTURE_Q.task_done()
 
@@ -114,7 +105,19 @@ class Handler(BaseHTTPRequestHandler):
             if not required <= body.keys():
                 self._json(400, {"error": f"missing fields: {required - body.keys()}"})
                 return
-            CAPTURE_Q.put(body)
+            try:
+                enqueue_capture(
+                    spool_root=CFG.spool,
+                    transcript_path=Path(body["transcript_path"]),
+                    session_id=body["session_id"],
+                    project=body.get("project"),
+                    trigger=body.get("trigger", "unknown"),
+                )
+            except Exception as exc:  # noqa: BLE001 — report persistence failure
+                self._json(
+                    500, {"error": f"capture could not be persisted: {exc}"})
+                return
+            CAPTURE_Q.put({"drain_spool": True})
             self._json(202, {"queued": True})
         elif self.path == "/capture-events":
             # Direct event ingestion for agents that hand us turns in-process
@@ -310,9 +313,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def _drain_spool_bg() -> None:
     try:
-        drained = drain_spool()
-        if drained:
-            print(f"memoryd: drained {drained} spooled capture(s)")
+        stats = drain_spool()
+        if any(stats.values()):
+            print("memoryd: spool " + ", ".join(
+                f"{key}={value}" for key, value in stats.items()))
     except Exception as e:  # noqa: BLE001 — spool retries on next start/microsleep
         print(f"memoryd: spool drain failed: {e}")
 

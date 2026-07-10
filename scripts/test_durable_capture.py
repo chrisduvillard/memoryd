@@ -8,10 +8,12 @@ import multiprocessing
 import os
 import tempfile
 import threading
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from memoryd import core
+from memoryd import core, server, spool
 from memoryd.hook import capture
 from memoryd.ingest import _classify_all
 from memoryd.spool import enqueue_capture, ensure_layout, validate_blob
@@ -49,6 +51,26 @@ def _archive_with_synchronized_publication(
     core.os.replace = synchronized_publish(real_replace)
     core.archive_bytes(b"concurrent", "text/plain", f"parallel/{job_id}.txt",
                        ingest_job_id=job_id)
+
+
+def _claim_with_synchronized_move(
+        root: str, ready: multiprocessing.synchronize.Barrier,
+        results: multiprocessing.queues.Queue) -> None:
+    real_replace = spool.os.replace
+
+    def synchronized_replace(source: Path, target: Path) -> None:
+        try:
+            ready.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        real_replace(source, target)
+
+    spool.os.replace = synchronized_replace
+    try:
+        claimed = spool.claim_next(Path(root))
+        results.put(None if claimed is None else claimed.name)
+    except Exception as exc:  # noqa: BLE001 — parent asserts no claim error
+        results.put(f"error:{type(exc).__name__}:{exc}")
 
 
 def _assert_manifest_permission_contention_is_bounded(manifest: Path) -> None:
@@ -237,6 +259,295 @@ def test_hook_warns_when_delivery_and_spooling_fail() -> None:
          contextlib.redirect_stderr(stderr):
         capture(stdin, "stop", 7437, Path("unused"))
     assert "capture not durably saved" in stderr.getvalue()
+
+
+def test_capture_persists_snapshot_before_acknowledgement() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever)
+        try:
+            core.CFG.home = Path(td) / "memory"
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text("durable before ack", encoding="utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{httpd.server_port}/capture",
+                data=json.dumps({
+                    "transcript_path": str(transcript),
+                    "session_id": "http-durable",
+                    "project": None,
+                    "trigger": "stop",
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            thread.start()
+            with urllib.request.urlopen(request, timeout=5) as response:
+                assert response.status == 202
+                response_body = response.read()
+            transcript.unlink()
+
+            assert response_body == b'{"queued": true}'
+            assert json.loads(response_body) == {"queued": True}
+            manifests = list((core.CFG.spool / "incoming").glob("*.json"))
+            assert len(manifests) == 1
+            job = json.loads(manifests[0].read_text(encoding="utf-8"))
+            assert validate_blob(core.CFG.spool, job).read_text() == "durable before ack"
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            if thread.is_alive():
+                thread.join(timeout=5)
+            try:
+                server.CAPTURE_Q.get_nowait()
+            except server.queue.Empty:
+                pass
+            else:
+                server.CAPTURE_Q.task_done()
+            core.CFG.home = old_home
+
+
+def test_claim_retry_and_dead_letter_preserve_manifest() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        gc_root = Path(td) / "gc-spool"
+        gc_source = Path(td) / "gc.jsonl"
+        gc_source.write_text("x", encoding="utf-8")
+        gc_job = enqueue_capture(
+            spool_root=gc_root, transcript_path=gc_source,
+            session_id="gc", project=None, trigger="stop")
+        next((gc_root / "incoming").glob("*.json")).unlink()
+        canonical = Path(td) / "canonical"
+        canonical.write_text("wrong", encoding="utf-8")
+        assert not spool.gc_blob_if_unreferenced(
+            gc_root, gc_job["blob_sha256"], canonical)
+        assert (gc_root / "blobs" / gc_job["blob_sha256"]).exists()
+        canonical.write_text("x", encoding="utf-8")
+        assert spool.gc_blob_if_unreferenced(
+            gc_root, gc_job["blob_sha256"], canonical)
+
+        gc_race_root = Path(td) / "gc-race-spool"
+        gc_race_source = Path(td) / "gc-race.jsonl"
+        gc_race_source.write_text("x", encoding="utf-8")
+        gc_race_job = enqueue_capture(
+            spool_root=gc_race_root, transcript_path=gc_race_source,
+            session_id="gc-race-old", project=None, trigger="stop")
+        next((gc_race_root / "incoming").glob("*.json")).unlink()
+        gc_race_blob = gc_race_root / "blobs" / gc_race_job["blob_sha256"]
+        gc_at_delete = threading.Event()
+        allow_gc = threading.Event()
+        manifest_written = threading.Event()
+        real_unlink = Path.unlink
+        real_atomic_json = spool._atomic_json
+
+        def delayed_gc_unlink(path: Path, *args, **kwargs) -> None:
+            if (Path(path) == gc_race_blob and
+                    threading.current_thread().name == "gc-race"):
+                gc_at_delete.set()
+                assert allow_gc.wait(timeout=5)
+            real_unlink(path, *args, **kwargs)
+
+        def observed_atomic_json(path: Path, value: dict) -> None:
+            real_atomic_json(path, value)
+            if path.parent.name == "incoming":
+                manifest_written.set()
+
+        gc_result: list[bool] = []
+        enqueue_errors: list[Exception] = []
+
+        def collect_gc() -> None:
+            gc_result.append(spool.gc_blob_if_unreferenced(
+                gc_race_root, gc_race_job["blob_sha256"], canonical))
+
+        def enqueue_during_gc() -> None:
+            try:
+                enqueue_capture(
+                    spool_root=gc_race_root, transcript_path=gc_race_source,
+                    session_id="gc-race-new", project=None, trigger="stop")
+            except Exception as exc:  # noqa: BLE001 — assertion records race
+                enqueue_errors.append(exc)
+
+        with patch.object(Path, "unlink", delayed_gc_unlink), \
+             patch.object(spool, "_atomic_json", side_effect=observed_atomic_json):
+            gc_thread = threading.Thread(target=collect_gc, name="gc-race")
+            gc_thread.start()
+            assert gc_at_delete.wait(timeout=5)
+            enqueue_thread = threading.Thread(target=enqueue_during_gc)
+            enqueue_thread.start()
+            manifest_written.wait(timeout=0.5)
+            allow_gc.set()
+            gc_thread.join(timeout=5)
+            enqueue_thread.join(timeout=5)
+        assert gc_result == [True]
+        assert not enqueue_errors
+        gc_race_manifest = next((gc_race_root / "incoming").glob("*.json"))
+        validate_blob(
+            gc_race_root,
+            json.loads(gc_race_manifest.read_text(encoding="utf-8")))
+
+        release_race_root = Path(td) / "release-race-spool"
+        release_race_job = enqueue_capture(
+            spool_root=release_race_root, transcript_path=gc_race_source,
+            session_id="release-race", project=None, trigger="stop")
+        release_claim = spool.claim_next(release_race_root)
+        assert release_claim
+        incoming_scanned = threading.Event()
+        allow_processing_scan = threading.Event()
+        real_glob = Path.glob
+
+        def delayed_incoming_glob(path: Path, pattern: str):
+            values = list(real_glob(path, pattern))
+            if (Path(path) == release_race_root / "incoming" and
+                    threading.current_thread().name == "release-race-gc"):
+                incoming_scanned.set()
+                assert allow_processing_scan.wait(timeout=5)
+            return iter(values)
+
+        release_gc_result: list[bool] = []
+        release_errors: list[Exception] = []
+
+        def collect_release_gc() -> None:
+            release_gc_result.append(spool.gc_blob_if_unreferenced(
+                release_race_root, release_race_job["blob_sha256"], canonical))
+
+        def release_during_gc() -> None:
+            try:
+                spool.release_job(
+                    release_race_root, release_claim, "retry", delay_s=1)
+            except Exception as exc:  # noqa: BLE001 — assertion records race
+                release_errors.append(exc)
+
+        with patch.object(Path, "glob", delayed_incoming_glob):
+            release_gc_thread = threading.Thread(
+                target=collect_release_gc, name="release-race-gc")
+            release_gc_thread.start()
+            assert incoming_scanned.wait(timeout=5)
+            release_thread = threading.Thread(target=release_during_gc)
+            release_thread.start()
+            release_thread.join(timeout=0.2)
+            allow_processing_scan.set()
+            release_gc_thread.join(timeout=5)
+            release_thread.join(timeout=5)
+        assert release_gc_result == [False]
+        assert not release_errors
+        release_manifest = next(
+            (release_race_root / "incoming").glob("*.json"))
+        validate_blob(
+            release_race_root,
+            json.loads(release_manifest.read_text(encoding="utf-8")))
+
+        claim_root = Path(td) / "claim-spool"
+        claim_source = Path(td) / "claim.jsonl"
+        claim_source.write_text("x", encoding="utf-8")
+        enqueue_capture(
+            spool_root=claim_root, transcript_path=claim_source,
+            session_id="claim", project=None, trigger="stop")
+        real_replace = spool.os.replace
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+        both_entered = threading.Event()
+
+        def observed_replace(source: Path, target: Path) -> None:
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+                if active == 2:
+                    both_entered.set()
+            both_entered.wait(timeout=0.2)
+            try:
+                real_replace(source, target)
+            finally:
+                with active_lock:
+                    active -= 1
+
+        claims: list[Path | None] = []
+        errors: list[Exception] = []
+        start = threading.Barrier(2)
+
+        def claim() -> None:
+            try:
+                start.wait(timeout=5)
+                claims.append(spool.claim_next(claim_root))
+            except Exception as exc:  # noqa: BLE001 — assertion records loser
+                errors.append(exc)
+
+        with patch.object(spool.os, "replace", side_effect=observed_replace):
+            threads = [threading.Thread(target=claim) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+        assert not errors
+        assert sum(path is not None for path in claims) == 1
+        assert max_active == 1
+
+        process_root = Path(td) / "process-claim-spool"
+        enqueue_capture(
+            spool_root=process_root, transcript_path=claim_source,
+            session_id="process-claim", project=None, trigger="stop")
+        context = multiprocessing.get_context("spawn")
+        ready = context.Barrier(2)
+        results = context.Queue()
+        processes = [context.Process(
+            target=_claim_with_synchronized_move,
+            args=(str(process_root), ready, results),
+        ) for _ in range(2)]
+        for process in processes:
+            process.start()
+        _join_processes(processes)
+        process_claims = [results.get(timeout=5) for _ in processes]
+        assert not any(str(value).startswith("error:")
+                       for value in process_claims), process_claims
+        assert sum(value is not None for value in process_claims) == 1, process_claims
+
+        root = Path(td) / "spool"
+        transcript = Path(td) / "session.jsonl"
+        transcript.write_text("x", encoding="utf-8")
+        enqueue_capture(spool_root=root, transcript_path=transcript,
+                        session_id="s", project=None, trigger="stop")
+        claimed = spool.claim_next(root)
+        assert claimed and claimed.parent.name == "processing"
+        released = spool.release_job(root, claimed, "database down", delay_s=1)
+        value = json.loads(released.read_text())
+        assert value["attempts"] == 1
+        assert value["last_error"] == "database down"
+        claimed = spool.claim_next(root, ignore_schedule=True)
+        assert claimed
+        preserved = spool.dead_letter(root, claimed, "checksum mismatch")
+        assert preserved.exists()
+        reason = preserved.with_suffix(".reason.json")
+        assert json.loads(reason.read_text())["reason"] == "checksum mismatch"
+
+
+def test_legacy_missing_source_is_preserved() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        paths = ensure_layout(root)
+        legacy = root / "cap-old.json"
+        original = {"transcript_path": str(Path(td) / "gone.jsonl"),
+                    "session_id": "old", "trigger": "stop"}
+        legacy.write_text(json.dumps(original), encoding="utf-8")
+        result = spool.upgrade_legacy_job(root, legacy)
+        assert result is None
+        preserved = paths["dead-letter"] / legacy.name
+        assert json.loads(preserved.read_text()) == original
+        assert preserved.with_suffix(".reason.json").exists()
+
+
+def test_stale_processing_job_is_requeued() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        transcript = Path(td) / "session.jsonl"
+        transcript.write_text("x", encoding="utf-8")
+        enqueue_capture(spool_root=root, transcript_path=transcript,
+                        session_id="s", project=None, trigger="stop")
+        claimed = spool.claim_next(root)
+        assert claimed
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).timestamp()
+        os.utime(claimed, (old, old))
+        assert spool.requeue_stale(root, stale_after_s=900) == 1
+        assert list((root / "incoming").glob("*.json"))
 
 
 def test_mixed_transcript_line_preserves_text_and_tools() -> None:
@@ -434,7 +745,11 @@ if __name__ == "__main__":
     test_identical_snapshots_share_one_blob()
     test_hook_spools_bytes_when_daemon_is_down()
     test_hook_warns_when_delivery_and_spooling_fail()
+    test_capture_persists_snapshot_before_acknowledgement()
+    test_claim_retry_and_dead_letter_preserve_manifest()
+    test_legacy_missing_source_is_preserved()
+    test_stale_processing_job_is_requeued()
     test_mixed_transcript_line_preserves_text_and_tools()
     test_fonds_paths_cannot_escape_archive()
     test_archive_records_each_occurrence()
-    print("7 passed, 0 failed")
+    print("11 passed, 0 failed")

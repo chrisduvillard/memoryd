@@ -24,8 +24,9 @@ def main() -> None:
     CFG.ensure_dirs()
     report: list[str] = [f"# memoryd digest — {date.today().isoformat()}", ""]
 
-    drained = drain_spool()
-    report.append(f"- spool drained: {drained}")
+    spool_stats = drain_spool()
+    report.append("- spool: " + ", ".join(
+        f"{key}={value}" for key, value in spool_stats.items()))
 
     with pool().connection() as conn:
         conn.row_factory = dict_row

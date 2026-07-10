@@ -136,23 +136,63 @@ def ingest_transcript(transcript_path: str, session_id: str, project: str | None
     return {"ok": True, "sha256": sha, "new_events": new_events}
 
 
-def drain_spool() -> int:
-    """Re-attempt captures spooled while the daemon or DB was down."""
-    drained = 0
-    for f in sorted(CFG.spool.glob("*.json")):
+def drain_spool() -> dict[str, int]:
+    """Advance durable captures through processing, retry, or dead-letter."""
+    from .spool import (
+        PermanentSpoolError, claim_next, complete_job, dead_letter,
+        gc_blob_if_unreferenced, load_job, release_job, requeue_stale,
+        upgrade_legacy_job, validate_blob,
+    )
+    stats = {"processed": 0, "retried": 0, "dead_lettered": 0, "requeued": 0}
+    stats["requeued"] = requeue_stale(CFG.spool)
+    while job_path := claim_next(CFG.spool):
+        raw: dict = {}
+        attempts = 0
         try:
-            job = json.loads(f.read_text())
-            if job.get("extract_only"):
-                # /extract jobs spooled by the capture worker carry no
-                # transcript — retry the extraction itself.
+            value = json.loads(job_path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("invalid job manifest: expected object")
+            raw = value
+            attempts = int(raw.get("attempts", 0))
+            if raw.get("extract_only"):
                 from .extract import run_extraction
-                res = run_extraction(job["session_id"])
-            else:
-                res = ingest_transcript(job["transcript_path"], job["session_id"],
-                                        job.get("project"), job.get("trigger", "spool"))
-            if res.get("ok"):
-                f.unlink()
-                drained += 1
-        except Exception:  # noqa: BLE001 — one bad job (e.g. LLM misconfig raising
-            continue        # LLMError) must not abort the drain or the nightly run
-    return drained
+                result = run_extraction(raw["session_id"])
+                if not result.get("ok"):
+                    raise RuntimeError(
+                        result.get("error", "extraction retry failed"))
+                complete_job(job_path)
+                stats["processed"] += 1
+                continue
+            if raw.get("schema_version") != 2:
+                upgraded = upgrade_legacy_job(CFG.spool, job_path)
+                stats["dead_lettered"] += int(upgraded is None)
+                continue
+            job = load_job(job_path)
+            blob = validate_blob(CFG.spool, job)
+            result = ingest_transcript(
+                str(blob), job["session_id"], job.get("project"), job["trigger"],
+                ingest_job_id=job["job_id"], source_adapter="claude-code")
+            if not result.get("ok"):
+                raise RuntimeError(
+                    result.get("error", "capture ingestion failed"))
+            if job["trigger"] in ("session_end", "pre_compact"):
+                from .extract import run_extraction
+                extracted = run_extraction(job["session_id"])
+                if not extracted.get("ok") and not extracted.get("skipped"):
+                    raise RuntimeError(
+                        extracted.get("error", "extraction failed"))
+            complete_job(job_path)
+            sha = result["sha256"]
+            canonical = (CFG.archive / "objects" / "sha256" /
+                         sha[:2] / sha[2:4] / sha)
+            gc_blob_if_unreferenced(CFG.spool, sha, canonical)
+            stats["processed"] += 1
+        except (PermanentSpoolError, ValueError) as exc:
+            dead_letter(CFG.spool, job_path, str(exc))
+            stats["dead_lettered"] += 1
+        except Exception as exc:  # noqa: BLE001 — transient work is retryable
+            release_job(
+                CFG.spool, job_path, str(exc)[:1000],
+                delay_s=min(3600, 2 ** min(attempts + 1, 10)))
+            stats["retried"] += 1
+    return stats

@@ -43,6 +43,25 @@ def http(path: str, body: dict | None = None, method: str = "POST") -> tuple[int
         return e.code, json.loads(e.read() or b"{}")
 
 
+def event_count(session_id: str, *, non_meta: bool = False) -> int:
+    where = " AND NOT meta" if non_meta else ""
+    with psycopg.connect(DSN) as conn:
+        return conn.execute(
+            f"SELECT count(*) FROM events WHERE session_id=%s{where}",
+            (session_id,),
+        ).fetchone()[0]
+
+
+def wait_for_events(session_id: str, *, minimum: int,
+                    non_meta: bool = False, timeout_s: float = 10) -> int:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        count = event_count(session_id, non_meta=non_meta)
+        if count >= minimum or time.monotonic() >= deadline:
+            return count
+        time.sleep(0.05)
+
+
 def check_durable_transcript_replay() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         mixed_session = f"smoke-mixed-{new_id('s')}"
@@ -219,19 +238,40 @@ def main() -> int:
     capture_session = f"smoketest-s2-{int(time.time())}"
     code, resp = http("/capture", {"transcript_path": tpath, "session_id": capture_session,
                                    "project": "smoketest", "trigger": "session_end"})
-    check("capture returns 202", code == 202, str(resp))
-    time.sleep(1.0)  # async worker
+    check("capture returns exact healthy response",
+          code == 202 and resp == {"queued": True}, str(resp))
+    captured_events = wait_for_events(capture_session, minimum=3, non_meta=True)
 
     with pool().connection() as conn:
-        n = conn.execute(
-            "SELECT count(*) FROM events WHERE session_id=%s AND NOT meta",
-            (capture_session,)).fetchone()[0]
-        check("ledger events written from transcript", n == 3, f"got {n}")
+        check("ledger events written from transcript",
+              captured_events == 3, f"got {captured_events}")
         sha = conn.execute(
             "SELECT raw_sha256 FROM events WHERE session_id=%s AND NOT meta LIMIT 1",
             (capture_session,)).fetchone()[0]
         blob = CFG.archive / "objects" / "sha256" / sha[:2] / sha[2:4] / sha
         check("raw blob archived, content-addressed", blob.exists())
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        durable_session = f"smoke-durable-{new_id('s')}"
+        durable = Path(temp_dir) / "durable.jsonl"
+        durable.write_text(json.dumps({
+            "uuid": "durable-line",
+            "type": "user",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"content": "survives source deletion"},
+        }) + "\n", encoding="utf-8")
+        code, response = http("/capture", {
+            "transcript_path": str(durable),
+            "session_id": durable_session,
+            "project": "smoketest",
+            "trigger": "stop",
+        })
+        check("capture acknowledges durable spool job",
+              code == 202 and response == {"queued": True}, str(response))
+        durable.unlink()
+        durable_rows = wait_for_events(durable_session, minimum=1)
+        check("durable spool replays after source deletion",
+              durable_rows >= 1, f"rows={durable_rows}")
 
     check_durable_transcript_replay()
 
