@@ -1682,6 +1682,92 @@ def test_doctor_repair_preserves_and_requeues_spool_evidence() -> None:
         assert _tree_snapshot(cli_home) == before_cli_home
         assert _tree_snapshot(cli_outside) == before_cli_outside
 
+        evidence_root = base / "redirected-evidence-spool"
+        evidence_paths = ensure_layout(evidence_root)
+        redirected_manifest = evidence_paths["incoming"] / "redirected.json"
+        redirected_manifest.write_text(
+            json.dumps(_doctor_job("redirected")), encoding="utf-8")
+        evidence_before = _tree_snapshot(evidence_root)
+        real_redirected = doctor._redirected
+        with patch.object(
+                doctor, "_redirected",
+                side_effect=lambda path, value: (
+                    path == redirected_manifest or real_redirected(path, value))):
+            redirected_file_actions = repair_spool(evidence_root)
+        assert any(
+            item.code == "repair_refused" for item in redirected_file_actions)
+        assert _tree_snapshot(evidence_root) == evidence_before
+
+        blob_root = base / "redirected-blob-spool"
+        blob_paths = ensure_layout(blob_root)
+        blob_data = b"blob evidence"
+        blob_sha = hashlib.sha256(blob_data).hexdigest()
+        blob = blob_paths["blobs"] / blob_sha
+        blob.write_bytes(blob_data)
+        blob_manifest = blob_paths["incoming"] / "blob.json"
+        blob_manifest.write_text(json.dumps(_doctor_job(
+            "blob", kind="capture_snapshot", project=None, trigger="stop",
+            original_transcript_path="C:/blob.jsonl", blob_sha256=blob_sha,
+            blob_bytes=len(blob_data))), encoding="utf-8")
+        blob_before = _tree_snapshot(blob_root)
+        with patch.object(
+                doctor, "_redirected",
+                side_effect=lambda path, value: (
+                    path == blob or real_redirected(path, value))):
+            blob_actions = repair_spool(blob_root)
+        assert any(item.code == "repair_refused" for item in blob_actions)
+        assert _tree_snapshot(blob_root) == blob_before
+
+        scandir_root = base / "scandir-spool"
+        ensure_layout(scandir_root)
+        scandir_before = _tree_snapshot(scandir_root)
+        with patch.object(
+                doctor.os, "scandir", side_effect=PermissionError("denied")):
+            assert "spool_topology_unreadable" in {
+                item.code for item in inspect_spool(scandir_root)}
+            scandir_actions = repair_spool(scandir_root)
+        assert any(item.code == "repair_refused" for item in scandir_actions)
+        assert _tree_snapshot(scandir_root) == scandir_before
+
+        layout_root = base / "layout-failure-spool"
+        with patch.object(
+                doctor, "ensure_layout", side_effect=OSError("mkdir denied")):
+            layout_actions = repair_spool(layout_root)
+        assert any(item.code == "repair_refused" for item in layout_actions)
+        assert not layout_root.exists()
+
+        disappearing_root = base / "disappearing-legacy-spool"
+        disappearing_paths = ensure_layout(disappearing_root)
+        disappearing_source = base / "disappearing.jsonl"
+        disappearing_source.write_text("evidence", encoding="utf-8")
+        disappearing_job = disappearing_root / "legacy.json"
+        disappearing_job.write_text(json.dumps({
+            "transcript_path": str(disappearing_source),
+            "session_id": "disappearing", "trigger": "stop",
+        }), encoding="utf-8")
+        occupied = disappearing_paths["dead-letter"] / disappearing_job.name
+        occupied.write_text(json.dumps(_doctor_job("occupied")), encoding="utf-8")
+        dead_letter_reason_path(occupied).write_text(json.dumps({
+            "dead_lettered_at": "2026-07-10T08:00:00+00:00",
+            "reason": "occupied", "manifest": occupied.name,
+        }), encoding="utf-8")
+
+        def disappear_during_upgrade(root: Path, path: Path):
+            disappearing_source.unlink()
+            spool.dead_letter(root, path, "legacy transcript source missing")
+            return None
+
+        with patch.object(
+                doctor, "upgrade_legacy_job",
+                side_effect=disappear_during_upgrade):
+            disappearing_actions = repair_spool(disappearing_root)
+        disappeared = next(
+            item for item in disappearing_actions
+            if item.code == "legacy_dead_lettered")
+        assert Path(disappeared.path).is_file()
+        assert Path(disappeared.path) != disappearing_job
+        assert Path(disappeared.path).name != occupied.name
+
 
 def test_doctor_reconstructs_each_supported_occurrence_idempotently() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -1901,6 +1987,81 @@ def test_doctor_reconstructs_each_supported_occurrence_idempotently() -> None:
         assert any(item.code == "repair_refused" for item in shard_actions)
         assert _tree_snapshot(shard_archive) == shard_before
         assert _tree_snapshot(shard_outside) == shard_outside_before
+
+        spool_conflict_home = home / "spool-id-conflict"
+        spool_conflict = spool_conflict_home / "spool"
+        spool_conflict_paths = ensure_layout(spool_conflict)
+        conflict_data = (b"conflict-one", b"conflict-two")
+        for index, value in enumerate(conflict_data):
+            value_sha = hashlib.sha256(value).hexdigest()
+            value_obj = (spool_conflict_home / "archive" / "objects" /
+                         "sha256" / value_sha[:2] / value_sha[2:4] / value_sha)
+            value_obj.parent.mkdir(parents=True)
+            value_obj.write_bytes(value)
+            (spool_conflict_paths["dead-letter"] /
+             f"conflict-{index}.json").write_text(json.dumps(_doctor_job(
+                "shared-spool-id", kind="capture_snapshot", project="memoryd",
+                trigger="stop", original_transcript_path=f"C:/{index}.jsonl",
+                blob_sha256=value_sha, blob_bytes=len(value),
+                session_id=f"conflict-{index}")), encoding="utf-8")
+        assert "occurrence_identity_collision" in {
+            item.code for item in inspect_spool(spool_conflict)}
+        spool_conflict_actions = repair_archive(
+            spool_conflict_home / "archive", spool_conflict)
+        assert any(
+            item.code == "occurrence_identity_collision"
+            for item in spool_conflict_actions)
+        assert not (spool_conflict_home / "archive" / "manifest.jsonl").exists()
+
+        rollback_archive = home / "rollback-archive"
+        rollback_archive.mkdir()
+        rollback_manifest = rollback_archive / "manifest.jsonl"
+        rollback_original = b"unterminated evidence"
+        rollback_manifest.write_bytes(rollback_original)
+        try:
+            core.append_manifest_occurrence(
+                rollback_archive, {"sha256": sha, "fonds_path": "safe/path"},
+                pre_append=lambda: True, post_append=lambda: False)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("failed post-append validation was retained")
+        assert rollback_manifest.read_bytes() == rollback_original
+
+        mkdir_home = home / "mkdir-failure"
+        mkdir_spool = mkdir_home / "spool"
+        ensure_layout(mkdir_spool)
+        with patch.object(Path, "mkdir", side_effect=OSError("mkdir denied")):
+            mkdir_actions = repair_archive(mkdir_home / "archive", mkdir_spool)
+        assert any(item.code == "repair_refused" for item in mkdir_actions)
+        assert not (mkdir_home / "archive").exists()
+
+        redirected_object_home = home / "redirected-object"
+        redirected_object_spool = redirected_object_home / "spool"
+        redirected_object_paths = ensure_layout(redirected_object_spool)
+        redirected_object_archive = redirected_object_home / "archive"
+        redirected_object = (redirected_object_archive / "objects" / "sha256" /
+                             sha[:2] / sha[2:4] / sha)
+        redirected_object.parent.mkdir(parents=True)
+        redirected_object.write_bytes(data)
+        (redirected_object_paths["dead-letter"] / "job.json").write_text(
+            json.dumps(_doctor_job(
+                "redirected-object", kind="capture_snapshot", project="memoryd",
+                trigger="stop", original_transcript_path="C:/object.jsonl",
+                blob_sha256=sha, blob_bytes=len(data), session_id="object")),
+            encoding="utf-8")
+        redirected_object_before = _tree_snapshot(redirected_object_home)
+        real_redirected = doctor._redirected
+        with patch.object(
+                doctor, "_redirected",
+                side_effect=lambda path, value: (
+                    path == redirected_object or real_redirected(path, value))):
+            redirected_object_actions = repair_archive(
+                redirected_object_archive, redirected_object_spool)
+        assert any(
+            item.code == "repair_refused"
+            for item in redirected_object_actions)
+        assert _tree_snapshot(redirected_object_home) == redirected_object_before
 
 
 if __name__ == "__main__":

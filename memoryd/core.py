@@ -294,7 +294,8 @@ def _create_fonds_link(archive_root: Path, obj_path: Path,
 
 def append_manifest_occurrence(
         archive_root: Path, occurrence: dict,
-        *, pre_append: Callable[[], bool] | None = None) -> None:
+        *, pre_append: Callable[[], bool] | None = None,
+        post_append: Callable[[], bool] | None = None) -> None:
     manifest = archive_root / "manifest.jsonl"
     line = (json.dumps(occurrence, sort_keys=True, default=str) + "\n").encode()
     with _manifest_file_lock(manifest):
@@ -302,7 +303,8 @@ def append_manifest_occurrence(
             raise ValueError("manifest append precondition failed")
         with manifest.open("a+b") as handle:
             handle.seek(0, os.SEEK_END)
-            if handle.tell():
+            original_size = handle.tell()
+            if original_size:
                 handle.seek(-1, os.SEEK_END)
                 if handle.read(1) != b"\n":
                     handle.seek(0, os.SEEK_END)
@@ -311,6 +313,18 @@ def append_manifest_occurrence(
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+            try:
+                valid = post_append is None or post_append()
+            except Exception:
+                handle.truncate(original_size)
+                handle.flush()
+                os.fsync(handle.fileno())
+                raise
+            if not valid:
+                handle.truncate(original_size)
+                handle.flush()
+                os.fsync(handle.fileno())
+                raise ValueError("manifest append postcondition failed")
 
 
 def archive_bytes(data: bytes, mime: str, fonds_path: str,

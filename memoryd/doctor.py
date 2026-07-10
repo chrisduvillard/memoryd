@@ -53,6 +53,18 @@ def _redirected(path: Path, path_stat: os.stat_result) -> bool:
     return bool(getattr(path_stat, "st_file_attributes", 0) & reparse)
 
 
+def _scan_tree(root: Path):
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = directory / entry.name
+                yield path
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+
+
 def _topology_finding(
         path: Path, expected: str, code: str) -> Finding | None:
     try:
@@ -129,7 +141,7 @@ def _archive_topology(archive_root: Path, *, repair: bool) -> list[Finding]:
     object_root = archive_root / "objects" / "sha256"
     if not findings and os.path.lexists(object_root):
         try:
-            for path in object_root.rglob("*"):
+            for path in _scan_tree(object_root):
                 path_stat = path.stat(follow_symlinks=False)
                 if _redirected(path, path_stat):
                     findings.append(Finding(
@@ -152,10 +164,43 @@ def _spool_paths(spool_root: Path) -> dict[str, Path]:
 
 def _json_files(path: Path) -> tuple[list[Path], Finding | None]:
     try:
-        return sorted(path.glob("*.json")), None
+        with os.scandir(path) as entries:
+            return sorted(
+                path / entry.name for entry in entries
+                if entry.name.endswith(".json")), None
+    except FileNotFoundError:
+        return [], None
     except OSError as exc:
         return [], Finding(
             "spool_topology_unreadable", "error", str(path), str(exc))
+
+
+def _repair_evidence_topology(spool_root: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    paths = _spool_paths(spool_root)
+    for directory in (spool_root, *(paths[state] for state in SPOOL_STATES)):
+        candidates, error = _json_files(directory)
+        if error is not None:
+            findings.append(error)
+            continue
+        for candidate in candidates:
+            finding = _topology_finding(
+                candidate, "regular file", "repair_topology_invalid")
+            if finding is not None:
+                findings.append(finding)
+                continue
+            value, read_error = _read_json(candidate)
+            if read_error is not None or not isinstance(value, dict):
+                continue
+            if value.get("schema_version") == 2:
+                sha = value.get("blob_sha256")
+                if _valid_sha(sha):
+                    blob_finding = _topology_finding(
+                        paths["blobs"] / sha, "regular file",
+                        "repair_topology_invalid")
+                    if blob_finding is not None:
+                        findings.append(blob_finding)
+    return findings
 
 
 def _spool_manifests(spool_root: Path) -> list[Path]:
@@ -248,11 +293,19 @@ def _reason_record(value: object) -> dict | None:
 def _dead_letter_evidence(
         dead_root: Path,
 ) -> tuple[list[Path], int, list[Finding]]:
-    try:
-        candidates = sorted(dead_root.glob("*.json"))
-    except OSError as exc:
-        return [], 0, [Finding(
-            "spool_topology_unreadable", "error", str(dead_root), str(exc))]
+    candidates, enumeration_error = _json_files(dead_root)
+    if enumeration_error is not None:
+        return [], 0, [enumeration_error]
+    topology_findings: list[Finding] = []
+    safe_candidates: list[Path] = []
+    for path in candidates:
+        finding = _topology_finding(
+            path, "regular file", "spool_topology_invalid")
+        if finding is not None:
+            topology_findings.append(finding)
+        else:
+            safe_candidates.append(path)
+    candidates = safe_candidates
     parsed = {path: _read_json(path) for path in candidates}
     valid_jobs = {
         path for path, (value, error) in parsed.items()
@@ -273,7 +326,7 @@ def _dead_letter_evidence(
             continue
         evidence.add(path)
     expected = {dead_letter_reason_path(path): path for path in evidence}
-    findings: list[Finding] = []
+    findings: list[Finding] = topology_findings
 
     for reason_path, manifest in expected.items():
         if reason_path not in parsed:
@@ -321,6 +374,11 @@ def inspect_spool(spool_root: Path) -> list[Finding]:
     manifests.extend(dead_manifests)
     findings.extend(reason_findings)
     for manifest in manifests:
+        topology_finding = _topology_finding(
+            manifest, "regular file", "spool_topology_invalid")
+        if topology_finding is not None:
+            findings.append(topology_finding)
+            continue
         if manifest.parent == paths["processing"]:
             try:
                 if time.time() - manifest.stat().st_mtime > 900:
@@ -365,6 +423,10 @@ def inspect_spool(spool_root: Path) -> list[Finding]:
         findings.append(Finding(
             "dead_letter_jobs", "error", str(paths["dead-letter"]),
             str(dead_count)))
+    for job_id, identities in _spool_identity_collisions(spool_root).items():
+        findings.append(Finding(
+            "occurrence_identity_collision", "error", str(spool_root),
+            f"{job_id}: {sorted(identities)!r}"))
     return findings
 
 
@@ -378,9 +440,10 @@ def _archive_objects(
     object_root = archive_root / "objects" / "sha256"
     objects: dict[str, Path] = {}
     findings: list[Finding] = []
+    if not os.path.lexists(object_root):
+        return objects, findings
     try:
-        candidates = object_root.rglob("*")
-        for path in candidates:
+        for path in _scan_tree(object_root):
             try:
                 path_stat = path.stat(follow_symlinks=False)
             except OSError as exc:
@@ -498,16 +561,22 @@ def _dead_letter_invalid(
 
 
 def repair_spool(spool_root: Path) -> list[Finding]:
-    topology = _spool_topology(spool_root, repair=True)
+    topology = [
+        *_spool_topology(spool_root, repair=True),
+        *_repair_evidence_topology(spool_root),
+    ]
     if topology:
         return _repair_refusals(topology)
     actions: list[Finding] = []
-    ensure_layout(spool_root)
+    try:
+        ensure_layout(spool_root)
+    except OSError as exc:
+        return [Finding("repair_refused", "error", str(spool_root), str(exc))]
     try:
         requeued = requeue_stale(spool_root)
     except OSError as exc:
         actions.append(Finding(
-            "stale_requeue_failed", "error", str(spool_root), str(exc)))
+            "repair_refused", "error", str(spool_root), str(exc)))
     else:
         if requeued:
             actions.append(Finding(
@@ -515,8 +584,9 @@ def repair_spool(spool_root: Path) -> list[Finding]:
                 str(requeued)))
 
     paths = _spool_paths(spool_root)
-    manifests = [*sorted(spool_root.glob("*.json")),
-                 *sorted(paths["incoming"].glob("*.json"))]
+    root_manifests, _ = _json_files(spool_root)
+    incoming_manifests, _ = _json_files(paths["incoming"])
+    manifests = [*root_manifests, *incoming_manifests]
     for manifest in manifests:
         value, read_error = _read_json(manifest)
         if read_error is not None:
@@ -549,6 +619,7 @@ def repair_spool(spool_root: Path) -> list[Finding]:
                 spool_root, manifest, "legacy transcript source missing",
                 "legacy_dead_lettered"))
             continue
+        before_dead = set(_dead_letter_evidence(paths["dead-letter"])[0])
         try:
             upgraded = upgrade_legacy_job(spool_root, manifest)
         except (OSError, PermanentSpoolError, ValueError) as exc:
@@ -556,9 +627,15 @@ def repair_spool(spool_root: Path) -> list[Finding]:
                 spool_root, manifest, str(exc),
                 "invalid_job_dead_lettered"))
             continue
+        preserved_path = manifest
+        if upgraded is None:
+            after_dead = set(_dead_letter_evidence(paths["dead-letter"])[0])
+            created = sorted(after_dead - before_dead)
+            if len(created) == 1:
+                preserved_path = created[0]
         actions.append(Finding(
             "legacy_upgraded" if upgraded else "legacy_dead_lettered",
-            "info", str(manifest),
+            "info", str(upgraded or preserved_path),
             str(upgraded or "preserved in dead-letter")))
     return actions
 
@@ -639,6 +716,26 @@ def _archive_evidence(
         return None
 
 
+def _spool_identity_collisions(
+        spool_root: Path) -> dict[str, set[tuple[str, str]]]:
+    identities: dict[str, set[tuple[str, str]]] = {}
+    for job_path in _spool_manifests(spool_root):
+        value, error = _read_json(job_path)
+        if error is not None:
+            continue
+        evidence = _archive_evidence(value)
+        if evidence is None:
+            continue
+        sha, _size, created, session_id, job_id = evidence
+        if job_id is None:
+            continue
+        fonds = f"claude-code/{created:%Y/%m/%d}/{session_id}.jsonl"
+        identities.setdefault(job_id, set()).add((sha, fonds))
+    return {
+        job_id: values for job_id, values in identities.items()
+        if len(values) > 1}
+
+
 def _consume_legacy_pair(
         pair: tuple[str, str],
         fallbacks: Counter[tuple[str, str, str]],
@@ -665,7 +762,7 @@ def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
 
 def _verify_repair_object(
         path: Path, sha: str, expected_bytes: int | None,
-) -> os.stat_result:
+) -> tuple[object, os.stat_result]:
     path_before = path.stat(follow_symlinks=False)
     if (_redirected(path, path_before) or
             not stat.S_ISREG(path_before.st_mode)):
@@ -676,7 +773,8 @@ def _verify_repair_object(
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags)
-    with os.fdopen(fd, "rb") as handle:
+    handle = os.fdopen(fd, "rb")
+    try:
         opened = os.fstat(handle.fileno())
         if not _same_file_identity(path_before, opened):
             raise ValueError("canonical object changed before open")
@@ -686,13 +784,16 @@ def _verify_repair_object(
         opened_after = os.fstat(handle.fileno())
         if not _same_file_identity(opened, opened_after):
             raise ValueError("canonical object changed while hashing")
-    if digest.hexdigest() != sha:
-        raise ValueError("canonical object checksum mismatch")
-    path_after = path.stat(follow_symlinks=False)
-    if (_redirected(path, path_after) or
-            not _same_file_identity(opened_after, path_after)):
-        raise ValueError("canonical object path changed after hashing")
-    return opened_after
+        if digest.hexdigest() != sha:
+            raise ValueError("canonical object checksum mismatch")
+        path_after = path.stat(follow_symlinks=False)
+        if (_redirected(path, path_after) or
+                not _same_file_identity(opened_after, path_after)):
+            raise ValueError("canonical object path changed after hashing")
+        return handle, opened_after
+    except Exception:
+        handle.close()
+        raise
 
 
 def _canonical_identity_matches(path: Path, verified: os.stat_result) -> bool:
@@ -704,14 +805,28 @@ def _canonical_identity_matches(path: Path, verified: os.stat_result) -> bool:
             _same_file_identity(verified, current))
 
 
+def _open_identity_matches(handle: object, path: Path,
+                           verified: os.stat_result) -> bool:
+    try:
+        opened = os.fstat(handle.fileno())
+    except OSError:
+        return False
+    return (_same_file_identity(verified, opened) and
+            _canonical_identity_matches(path, verified))
+
+
 def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
     topology = [
         *_spool_topology(spool_root, repair=True),
+        *_repair_evidence_topology(spool_root),
         *_archive_topology(archive_root, repair=True),
     ]
     if topology:
         return _repair_refusals(topology)
-    archive_root.mkdir(parents=True, exist_ok=True)
+    try:
+        archive_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return [Finding("repair_refused", "error", str(archive_root), str(exc))]
     manifest = archive_root / "manifest.jsonl"
     identities = _manifest_identities(manifest)
     if identities is None:
@@ -726,6 +841,11 @@ def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
         "occurrence_identity_collision", "error", str(manifest),
         f"{job_id}: {sorted(values)!r}")
         for job_id, values in sorted(collisions.items())]
+    spool_collisions = _spool_identity_collisions(spool_root)
+    actions.extend(Finding(
+        "occurrence_identity_collision", "error", str(spool_root),
+        f"{job_id}: {sorted(values)!r}")
+        for job_id, values in sorted(spool_collisions.items()))
     for job_path in _spool_manifests(spool_root):
         value, read_error = _read_json(job_path)
         if read_error is not None:
@@ -744,6 +864,8 @@ def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
         fallback = (sha, occurrence_at, fonds)
         pair = (sha, fonds)
         if job_id is not None:
+            if job_id in spool_collisions:
+                continue
             if job_id in collisions:
                 continue
             existing_identities = job_identities.get(job_id)
@@ -768,7 +890,7 @@ def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
         obj = (archive_root / "objects" / "sha256" /
                sha[:2] / sha[2:4] / sha)
         try:
-            obj_stat = _verify_repair_object(
+            obj_handle, obj_stat = _verify_repair_object(
                 obj, sha, expected_bytes)
         except (OSError, ValueError) as exc:
             actions.append(Finding(
@@ -793,11 +915,16 @@ def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
                 continue
             append_manifest_occurrence(
                 archive_root, occurrence,
-                pre_append=lambda: _canonical_identity_matches(obj, obj_stat))
+                pre_append=lambda: _open_identity_matches(
+                    obj_handle, obj, obj_stat),
+                post_append=lambda: _open_identity_matches(
+                    obj_handle, obj, obj_stat))
         except (OSError, ValueError) as exc:
             actions.append(Finding(
                 "archive_repair_failed", "error", str(manifest), str(exc)))
             continue
+        finally:
+            obj_handle.close()
         if job_id is not None:
             job_identities[job_id] = {pair}
         actions.append(Finding(
@@ -829,6 +956,7 @@ def main(repair: bool = False) -> int:
     if repair:
         topology = [
             *_spool_topology(CFG.spool, repair=True),
+            *_repair_evidence_topology(CFG.spool),
             *_archive_topology(CFG.archive, repair=True),
         ]
         if topology:
