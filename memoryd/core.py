@@ -162,8 +162,8 @@ def validate_fonds_path(archive_root: Path, fonds_path: str) -> Path:
     if rel.is_absolute() or any(part in ("", ".", "..") for part in parts):
         raise ValueError(f"unsafe fonds path: {fonds_path!r}")
     root = (archive_root / "fonds").resolve()
-    target = (root / Path(*parts)).resolve()
-    if not target.is_relative_to(root):
+    target = root / Path(*parts)
+    if not target.parent.resolve().is_relative_to(root):
         raise ValueError(f"fonds path escapes archive: {fonds_path!r}")
     return target
 
@@ -175,23 +175,45 @@ def _manifest_file_lock(manifest: Path):
     fd = None
     while fd is None:
         try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"{os.getpid()}\n".encode())
-        except FileExistsError:
+            candidate = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except (FileExistsError, PermissionError) as error:
             try:
                 if time.time() - lock.stat().st_mtime > 900:
-                    lock.unlink(missing_ok=True)
-                    continue
+                    try:
+                        lock.unlink(missing_ok=True)
+                    except PermissionError as unlink_error:
+                        error = unlink_error
+                    else:
+                        continue
             except FileNotFoundError:
-                continue
+                pass
+            except PermissionError as stat_error:
+                error = stat_error
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"manifest lock timeout: {lock}")
+                raise TimeoutError(f"manifest lock timeout: {lock}") from error
             time.sleep(0.01)
+        else:
+            try:
+                os.write(candidate, f"{os.getpid()}\n".encode())
+            except BaseException:
+                os.close(candidate)
+                lock.unlink(missing_ok=True)
+                raise
+            fd = candidate
     try:
         yield
     finally:
         os.close(fd)
-        lock.unlink(missing_ok=True)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                lock.unlink(missing_ok=True)
+            except PermissionError as error:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"manifest lock timeout: {lock}") from error
+                time.sleep(0.01)
+            else:
+                break
 
 
 def append_manifest_occurrence(archive_root: Path, occurrence: dict) -> None:
@@ -222,7 +244,14 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp, obj_path)
+            try:
+                os.replace(tmp, obj_path)
+            except (FileExistsError, PermissionError):
+                deadline = time.monotonic() + 5
+                while not obj_path.is_file():
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
         finally:
             tmp.unlink(missing_ok=True)
 

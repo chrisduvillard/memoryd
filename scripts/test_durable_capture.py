@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import multiprocessing
+import os
 import tempfile
 import threading
 from pathlib import Path
@@ -12,6 +14,63 @@ from memoryd import core
 from memoryd.hook import capture
 from memoryd.ingest import _classify_all
 from memoryd.spool import enqueue_capture, ensure_layout, validate_blob
+
+
+def _create_directory_link(target: Path, link: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+
+
+def _archive_with_synchronized_publication(
+        home: str, job_id: str, winner: bool,
+        ready: multiprocessing.synchronize.Barrier) -> None:
+    core.CFG.home = Path(home)
+    core.CFG.ensure_dirs()
+    real_replace = core.os.replace
+
+    def synchronized_replace(source: Path, target: Path) -> None:
+        ready.wait(timeout=10)
+        if winner:
+            core.time.sleep(0.05)
+            real_replace(source, target)
+        else:
+            raise PermissionError("simulated Windows publication loser")
+
+    core.os.replace = synchronized_replace
+    core.archive_bytes(b"concurrent", "text/plain", f"parallel/{job_id}.txt",
+                       ingest_job_id=job_id)
+
+
+def _assert_manifest_permission_contention_is_bounded(manifest: Path) -> None:
+    real_open = core.os.open
+    attempts = 0
+
+    def transient_permission(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("transient lock contention")
+        return real_open(*args, **kwargs)
+
+    with patch.object(core.os, "open", side_effect=transient_permission):
+        with core._manifest_file_lock(manifest):
+            pass
+    assert attempts == 2
+
+    with patch.object(core.os, "open", side_effect=PermissionError("denied")), \
+         patch.object(core.time, "monotonic", side_effect=(0, 6)):
+        try:
+            with core._manifest_file_lock(manifest):
+                pass
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("persistent manifest lock denial did not time out")
 
 
 def test_snapshot_survives_original_deletion() -> None:
@@ -116,6 +175,25 @@ def test_fonds_paths_cannot_escape_archive() -> None:
         safe = core.validate_fonds_path(root, "claude-code/2026/07/session.jsonl")
         assert safe.is_relative_to((root / "fonds").resolve())
 
+        objects = root / "objects"
+        objects.mkdir(parents=True)
+        leaf = root / "fonds" / "safe" / "existing"
+        leaf.parent.mkdir(parents=True)
+        _create_directory_link(objects, leaf)
+        expected_leaf = (root / "fonds").resolve() / "safe" / "existing"
+        assert core.validate_fonds_path(root, "safe/existing") == expected_leaf
+
+        outside = Path(td) / "outside"
+        outside.mkdir()
+        escaping_parent = root / "fonds" / "escaping"
+        _create_directory_link(outside, escaping_parent)
+        try:
+            core.validate_fonds_path(root, "escaping/file.txt")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe parent symlink accepted")
+
 
 def test_archive_records_each_occurrence() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -130,6 +208,47 @@ def test_archive_records_each_occurrence() -> None:
                        (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
             assert [entry["fonds_path"] for entry in entries] == ["a/one.txt", "b/two.txt"]
             assert [entry["ingest_job_id"] for entry in entries] == ["j1", "j2"]
+
+            context = multiprocessing.get_context("spawn")
+            ready = context.Barrier(2)
+            processes = [
+                context.Process(
+                    target=_archive_with_synchronized_publication,
+                    args=(td, str(index), index == 0, ready),
+                )
+                for index in range(2)
+            ]
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=15)
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+                    raise AssertionError("archive publication process timed out")
+            assert [process.exitcode for process in processes] == [0, 0]
+
+            entries = [json.loads(line) for line in
+                       (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
+            assert {entry["ingest_job_id"] for entry in entries} == {
+                "j1", "j2", "0", "1"}
+            object_files = [path for path in
+                            (core.CFG.archive / "objects" / "sha256").rglob("*")
+                            if path.is_file()]
+            assert len(object_files) == 2
+
+            with patch.object(core.os, "replace",
+                              side_effect=PermissionError("persistent denial")), \
+                 patch.object(core.time, "monotonic", side_effect=(0, 6)):
+                try:
+                    core.archive_bytes(b"blocked", "text/plain", "blocked/file.txt")
+                except PermissionError:
+                    pass
+                else:
+                    raise AssertionError("unrelated object denial was swallowed")
+
+            _assert_manifest_permission_contention_is_bounded(
+                core.CFG.archive / "manifest.jsonl")
         finally:
             core.CFG.home = old_home
 
