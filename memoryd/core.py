@@ -482,24 +482,27 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
         handle.flush()
         os.fsync(handle.fileno())
     keep_temp = False
+    canonical_observed = False
     try:
         try:
             os.link(tmp, obj_path)
+            canonical_observed = True
         except FileExistsError:
-            pass
+            canonical_observed = True
         except PermissionError:
             deadline = time.monotonic() + 5
             while not os.path.lexists(obj_path):
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.01)
+            canonical_observed = True
         _fsync_directory(obj_dir)
 
         try:
             obj_handle, obj_stat = _open_verified_archive_object(
                 obj_path, sha, len(data))
         except Exception:
-            keep_temp = os.path.lexists(obj_path)
+            keep_temp = canonical_observed
             raise
         try:
             try:

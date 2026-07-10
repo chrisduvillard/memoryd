@@ -2129,6 +2129,51 @@ def test_archive_leaf_swap_rolls_back_manifest_and_preserves_temp() -> None:
             core.CFG.home = old_home
 
 
+def test_archive_publication_disappearance_preserves_temp() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            data = b"published object disappears before verification"
+            sha = hashlib.sha256(data).hexdigest()
+            obj = (core.CFG.archive / "objects" / "sha256" /
+                   sha[:2] / sha[2:4] / sha)
+            real_open = core._open_verified_archive_object
+            disappeared = False
+
+            def disappear_before_verification(
+                    obj_path: Path, expected_sha: str,
+                    expected_bytes: int):
+                nonlocal disappeared
+                assert obj_path.read_bytes() == data
+                obj_path.unlink()
+                disappeared = True
+                return real_open(obj_path, expected_sha, expected_bytes)
+
+            with patch.object(
+                    core, "_open_verified_archive_object",
+                    side_effect=disappear_before_verification):
+                try:
+                    core.archive_bytes(
+                        data, "text/plain", "disappeared/object.txt")
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "missing published object was manifested")
+
+            assert disappeared
+            assert not os.path.lexists(obj)
+            manifest = core.CFG.archive / "manifest.jsonl"
+            assert not manifest.exists() or not manifest.read_bytes()
+            preserved = list(obj.parent.glob(f".{sha}.*.tmp"))
+            assert preserved
+            assert any(path.read_bytes() == data for path in preserved)
+        finally:
+            core.CFG.home = old_home
+
+
 def test_archive_unrelated_failures_do_not_accumulate_temps() -> None:
     with tempfile.TemporaryDirectory() as td:
         old_home = core.CFG.home
@@ -3114,6 +3159,7 @@ if __name__ == "__main__":
     test_fonds_paths_cannot_escape_archive()
     test_archive_object_ancestors_cannot_redirect_publication_or_gc()
     test_archive_leaf_swap_rolls_back_manifest_and_preserves_temp()
+    test_archive_publication_disappearance_preserves_temp()
     test_archive_unrelated_failures_do_not_accumulate_temps()
     test_archive_records_each_occurrence()
     test_session_separator_fonds_identity_matches_doctor_repair()
@@ -3122,4 +3168,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("30 passed, 0 failed")
+    print("31 passed, 0 failed")
