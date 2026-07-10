@@ -25,7 +25,7 @@ from pathlib import Path
 from .core import CFG, new_id, pool
 from .ingest import drain_spool
 from .recall import build_packet
-from .spool import enqueue_capture
+from .spool import enqueue_capture, enqueue_extraction
 
 CAPTURE_Q: "queue.Queue[dict]" = queue.Queue()
 ADMIN_POST_ENDPOINTS = {
@@ -42,10 +42,7 @@ def _capture_worker() -> None:
     while True:
         job = CAPTURE_Q.get()
         try:
-            if job.get("extract_only"):
-                from .extract import run_extraction
-                run_extraction(job["session_id"])
-            elif job.get("drain_spool"):
+            if job.get("drain_spool"):
                 drain_spool()
         except Exception as exc:  # noqa: BLE001 — keep the worker alive
             print(f"memoryd: capture worker failed: {exc}")
@@ -179,7 +176,13 @@ class Handler(BaseHTTPRequestHandler):
             if not sid:
                 self._json(400, {"error": "session_id required"})
                 return
-            CAPTURE_Q.put({"extract_only": True, "session_id": sid})
+            try:
+                enqueue_extraction(spool_root=CFG.spool, session_id=sid)
+            except Exception as exc:  # noqa: BLE001 — report persistence failure
+                self._json(
+                    500, {"error": f"extraction could not be persisted: {exc}"})
+                return
+            CAPTURE_Q.put({"drain_spool": True})
             self._json(202, {"queued": True})
         elif self.path == "/miss":
             with pool().connection() as conn:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -12,7 +14,7 @@ from typing import BinaryIO
 
 SCHEMA_VERSION = 2
 BUFFER_BYTES = 1024 * 1024
-_CLAIM_LOCK = threading.Lock()
+_STATE_THREAD_LOCK = threading.RLock()
 
 
 class SpoolError(RuntimeError):
@@ -57,10 +59,57 @@ def _atomic_json(path: Path, value: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def _blob_state_lock(spool_root: Path):
-    from .core import _manifest_file_lock
-    lock_anchor = ensure_layout(spool_root)["blobs"] / "state.guard"
-    return _manifest_file_lock(lock_anchor)
+@contextlib.contextmanager
+def _state_lock(spool_root: Path):
+    ensure_layout(spool_root)
+    lock_path = spool_root / "state.lock"
+    deadline = time.monotonic() + 5
+    fd = None
+    last_error = None
+    with _STATE_THREAD_LOCK:
+        while fd is None:
+            candidate = None
+            try:
+                candidate = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                if os.name == "nt":
+                    import msvcrt
+                    if os.fstat(candidate).st_size == 0:
+                        os.write(candidate, b"\0")
+                        os.fsync(candidate)
+                    os.lseek(candidate, 0, os.SEEK_SET)
+                    msvcrt.locking(candidate, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except PermissionError as error:
+                last_error = error
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    if candidate is not None:
+                        os.close(candidate)
+                    raise
+                last_error = error
+            else:
+                fd = candidate
+                break
+            if candidate is not None:
+                os.close(candidate)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"state lock timeout: {lock_path}") from last_error
+            time.sleep(0.01)
+        try:
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def enqueue_capture(*, spool_root: Path, transcript_path: Path,
@@ -77,7 +126,7 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
             sha, size = _copy_and_hash(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
-        with _blob_state_lock(spool_root):
+        with _state_lock(spool_root):
             blob = paths["blobs"] / sha
             if blob.exists():
                 tmp_blob.unlink(missing_ok=True)
@@ -110,21 +159,49 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
         tmp_blob.unlink(missing_ok=True)
 
 
+def enqueue_extraction(*, spool_root: Path, session_id: str) -> dict:
+    paths = ensure_layout(spool_root)
+    job_id = _job_id()
+    job = {
+        "schema_version": SCHEMA_VERSION,
+        "job_id": job_id,
+        "kind": "extraction",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "session_id": session_id,
+        "attempts": 0,
+        "last_error": None,
+        "next_attempt_at": None,
+    }
+    with _state_lock(spool_root):
+        _atomic_json(paths["incoming"] / f"{job_id}.json", job)
+    return job
+
+
 def load_job(path: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise PermanentSpoolError(f"invalid job manifest: {exc}") from exc
+    if not isinstance(value, dict):
+        raise PermanentSpoolError("invalid job manifest: expected object")
     if value.get("schema_version") != SCHEMA_VERSION:
         raise PermanentSpoolError("unsupported job schema")
-    required = {"job_id", "kind", "session_id", "trigger", "blob_sha256", "blob_bytes"}
+    required = {"job_id", "kind", "session_id"}
     missing = required - value.keys()
     if missing:
         raise PermanentSpoolError(f"missing manifest fields: {sorted(missing)}")
-    if value["kind"] != "capture_snapshot" or not str(value["session_id"]):
-        raise PermanentSpoolError("invalid capture job identity")
-    if not isinstance(value["blob_bytes"], int) or value["blob_bytes"] < 0:
-        raise PermanentSpoolError("invalid blob byte count")
+    if not str(value["session_id"]):
+        raise PermanentSpoolError("invalid job identity")
+    if value["kind"] == "capture_snapshot":
+        capture_required = {"trigger", "blob_sha256", "blob_bytes"}
+        missing = capture_required - value.keys()
+        if missing:
+            raise PermanentSpoolError(
+                f"missing manifest fields: {sorted(missing)}")
+        if not isinstance(value["blob_bytes"], int) or value["blob_bytes"] < 0:
+            raise PermanentSpoolError("invalid blob byte count")
+    elif value["kind"] != "extraction":
+        raise PermanentSpoolError("unsupported job kind")
     return value
 
 
@@ -146,7 +223,9 @@ def validate_blob(spool_root: Path, job: dict) -> Path:
     return blob
 
 
-def _scheduled(job: dict) -> bool:
+def _scheduled(job: object) -> bool:
+    if not isinstance(job, dict):
+        return False
     raw = job.get("next_attempt_at")
     if not raw:
         return False
@@ -160,7 +239,7 @@ def _scheduled(job: dict) -> bool:
 
 
 def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | None:
-    with _CLAIM_LOCK:
+    with _state_lock(spool_root):
         paths = ensure_layout(spool_root)
         sources = sorted([*spool_root.glob("*.json"),
                           *paths["incoming"].glob("*.json")])
@@ -172,40 +251,31 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
             if not ignore_schedule and _scheduled(job):
                 continue
             target = paths["processing"] / source.name
-            claim_lock = paths["processing"] / (
-                ".claim-" + hashlib.sha256(source.name.encode()).hexdigest())
-            try:
-                claim_lock.mkdir()
-            except FileExistsError:
+            if target.exists():
                 continue
-            try:
-                if target.exists():
-                    continue
-                deadline = time.monotonic() + 5
-                while True:
-                    try:
-                        os.replace(source, target)
-                    except FileNotFoundError:
+            os.utime(source, None)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    os.replace(source, target)
+                except FileNotFoundError:
+                    break
+                except PermissionError as exc:
+                    if not source.exists() or target.exists():
                         break
-                    except PermissionError as exc:
-                        if not source.exists() or target.exists():
-                            break
-                        if time.monotonic() >= deadline:
-                            raise exc
-                        time.sleep(0.005)
-                        continue
-                    return target
-            finally:
-                claim_lock.rmdir()
+                    if time.monotonic() >= deadline:
+                        raise exc
+                    time.sleep(0.005)
+                    continue
+                os.utime(target, None)
+                return target
     return None
 
 
 def release_job(spool_root: Path, processing_path: Path, error: str,
                 *, delay_s: int) -> Path:
-    job = json.loads(processing_path.read_text(encoding="utf-8"))
-    sha = job.get("blob_sha256")
-
-    def release() -> Path:
+    with _state_lock(spool_root):
+        job = json.loads(processing_path.read_text(encoding="utf-8"))
         job["attempts"] = int(job.get("attempts", 0)) + 1
         job["last_error"] = error
         job["next_attempt_at"] = (
@@ -215,64 +285,45 @@ def release_job(spool_root: Path, processing_path: Path, error: str,
         os.replace(processing_path, target)
         return target
 
-    if sha:
-        with _blob_state_lock(spool_root):
-            return release()
-    return release()
-
 
 def dead_letter(spool_root: Path, job_path: Path, reason: str) -> Path:
-    paths = ensure_layout(spool_root)
-    target = paths["dead-letter"] / job_path.name
-    if target.exists():
-        target = target.with_name(
-            f"{target.stem}-{secrets.token_hex(4)}{target.suffix}")
-    os.replace(job_path, target)
-    _atomic_json(target.with_suffix(".reason.json"), {
-        "dead_lettered_at": datetime.now(timezone.utc).isoformat(),
-        "reason": reason,
-        "manifest": target.name,
-    })
-    return target
+    with _state_lock(spool_root):
+        paths = ensure_layout(spool_root)
+        target = paths["dead-letter"] / job_path.name
+        reason_path = target.with_suffix(".reason.json")
+        while target.exists() or reason_path.exists():
+            target = target.with_name(
+                f"{target.stem}-{secrets.token_hex(4)}{target.suffix}")
+            reason_path = target.with_suffix(".reason.json")
+        _atomic_json(reason_path, {
+            "dead_lettered_at": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "manifest": target.name,
+        })
+        os.replace(job_path, target)
+        return target
 
 
 def complete_job(job_path: Path) -> None:
-    job_path.unlink()
+    with _state_lock(job_path.parent.parent):
+        job_path.unlink()
 
 
 def requeue_stale(spool_root: Path, *, stale_after_s: int = 900) -> int:
-    paths = ensure_layout(spool_root)
-    cutoff = time.time() - stale_after_s
-    moved = 0
-    for source in paths["processing"].glob("*.json"):
-        target = paths["incoming"] / source.name
-
-        def move_if_stale() -> bool:
-            if source.stat().st_mtime >= cutoff:
-                return False
-            os.replace(source, target)
-            return True
-
-        try:
+    with _state_lock(spool_root):
+        paths = ensure_layout(spool_root)
+        cutoff = time.time() - stale_after_s
+        moved = 0
+        for source in paths["processing"].glob("*.json"):
+            target = paths["incoming"] / source.name
             try:
-                job = json.loads(source.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                job = {}
-            sha = job.get("blob_sha256") if isinstance(job, dict) else None
-            if sha:
-                with _blob_state_lock(spool_root):
-                    moved += int(move_if_stale())
-            else:
-                moved += int(move_if_stale())
-        except FileNotFoundError:
-            continue
-    for claim_lock in paths["processing"].glob(".claim-*"):
-        try:
-            if claim_lock.stat().st_mtime < cutoff:
-                claim_lock.rmdir()
-        except FileNotFoundError:
-            continue
-    return moved
+                if source.stat().st_mtime >= cutoff:
+                    continue
+                os.replace(source, target)
+                moved += 1
+            except FileNotFoundError:
+                continue
+        return moved
 
 
 def upgrade_legacy_job(spool_root: Path, legacy_path: Path) -> Path | None:
@@ -307,7 +358,7 @@ def gc_blob_if_unreferenced(spool_root: Path, sha: str,
         return False
 
     try:
-        with _blob_state_lock(spool_root):
+        with _state_lock(spool_root):
             paths = ensure_layout(spool_root)
             manifests = [*spool_root.glob("*.json")]
             for state in ("incoming", "processing", "dead-letter"):
@@ -321,7 +372,9 @@ def gc_blob_if_unreferenced(spool_root: Path, sha: str,
                             value.get("blob_sha256") == sha):
                         return False
                 except (OSError, ValueError):
-                    continue
+                    return False
+                if not isinstance(value, dict):
+                    return False
             blob = paths["blobs"] / sha
             blob.unlink(missing_ok=True)
             return True

@@ -6,6 +6,8 @@ import io
 import json
 import multiprocessing
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import urllib.request
@@ -13,10 +15,25 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from memoryd import core, server, spool
+from memoryd import core, ingest, server, spool
 from memoryd.hook import capture
 from memoryd.ingest import _classify_all
 from memoryd.spool import enqueue_capture, ensure_layout, validate_blob
+
+
+def _write_extraction_job(root: Path, name: str, session_id: str) -> Path:
+    path = ensure_layout(root)["incoming"] / name
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "job_id": name.removesuffix(".json"),
+        "kind": "extraction",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "session_id": session_id,
+        "attempts": 0,
+        "last_error": None,
+        "next_attempt_at": None,
+    }), encoding="utf-8")
+    return path
 
 
 def _create_directory_link(target: Path, link: Path) -> None:
@@ -208,6 +225,32 @@ def test_snapshot_survives_original_deletion() -> None:
         assert len(manifests) == 1
         assert json.loads(manifests[0].read_text())["schema_version"] == 2
 
+        blocker = r'''
+import importlib.abc
+import sys
+from pathlib import Path
+
+class BlockCoreAndPsycopg(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "memoryd.core" or fullname.startswith("psycopg"):
+            raise ModuleNotFoundError(f"blocked dependency: {fullname}")
+        return None
+
+sys.meta_path.insert(0, BlockCoreAndPsycopg())
+from memoryd.spool import enqueue_capture
+base = Path(sys.argv[1])
+base.mkdir(parents=True)
+source = base / "stdlib.jsonl"
+source.write_text("stdlib", encoding="utf-8")
+enqueue_capture(spool_root=base / "spool", transcript_path=source,
+                session_id="stdlib", project=None, trigger="stop")
+'''
+        isolated = subprocess.run(
+            [sys.executable, "-c", blocker, str(Path(td) / "isolated")],
+            capture_output=True, text=True, timeout=15,
+            env=os.environ.copy(), check=False)
+        assert isolated.returncode == 0, isolated.stderr
+
 
 def test_identical_snapshots_share_one_blob() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -293,17 +336,36 @@ def test_capture_persists_snapshot_before_acknowledgement() -> None:
             assert len(manifests) == 1
             job = json.loads(manifests[0].read_text(encoding="utf-8"))
             assert validate_blob(core.CFG.spool, job).read_text() == "durable before ack"
+
+            extract_request = urllib.request.Request(
+                f"http://127.0.0.1:{httpd.server_port}/extract",
+                data=json.dumps({"session_id": "extract-durable"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(extract_request, timeout=5) as response:
+                assert response.status == 202
+                extract_response = response.read()
+            assert extract_response == b'{"queued": true}'
+            jobs = [json.loads(path.read_text(encoding="utf-8"))
+                    for path in (core.CFG.spool / "incoming").glob("*.json")]
+            extraction_jobs = [value for value in jobs
+                               if value.get("kind") == "extraction"]
+            assert len(extraction_jobs) == 1
+            assert extraction_jobs[0]["schema_version"] == 2
+            assert extraction_jobs[0]["session_id"] == "extract-durable"
         finally:
             httpd.shutdown()
             httpd.server_close()
             if thread.is_alive():
                 thread.join(timeout=5)
-            try:
-                server.CAPTURE_Q.get_nowait()
-            except server.queue.Empty:
-                pass
-            else:
-                server.CAPTURE_Q.task_done()
+            while True:
+                try:
+                    server.CAPTURE_Q.get_nowait()
+                except server.queue.Empty:
+                    break
+                else:
+                    server.CAPTURE_Q.task_done()
             core.CFG.home = old_home
 
 
@@ -324,6 +386,32 @@ def test_claim_retry_and_dead_letter_preserve_manifest() -> None:
         canonical.write_text("x", encoding="utf-8")
         assert spool.gc_blob_if_unreferenced(
             gc_root, gc_job["blob_sha256"], canonical)
+
+        uncertain_root = Path(td) / "uncertain-spool"
+        uncertain_job = enqueue_capture(
+            spool_root=uncertain_root, transcript_path=gc_source,
+            session_id="uncertain", project=None, trigger="stop")
+        next((uncertain_root / "incoming").glob("*.json")).unlink()
+        malformed = uncertain_root / "incoming" / "malformed.json"
+        malformed.write_text("{broken", encoding="utf-8")
+        assert not spool.gc_blob_if_unreferenced(
+            uncertain_root, uncertain_job["blob_sha256"], canonical)
+        assert (uncertain_root / "blobs" / uncertain_job["blob_sha256"]).exists()
+
+        malformed.unlink()
+        unreadable = uncertain_root / "incoming" / "unreadable.json"
+        unreadable.write_text("{}", encoding="utf-8")
+        real_read_text = Path.read_text
+
+        def unreadable_manifest(path: Path, *args, **kwargs) -> str:
+            if Path(path) == unreadable:
+                raise OSError("manifest unreadable")
+            return real_read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", unreadable_manifest):
+            assert not spool.gc_blob_if_unreferenced(
+                uncertain_root, uncertain_job["blob_sha256"], canonical)
+        assert (uncertain_root / "blobs" / uncertain_job["blob_sha256"]).exists()
 
         gc_race_root = Path(td) / "gc-race-spool"
         gc_race_source = Path(td) / "gc-race.jsonl"
@@ -519,6 +607,129 @@ def test_claim_retry_and_dead_letter_preserve_manifest() -> None:
         reason = preserved.with_suffix(".reason.json")
         assert json.loads(reason.read_text())["reason"] == "checksum mismatch"
 
+        sidecar_root = Path(td) / "sidecar-spool"
+        sidecar_paths = ensure_layout(sidecar_root)
+        sidecar_source = sidecar_paths["incoming"] / "job.json"
+        sidecar_source.write_text('{"evidence": true}', encoding="utf-8")
+        orphan_reason = sidecar_paths["dead-letter"] / "job.reason.json"
+        orphan_reason.write_text('{"orphan": true}', encoding="utf-8")
+        preserved = spool.dead_letter(sidecar_root, sidecar_source, "collision")
+        assert preserved.name != "job.json"
+        assert orphan_reason.read_text(encoding="utf-8") == '{"orphan": true}'
+        assert json.loads(preserved.with_suffix(".reason.json").read_text())[
+            "reason"] == "collision"
+
+        ordered_source = sidecar_paths["incoming"] / "ordered.json"
+        ordered_source.write_text('{"ordered": true}', encoding="utf-8")
+        real_replace = spool.os.replace
+
+        def require_reason_before_manifest(source: Path, target: Path) -> None:
+            if Path(source) == ordered_source:
+                assert Path(target).with_suffix(".reason.json").exists()
+            real_replace(source, target)
+
+        with patch.object(spool.os, "replace",
+                          side_effect=require_reason_before_manifest):
+            ordered = spool.dead_letter(
+                sidecar_root, ordered_source, "sidecar first")
+        assert ordered.exists()
+
+        recoverable = sidecar_paths["incoming"] / "recoverable.json"
+        recoverable.write_text('{"recoverable": true}', encoding="utf-8")
+        with patch.object(spool, "_atomic_json",
+                          side_effect=OSError("sidecar write failed")):
+            try:
+                spool.dead_letter(sidecar_root, recoverable, "temporary failure")
+            except OSError as exc:
+                assert str(exc) == "sidecar write failed"
+            else:
+                raise AssertionError("sidecar failure was swallowed")
+        assert recoverable.exists()
+        assert not (sidecar_paths["dead-letter"] / "recoverable.json").exists()
+
+
+def _assert_nonobject_manifest_does_not_block_drain() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            invalid = ensure_layout(core.CFG.spool)["incoming"] / "a-invalid.json"
+            invalid.write_text("[]", encoding="utf-8")
+            _write_extraction_job(
+                core.CFG.spool, "b-extraction.json", "later-session")
+            with patch("memoryd.extract.run_extraction",
+                       return_value={"ok": True, "stored": 0}):
+                stats = ingest.drain_spool()
+            assert stats == {
+                "processed": 1, "retried": 0,
+                "dead_lettered": 1, "requeued": 0,
+            }
+            preserved = core.CFG.spool / "dead-letter" / "a-invalid.json"
+            assert json.loads(preserved.read_text(encoding="utf-8")) == []
+            assert preserved.with_suffix(".reason.json").exists()
+        finally:
+            core.CFG.home = old_home
+
+
+def _assert_extraction_replay_classification() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        try:
+            core.CFG.home = Path(td) / "no-events"
+            core.CFG.ensure_dirs()
+            _write_extraction_job(
+                core.CFG.spool, "no-events.json", "empty-session")
+            with patch("memoryd.extract.run_extraction", return_value={
+                    "ok": False, "error": "no events for session"}):
+                stats = ingest.drain_spool()
+            assert stats == {
+                "processed": 1, "retried": 0,
+                "dead_lettered": 0, "requeued": 0,
+            }
+            assert not list((core.CFG.spool / "incoming").glob("*.json"))
+            assert not list((core.CFG.spool / "dead-letter").glob("*.json"))
+
+            core.CFG.home = Path(td) / "retryable"
+            core.CFG.ensure_dirs()
+            _write_extraction_job(
+                core.CFG.spool, "retryable.json", "retry-session")
+            with patch("memoryd.extract.run_extraction", return_value={
+                    "ok": False, "error": "database down"}):
+                stats = ingest.drain_spool()
+            assert stats == {
+                "processed": 0, "retried": 1,
+                "dead_lettered": 0, "requeued": 0,
+            }
+            retry = next((core.CFG.spool / "incoming").glob("*.json"))
+            assert json.loads(retry.read_text())["attempts"] == 1
+
+            core.CFG.home = Path(td) / "capture-no-events"
+            core.CFG.ensure_dirs()
+            transcript = Path(td) / "capture.jsonl"
+            transcript.write_text("x", encoding="utf-8")
+            job = enqueue_capture(
+                spool_root=core.CFG.spool, transcript_path=transcript,
+                session_id="capture-empty", project=None,
+                trigger="session_end")
+            sha = job["blob_sha256"]
+            canonical = (core.CFG.archive / "objects" / "sha256" /
+                         sha[:2] / sha[2:4] / sha)
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            canonical.write_text("x", encoding="utf-8")
+            with patch.object(ingest, "ingest_transcript", return_value={
+                    "ok": True, "sha256": sha, "new_events": 0}), \
+                 patch("memoryd.extract.run_extraction", return_value={
+                     "ok": False, "error": "no events for session"}):
+                stats = ingest.drain_spool()
+            assert stats == {
+                "processed": 1, "retried": 0,
+                "dead_lettered": 0, "requeued": 0,
+            }
+            assert not list((core.CFG.spool / "incoming").glob("*.json"))
+        finally:
+            core.CFG.home = old_home
+
 
 def test_legacy_missing_source_is_preserved() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -533,10 +744,27 @@ def test_legacy_missing_source_is_preserved() -> None:
         preserved = paths["dead-letter"] / legacy.name
         assert json.loads(preserved.read_text()) == original
         assert preserved.with_suffix(".reason.json").exists()
+    _assert_nonobject_manifest_does_not_block_drain()
+    _assert_extraction_replay_classification()
 
 
 def test_stale_processing_job_is_requeued() -> None:
     with tempfile.TemporaryDirectory() as td:
+        lease_root = Path(td) / "lease-spool"
+        lease_transcript = Path(td) / "lease.jsonl"
+        lease_transcript.write_text("x", encoding="utf-8")
+        enqueue_capture(
+            spool_root=lease_root, transcript_path=lease_transcript,
+            session_id="lease", project=None, trigger="stop")
+        incoming = next((lease_root / "incoming").glob("*.json"))
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).timestamp()
+        os.utime(incoming, (old, old))
+        leased = spool.claim_next(lease_root)
+        assert leased
+        assert leased.stat().st_mtime > old
+        assert spool.requeue_stale(lease_root, stale_after_s=900) == 0
+        assert leased.exists()
+
         root = Path(td) / "spool"
         transcript = Path(td) / "session.jsonl"
         transcript.write_text("x", encoding="utf-8")

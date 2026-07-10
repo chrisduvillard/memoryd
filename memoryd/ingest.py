@@ -157,7 +157,8 @@ def drain_spool() -> dict[str, int]:
             if raw.get("extract_only"):
                 from .extract import run_extraction
                 result = run_extraction(raw["session_id"])
-                if not result.get("ok"):
+                if (not result.get("ok") and not result.get("skipped") and
+                        result.get("error") != "no events for session"):
                     raise RuntimeError(
                         result.get("error", "extraction retry failed"))
                 complete_job(job_path)
@@ -168,6 +169,16 @@ def drain_spool() -> dict[str, int]:
                 stats["dead_lettered"] += int(upgraded is None)
                 continue
             job = load_job(job_path)
+            if job["kind"] == "extraction":
+                from .extract import run_extraction
+                result = run_extraction(job["session_id"])
+                if (not result.get("ok") and not result.get("skipped") and
+                        result.get("error") != "no events for session"):
+                    raise RuntimeError(
+                        result.get("error", "extraction retry failed"))
+                complete_job(job_path)
+                stats["processed"] += 1
+                continue
             blob = validate_blob(CFG.spool, job)
             result = ingest_transcript(
                 str(blob), job["session_id"], job.get("project"), job["trigger"],
@@ -178,7 +189,8 @@ def drain_spool() -> dict[str, int]:
             if job["trigger"] in ("session_end", "pre_compact"):
                 from .extract import run_extraction
                 extracted = run_extraction(job["session_id"])
-                if not extracted.get("ok") and not extracted.get("skipped"):
+                if (not extracted.get("ok") and not extracted.get("skipped") and
+                        extracted.get("error") != "no events for session"):
                     raise RuntimeError(
                         extracted.get("error", "extraction failed"))
             complete_job(job_path)
