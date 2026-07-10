@@ -90,7 +90,8 @@ def ingest_transcript(transcript_path: str, session_id: str, project: str | None
 
     day = datetime.now(timezone.utc)
     fonds = f"claude-code/{day:%Y/%m/%d}/{session_id}.jsonl"
-    sha = archive_file(path, fonds, mime="application/x-jsonl")
+    sha = archive_file(path, fonds, mime="application/x-jsonl",
+                       ingest_job_id=ingest_job_id)
 
     new_events = 0
     with pool().connection() as conn:

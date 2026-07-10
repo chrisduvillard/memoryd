@@ -5,6 +5,7 @@ blocks on anything downstream (spec §4.3).
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -14,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -152,43 +153,107 @@ def barcode(ts: datetime, session_id: str, kind: str, content_hash: str) -> str:
 
 # ----------------------------------------------------------------- archive (Fonds Keeper)
 
-def archive_bytes(data: bytes, mime: str, fonds_path: str) -> str:
-    """Store blob content-addressed; append manifest; symlink into fonds.
+def validate_fonds_path(archive_root: Path, fonds_path: str) -> Path:
+    if not fonds_path or PureWindowsPath(fonds_path).drive:
+        raise ValueError(f"unsafe fonds path: {fonds_path!r}")
+    normalized = fonds_path.replace("\\", "/")
+    rel = PurePosixPath(normalized)
+    parts = normalized.split("/")
+    if rel.is_absolute() or any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"unsafe fonds path: {fonds_path!r}")
+    root = (archive_root / "fonds").resolve()
+    target = (root / Path(*parts)).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError(f"fonds path escapes archive: {fonds_path!r}")
+    return target
 
-    Returns sha256. Idempotent: re-archiving identical bytes is a no-op
-    except for the fonds link, preserving original order per source.
+
+@contextlib.contextmanager
+def _manifest_file_lock(manifest: Path):
+    lock = manifest.with_suffix(".lock")
+    deadline = time.monotonic() + 5
+    fd = None
+    while fd is None:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 900:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"manifest lock timeout: {lock}")
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        os.close(fd)
+        lock.unlink(missing_ok=True)
+
+
+def append_manifest_occurrence(archive_root: Path, occurrence: dict) -> None:
+    manifest = archive_root / "manifest.jsonl"
+    line = json.dumps(occurrence, sort_keys=True, default=str) + "\n"
+    with _manifest_file_lock(manifest):
+        with manifest.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def archive_bytes(data: bytes, mime: str, fonds_path: str,
+                  ingest_job_id: str | None = None) -> str:
+    """Store blob content-addressed; append occurrence; symlink into fonds.
+
+    Returns sha256. Identical bytes share one immutable object while every
+    archive call records its own occurrence.
     """
     sha = hashlib.sha256(data).hexdigest()
     obj_dir = CFG.archive / "objects" / "sha256" / sha[:2] / sha[2:4]
     obj_path = obj_dir / sha
+    obj_dir.mkdir(parents=True, exist_ok=True)
     if not obj_path.exists():
-        obj_dir.mkdir(parents=True, exist_ok=True)
-        tmp = obj_path.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, obj_path)  # atomic; blob is immutable from here on
-        manifest = CFG.archive / "manifest.jsonl"
-        with manifest.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sha256": sha,
-                "bytes": len(data),
-                "mime": mime,
-                "first_seen": datetime.now(timezone.utc).isoformat(),
-                "fonds_path": fonds_path,
-            }) + "\n")
+        tmp = obj_dir / f".{sha}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        try:
+            with tmp.open("xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, obj_path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
     # fonds symlink (original-order view); best effort, never fatal
+    link = validate_fonds_path(CFG.archive, fonds_path)
+    link.parent.mkdir(parents=True, exist_ok=True)
     try:
-        link = CFG.archive / "fonds" / fonds_path
-        link.parent.mkdir(parents=True, exist_ok=True)
         if not link.exists():
-            rel = os.path.relpath(obj_path, link.parent)
-            os.symlink(rel, link)
+            os.symlink(os.path.relpath(obj_path, link.parent), link)
     except OSError:
         pass
+
+    seen = datetime.fromtimestamp(obj_path.stat().st_mtime, timezone.utc).isoformat()
+    occurrence = {
+        "sha256": sha,
+        "bytes": len(data),
+        "mime": mime,
+        "first_seen": seen,
+        "occurrence_at": datetime.now(timezone.utc).isoformat(),
+        "fonds_path": fonds_path.replace("\\", "/"),
+        "ingest_job_id": ingest_job_id,
+    }
+    append_manifest_occurrence(CFG.archive, occurrence)
     return sha
 
 
-def archive_file(path: Path, fonds_path: str, mime: str = "application/octet-stream") -> str:
-    return archive_bytes(path.read_bytes(), mime, fonds_path)
+def archive_file(path: Path, fonds_path: str,
+                 mime: str = "application/octet-stream",
+                 ingest_job_id: str | None = None) -> str:
+    return archive_bytes(path.read_bytes(), mime, fonds_path,
+                         ingest_job_id=ingest_job_id)
 
 
 def read_blob(sha: str) -> bytes:

@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+from memoryd import core
 from memoryd.hook import capture
 from memoryd.ingest import _classify_all
 from memoryd.spool import enqueue_capture, ensure_layout, validate_blob
@@ -102,10 +103,43 @@ def test_mixed_transcript_line_preserves_text_and_tools() -> None:
         "user_message", "tool_result"]
 
 
+def test_fonds_paths_cannot_escape_archive() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "archive"
+        for unsafe in ("../escape", "/absolute/path", r"C:\escape", r"a\..\escape"):
+            try:
+                core.validate_fonds_path(root, unsafe)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"unsafe path accepted: {unsafe}")
+        safe = core.validate_fonds_path(root, "claude-code/2026/07/session.jsonl")
+        assert safe.is_relative_to((root / "fonds").resolve())
+
+
+def test_archive_records_each_occurrence() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td)
+        try:
+            core.CFG.ensure_dirs()
+            sha1 = core.archive_bytes(b"same", "text/plain", "a/one.txt", ingest_job_id="j1")
+            sha2 = core.archive_bytes(b"same", "text/plain", "b/two.txt", ingest_job_id="j2")
+            assert sha1 == sha2
+            entries = [json.loads(line) for line in
+                       (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
+            assert [entry["fonds_path"] for entry in entries] == ["a/one.txt", "b/two.txt"]
+            assert [entry["ingest_job_id"] for entry in entries] == ["j1", "j2"]
+        finally:
+            core.CFG.home = old_home
+
+
 if __name__ == "__main__":
     test_snapshot_survives_original_deletion()
     test_identical_snapshots_share_one_blob()
     test_hook_spools_bytes_when_daemon_is_down()
     test_hook_warns_when_delivery_and_spooling_fail()
     test_mixed_transcript_line_preserves_text_and_tools()
-    print("5 passed, 0 failed")
+    test_fonds_paths_cannot_escape_archive()
+    test_archive_records_each_occurrence()
+    print("7 passed, 0 failed")
