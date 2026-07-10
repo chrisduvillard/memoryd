@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .core import append_manifest_occurrence, validate_fonds_path
+from .ingest import capture_fonds_path
 from .spool import (
     BUFFER_BYTES,
     DEAD_LETTER_REASON_FIELDS,
@@ -729,7 +730,7 @@ def _spool_identity_collisions(
         sha, _size, created, session_id, job_id = evidence
         if job_id is None:
             continue
-        fonds = f"claude-code/{created:%Y/%m/%d}/{session_id}.jsonl"
+        fonds = capture_fonds_path(session_id, created)
         identities.setdefault(job_id, set()).add((sha, fonds))
     return {
         job_id: values for job_id, values in identities.items()
@@ -815,6 +816,25 @@ def _open_identity_matches(handle: object, path: Path,
             _canonical_identity_matches(path, verified))
 
 
+def _manifest_contains_occurrence(
+        manifest: Path, job_id: str | None, pair: tuple[str, str],
+        fallback: tuple[str, str, str]) -> bool:
+    identities = _manifest_identities(manifest)
+    if identities is None:
+        raise ValueError("manifest cannot be read safely under append lock")
+    job_identities, fallbacks, _legacy_pairs = identities
+    if job_id is None:
+        return bool(fallbacks[fallback])
+    existing = job_identities.get(job_id)
+    if existing is None:
+        return False
+    if existing == {pair}:
+        return True
+    raise ValueError(
+        f"occurrence identity collision: {job_id}: "
+        f"existing={sorted(existing)!r}, candidate={pair!r}")
+
+
 def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
     topology = [
         *_spool_topology(spool_root, repair=True),
@@ -854,7 +874,7 @@ def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
         if evidence is None:
             continue
         sha, expected_bytes, created, session_id, job_id = evidence
-        fonds = f"claude-code/{created:%Y/%m/%d}/{session_id}.jsonl"
+        fonds = capture_fonds_path(session_id, created)
         try:
             validate_fonds_path(archive_root, fonds)
         except (OSError, ValueError):
@@ -913,18 +933,22 @@ def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
                     "archive_object_untrusted", "error", str(obj),
                     "canonical object changed before manifest append"))
                 continue
-            append_manifest_occurrence(
+            appended = append_manifest_occurrence(
                 archive_root, occurrence,
                 pre_append=lambda: _open_identity_matches(
                     obj_handle, obj, obj_stat),
                 post_append=lambda: _open_identity_matches(
-                    obj_handle, obj, obj_stat))
+                    obj_handle, obj, obj_stat),
+                skip_if=lambda: _manifest_contains_occurrence(
+                    manifest, job_id, pair, fallback))
         except (OSError, ValueError) as exc:
             actions.append(Finding(
                 "archive_repair_failed", "error", str(manifest), str(exc)))
             continue
         finally:
             obj_handle.close()
+        if not appended:
+            continue
         if job_id is not None:
             job_identities[job_id] = {pair}
         actions.append(Finding(

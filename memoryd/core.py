@@ -228,6 +228,24 @@ def _manifest_file_lock(manifest: Path):
             os.close(fd)
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _verify_archive_object(obj_path: Path, sha: str,
                            expected_bytes: int) -> os.stat_result:
     path_stat = obj_path.stat(follow_symlinks=False)
@@ -287,6 +305,10 @@ def _create_fonds_link(archive_root: Path, obj_path: Path,
         except FileNotFoundError:
             os.symlink(os.path.relpath(obj_path, link.parent), parts[-1],
                        dir_fd=current)
+            try:
+                os.fsync(current)
+            except OSError:
+                pass
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
@@ -295,10 +317,13 @@ def _create_fonds_link(archive_root: Path, obj_path: Path,
 def append_manifest_occurrence(
         archive_root: Path, occurrence: dict,
         *, pre_append: Callable[[], bool] | None = None,
-        post_append: Callable[[], bool] | None = None) -> None:
+        post_append: Callable[[], bool] | None = None,
+        skip_if: Callable[[], bool] | None = None) -> bool:
     manifest = archive_root / "manifest.jsonl"
     line = (json.dumps(occurrence, sort_keys=True, default=str) + "\n").encode()
     with _manifest_file_lock(manifest):
+        if skip_if is not None and skip_if():
+            return False
         if pre_append is not None and not pre_append():
             raise ValueError("manifest append precondition failed")
         with manifest.open("a+b") as handle:
@@ -325,6 +350,8 @@ def append_manifest_occurrence(
                 handle.flush()
                 os.fsync(handle.fileno())
                 raise ValueError("manifest append postcondition failed")
+        _fsync_directory(manifest.parent)
+    return True
 
 
 def archive_bytes(data: bytes, mime: str, fonds_path: str,
@@ -359,6 +386,7 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
             tmp.unlink(missing_ok=True)
 
     obj_stat = _verify_archive_object(obj_path, sha, len(data))
+    _fsync_directory(obj_dir)
 
     # fonds symlink (original-order view); best effort, never fatal
     trusted_archive_root = CFG.archive.resolve()

@@ -13,7 +13,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .core import CFG, append_event, archive_file, pool
+from .core import CFG, append_event, archive_bytes, pool
 
 
 def _parse_ts(entry: dict) -> datetime:
@@ -35,18 +35,23 @@ def _block_text(block: dict) -> str:
     return str(value or "")
 
 
-def _classify_all(entry: dict) -> list[tuple[str, dict]]:
+def _classify_all(entry: object) -> list[tuple[str, dict]]:
+    if not isinstance(entry, dict):
+        return []
     etype = entry.get("type")
-    content = (entry.get("message") or {}).get("content")
+    if etype not in ("user", "assistant"):
+        return []
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
     if not isinstance(content, list):
-        text = str(content or "")[:4000]
-        if not text:
+        if not isinstance(content, str) or not content:
             return []
+        text = content[:4000]
         if etype == "user":
             return [("user_message", {"text": text})]
-        if etype == "assistant":
-            return [("agent_response", {"text": text})]
-        return []
+        return [("agent_response", {"text": text})]
 
     events: list[tuple[str, dict]] = []
     for block in content:
@@ -61,9 +66,15 @@ def _classify_all(entry: dict) -> list[tuple[str, dict]]:
             if text:
                 events.append((kind, {"text": text}))
         elif etype == "assistant" and block.get("type") == "tool_use":
+            tool_input = block.get("input")
+            tool_name = block.get("name")
+            if (not isinstance(tool_input, dict) or
+                    not isinstance(tool_name, str) or not tool_name or
+                    any(not isinstance(key, str) for key in tool_input)):
+                continue
             events.append(("tool_call", {"tools": [{
-                "name": block.get("name"),
-                "input_keys": sorted((block.get("input") or {}).keys()),
+                "name": tool_name,
+                "input_keys": sorted(tool_input),
             }]}))
         elif etype == "user" and block.get("type") == "tool_result":
             events.append(("tool_result", {"summary": _block_text(block)[:2000]}))
@@ -74,29 +85,55 @@ def _text_of(content: list) -> str:
     parts = []
     for b in content:
         if isinstance(b, dict) and b.get("type") == "text":
-            parts.append(b.get("text", ""))
+            text = b.get("text", "")
+            if isinstance(text, str):
+                parts.append(text)
         elif isinstance(b, str):
             parts.append(b)
     return "\n".join(parts)
 
 
+def capture_fonds_path(
+        session_id: str, captured_at: datetime | str | None = None) -> str:
+    if captured_at is None:
+        captured = datetime.now(timezone.utc)
+    elif isinstance(captured_at, datetime):
+        captured = captured_at
+    elif isinstance(captured_at, str):
+        captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+    else:
+        raise ValueError("captured_at must be a datetime, string, or null")
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=timezone.utc)
+    captured = captured.astimezone(timezone.utc)
+    return f"claude-code/{captured:%Y/%m/%d}/{session_id}.jsonl"
+
+
 def ingest_transcript(transcript_path: str, session_id: str, project: str | None,
                       trigger: str, *, ingest_job_id: str | None = None,
-                      source_adapter: str = "claude-code") -> dict:
+                      source_adapter: str = "claude-code",
+                      captured_at: datetime | str | None = None,
+                      transcript_bytes: bytes | None = None) -> dict:
     """Archive the transcript file and append ledger events for new lines."""
     path = Path(transcript_path).expanduser()
-    if not path.exists():
-        return {"ok": False, "error": f"transcript not found: {path}"}
+    if transcript_bytes is None:
+        try:
+            transcript_bytes = path.read_bytes()
+        except OSError:
+            return {"ok": False, "error": f"transcript not found: {path}"}
+    elif not isinstance(transcript_bytes, bytes):
+        raise ValueError("transcript_bytes must be bytes")
 
-    day = datetime.now(timezone.utc)
-    fonds = f"claude-code/{day:%Y/%m/%d}/{session_id}.jsonl"
-    sha = archive_file(path, fonds, mime="application/x-jsonl",
-                       ingest_job_id=ingest_job_id)
+    fonds = capture_fonds_path(session_id, captured_at)
+    sha = archive_bytes(
+        transcript_bytes, "application/x-jsonl", fonds,
+        ingest_job_id=ingest_job_id)
 
     new_events = 0
     with pool().connection() as conn:
         for line_no, raw_line in enumerate(
-                path.read_text(encoding="utf-8", errors="replace").splitlines()):
+                transcript_bytes.decode(
+                    encoding="utf-8", errors="replace").splitlines()):
             line = raw_line.strip()
             if not line:
                 continue
@@ -104,11 +141,16 @@ def ingest_transcript(transcript_path: str, session_id: str, project: str | None
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            classified = _classify_all(entry)
+            if not classified:
+                continue
+            if not isinstance(entry, dict):
+                continue
             native = entry.get("uuid")
             base_id = (f"uuid:{native}" if native else
                        f"line:{line_no}:{hashlib.sha256(raw_line.encode()).hexdigest()}")
             ts = _parse_ts(entry)
-            for ordinal, (kind, payload) in enumerate(_classify_all(entry)):
+            for ordinal, (kind, payload) in enumerate(classified):
                 event_id = f"{base_id}:{ordinal}:{kind}"
                 inserted = append_event(
                     conn, kind=kind, session_id=session_id, ts=ts,
@@ -141,7 +183,7 @@ def drain_spool() -> dict[str, int]:
     from .spool import (
         PermanentSpoolError, claim_next, complete_job, dead_letter,
         gc_blob_if_unreferenced, load_job, release_job, requeue_stale,
-        upgrade_legacy_job, validate_blob,
+        read_validated_blob, upgrade_legacy_job,
     )
     stats = {"processed": 0, "retried": 0, "dead_lettered": 0, "requeued": 0}
     stats["requeued"] = requeue_stale(CFG.spool)
@@ -188,10 +230,13 @@ def drain_spool() -> dict[str, int]:
                 complete_job(job_path)
                 stats["processed"] += 1
                 continue
-            blob = validate_blob(CFG.spool, job)
+            blob = read_validated_blob(CFG.spool, job)
+            blob_path = CFG.spool / "blobs" / job["blob_sha256"]
             result = ingest_transcript(
-                str(blob), job["session_id"], job.get("project"), job["trigger"],
-                ingest_job_id=job["job_id"], source_adapter="claude-code")
+                str(blob_path), job["session_id"], job.get("project"),
+                job["trigger"], ingest_job_id=job["job_id"],
+                source_adapter="claude-code", captured_at=job["created_at"],
+                transcript_bytes=blob)
             if not result.get("ok"):
                 raise RuntimeError(
                     result.get("error", "capture ingestion failed"))

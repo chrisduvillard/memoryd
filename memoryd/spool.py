@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -127,6 +128,92 @@ def _copy_and_hash(src: BinaryIO, dst: BinaryIO) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _redirected(path: Path, path_stat: os.stat_result) -> bool:
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None:
+        try:
+            if is_junction():
+                return True
+        except OSError:
+            return True
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(path_stat, "st_file_attributes", 0) & reparse)
+
+
+def _same_regular_identity(
+        left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(left.st_mode) and stat.S_ISREG(right.st_mode) and
+        (left.st_dev, left.st_ino, left.st_size, left.st_mtime_ns) ==
+        (right.st_dev, right.st_ino, right.st_size, right.st_mtime_ns)
+    )
+
+
+def _require_plain_directory(path: Path) -> None:
+    try:
+        path_stat = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise PermanentSpoolError(
+            f"untrusted spool directory: {path}: {exc}") from exc
+    if (_redirected(path, path_stat) or
+            not stat.S_ISDIR(path_stat.st_mode)):
+        raise PermanentSpoolError(f"untrusted spool directory: {path}")
+
+
+def _read_verified_file(path: Path, sha: str,
+                        expected_bytes: int | None) -> bytes:
+    try:
+        before = path.stat(follow_symlinks=False)
+        if (_redirected(path, before) or
+                not stat.S_ISREG(before.st_mode)):
+            raise PermanentSpoolError(f"redirected or non-regular file: {path}")
+        if expected_bytes is not None and before.st_size != expected_bytes:
+            raise PermanentSpoolError(f"file size mismatch: {path}")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not _same_regular_identity(before, opened):
+                raise PermanentSpoolError(f"file changed before open: {path}")
+            data = handle.read()
+            opened_after = os.fstat(handle.fileno())
+            if not _same_regular_identity(opened, opened_after):
+                raise PermanentSpoolError(f"file changed while reading: {path}")
+        after = path.stat(follow_symlinks=False)
+        if (_redirected(path, after) or
+                not _same_regular_identity(opened_after, after)):
+            raise PermanentSpoolError(f"file path changed while reading: {path}")
+    except PermanentSpoolError:
+        raise
+    except OSError as exc:
+        raise PermanentSpoolError(f"unreadable file: {path}: {exc}") from exc
+    if hashlib.sha256(data).hexdigest() != sha:
+        raise PermanentSpoolError(f"file checksum mismatch: {path}")
+    return data
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _atomic_json(path: Path, value: dict) -> None:
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     try:
@@ -135,6 +222,7 @@ def _atomic_json(path: Path, value: dict) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        _fsync_directory(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -207,6 +295,7 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
         raise PermanentSpoolError(f"transcript not found: {source}")
     job_id = _job_id()
     tmp_blob = paths["blobs"] / f".{job_id}.tmp"
+    remove_tmp = True
     try:
         with source.open("rb") as src, tmp_blob.open("xb") as dst:
             sha, size = _copy_and_hash(src, dst)
@@ -214,16 +303,31 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
             os.fsync(dst.fileno())
         with _state_lock(spool_root):
             blob = paths["blobs"] / sha
-            if blob.exists():
-                tmp_blob.unlink(missing_ok=True)
-            else:
+            try:
+                os.link(tmp_blob, blob)
+            except OSError as exc:
+                if exc.errno not in (errno.EEXIST, errno.EACCES, errno.EPERM):
+                    raise
                 try:
-                    os.replace(tmp_blob, blob)
-                except OSError:
-                    if blob.exists():
-                        tmp_blob.unlink(missing_ok=True)
-                    else:
-                        raise
+                    _read_verified_file(blob, sha, size)
+                except PermanentSpoolError as collision:
+                    evidence = (paths["blobs"] /
+                                f".collision.{sha}.{job_id}")
+                    preserved_at = tmp_blob
+                    try:
+                        os.replace(tmp_blob, evidence)
+                        _fsync_directory(paths["blobs"])
+                        preserved_at = evidence
+                    except OSError:
+                        # The fsynced temporary file remains durable evidence.
+                        remove_tmp = False
+                    raise PermanentSpoolError(
+                        f"invalid spool blob collision for {sha}; "
+                        f"capture bytes preserved at {preserved_at}") from collision
+                _fsync_directory(paths["blobs"])
+            else:
+                _fsync_directory(paths["blobs"])
+            _read_verified_file(blob, sha, size)
             job = {
                 "schema_version": SCHEMA_VERSION,
                 "job_id": job_id,
@@ -243,7 +347,8 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
             _atomic_json(paths["incoming"] / f"{job_id}.json", job)
         return job
     finally:
-        tmp_blob.unlink(missing_ok=True)
+        if remove_tmp:
+            tmp_blob.unlink(missing_ok=True)
 
 
 def enqueue_extraction(*, spool_root: Path, session_id: str) -> dict:
@@ -275,22 +380,22 @@ def load_job(path: Path) -> dict:
 
 
 def validate_blob(spool_root: Path, job: dict) -> Path:
+    read_validated_blob(spool_root, job)
+    return spool_root / "blobs" / job["blob_sha256"]
+
+
+def read_validated_blob(spool_root: Path, job: dict) -> bytes:
     job = validate_job(job)
     if job["kind"] != "capture_snapshot":
         raise PermanentSpoolError("invalid kind: blob validation requires capture")
     sha = job["blob_sha256"]
-    blob = ensure_layout(spool_root)["blobs"] / sha
-    if not blob.is_file():
-        raise PermanentSpoolError(f"missing spool blob: {sha}")
-    if blob.stat().st_size != job["blob_bytes"]:
-        raise PermanentSpoolError(f"spool blob size mismatch: {sha}")
-    digest = hashlib.sha256()
-    with blob.open("rb") as handle:
-        while chunk := handle.read(BUFFER_BYTES):
-            digest.update(chunk)
-    if digest.hexdigest() != sha:
-        raise PermanentSpoolError(f"spool blob checksum mismatch: {sha}")
-    return blob
+    _require_plain_directory(spool_root)
+    blob_root = spool_root / "blobs"
+    _require_plain_directory(blob_root)
+    try:
+        return _read_verified_file(blob_root / sha, sha, job["blob_bytes"])
+    except PermanentSpoolError as exc:
+        raise PermanentSpoolError(f"invalid spool blob {sha}: {exc}") from exc
 
 
 def _scheduled(job: object) -> bool:
@@ -468,21 +573,24 @@ def _candidate_blob_sha(value: object) -> str | None:
 
 def gc_blob_if_unreferenced(spool_root: Path, sha: str,
                             canonical_object: Path) -> bool:
-    if not canonical_object.is_file():
-        return False
-    digest = hashlib.sha256()
+    expected_layout = [
+        spool_root,
+        *(spool_root / name for name in
+          ("blobs", "incoming", "processing", "dead-letter")),
+    ]
     try:
-        with canonical_object.open("rb") as handle:
-            while chunk := handle.read(BUFFER_BYTES):
-                digest.update(chunk)
-    except OSError:
-        return False
-    if digest.hexdigest() != sha:
+        _require_plain_directory(canonical_object.parent)
+        _read_verified_file(canonical_object, sha, None)
+        for directory in expected_layout:
+            _require_plain_directory(directory)
+    except PermanentSpoolError:
         return False
 
     try:
         with _state_lock(spool_root):
             paths = ensure_layout(spool_root)
+            for directory in (spool_root, *paths.values()):
+                _require_plain_directory(directory)
             manifests = [*spool_root.glob("*.json")]
             for state in ("incoming", "processing", "dead-letter"):
                 manifests.extend(paths[state].glob("*.json"))
@@ -497,7 +605,22 @@ def gc_blob_if_unreferenced(spool_root: Path, sha: str,
                 except (OSError, ValueError, PermanentSpoolError):
                     return False
             blob = paths["blobs"] / sha
-            blob.unlink(missing_ok=True)
+            _require_plain_directory(paths["blobs"])
+            try:
+                _read_verified_file(blob, sha, None)
+            except PermanentSpoolError:
+                return False
+            try:
+                _require_plain_directory(canonical_object.parent)
+                _read_verified_file(canonical_object, sha, None)
+            except PermanentSpoolError:
+                return False
+            before_delete = blob.stat(follow_symlinks=False)
+            if (_redirected(blob, before_delete) or
+                    not stat.S_ISREG(before_delete.st_mode)):
+                return False
+            blob.unlink()
+            _fsync_directory(paths["blobs"])
             return True
-    except OSError:
+    except (OSError, PermanentSpoolError):
         return False

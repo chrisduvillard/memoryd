@@ -108,6 +108,11 @@ Schema-v2 jobs share `schema_version`, `job_id`, `kind`, `created_at`,
 `blob_sha256`, `blob_bytes`, and optional `project`. An `extraction` job needs
 only the shared fields. Every accepted capture gets a distinct job. Several
 jobs and repeated attempts can still deduplicate to the same blob bytes.
+Blob and manifest publication also syncs the containing directory where the
+platform permits it. A process discards a duplicate temporary blob only after
+the incumbent is a regular file with the expected size and digest. If that
+check fails, memoryd preserves the known-good bytes separately and refuses the
+capture instead of acknowledging untrusted evidence.
 
 Claims move jobs from `incoming/` to `processing/` under `state.lock` and touch
 the manifest mtime. A worker requeues a processing lease older than 15 minutes.
@@ -129,6 +134,9 @@ number with the raw-line SHA-256. It then appends the block ordinal and event
 kind. Replaying the same transcript therefore does not duplicate ledger rows.
 A mixed content line emits each supported text, tool-call, and tool-result
 block in order instead of dropping all but one block.
+Malformed or unsupported JSON values stay in the raw archive but emit no
+ledger event. Spool replay reads and verifies the blob through one file
+descriptor, then passes those exact bytes to archival and classification.
 
 The archive stores verified objects at
 `archive/objects/sha256/<first-2>/<next-2>/<sha256>`. Before use, memoryd checks
@@ -139,6 +147,9 @@ can append another occurrence with the same job ID even when the object bytes
 already exist. The `archive/fonds/` view is a platform-safe, best-effort
 symlink view. Unsupported platforms or a link failure do not invalidate the
 verified object or occurrence manifest.
+Capture fonds dates come from the job's UTC `created_at`, so a retry after
+midnight retains the same path. Repair derives the path from the same field and
+rechecks occurrence identity while holding the manifest append lock.
 
 ### Status and operator action
 

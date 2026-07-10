@@ -39,11 +39,11 @@ spool/
   dead-letter/    preserved jobs that cannot be processed
 ```
 
-The hook first attempts the existing `/capture` request. On failure, it streams the transcript into a temporary file under `blobs/`, calculates SHA-256, flushes the file, and atomically renames it to `blobs/<sha256>`. An existing blob with the same checksum wins; the hook discards only its temporary duplicate.
+The hook first attempts the existing `/capture` request. On failure, it streams the transcript into a temporary file under `blobs/`, calculates SHA-256, flushes the file, and publishes it without overwriting `blobs/<sha256>`. It syncs the containing directory where the platform permits it. An existing regular file wins only after its size and digest match. If the incumbent is corrupt, redirected, or not a regular file, memoryd preserves the known-good temporary bytes and refuses to acknowledge the capture.
 
 After the blob is durable, the hook writes a versioned job manifest to a temporary file under `incoming/` and atomically renames it to `<job_id>.json`. A visible warning reports failure if the hook can neither reach the daemon nor persist the bundle.
 
-The daemon claims a job by atomically moving its manifest from `incoming/` to `processing/`. It validates the manifest and blob, ingests the transcript, archives it canonically, and removes the processing manifest only after the database commit succeeds. Blob garbage collection may remove a spool blob only when no incoming, processing, or dead-letter job references it and the canonical archive contains the same checksum.
+The daemon claims a job by atomically moving its manifest from `incoming/` to `processing/`. It opens and validates the blob without following redirects, then passes the exact verified bytes to archival and classification. It removes the processing manifest only after the database commit succeeds. Blob garbage collection may remove a spool blob only when no incoming, processing, or dead-letter job references it and immediate locked rechecks confirm both the spool blob and canonical archive object.
 
 ## Job Manifest
 
@@ -112,6 +112,9 @@ Replace the one-result classifier with a classifier that returns a list of event
 - their order within the source line.
 
 Unknown transcript shapes remain in the raw snapshot even when the ledger classifier cannot interpret them.
+Malformed top-level values, messages, content blocks, and tool inputs emit no
+ledger event. They complete as raw-only captures instead of entering a
+transient retry loop.
 
 ## Archive Safety
 
@@ -123,9 +126,11 @@ All archive fonds paths pass through one validator before filesystem access. The
 - `.` and `..` components; and
 - any resolved path outside `archive/fonds`.
 
-Archive object writes use unique temporary names, file flush, `fsync` where the platform supports it, and atomic rename. Concurrent writers of identical bytes converge on the same checksum object.
+Archive object writes use unique temporary names, file flush, `fsync` where the platform supports it, and no-overwrite publication. Concurrent writers of identical bytes converge on the same checksum object. Namespace publication syncs the containing directory where supported.
 
 The manifest records each archival occurrence. Object content remains deduplicated, but repeated captures retain separate provenance records. Each record includes checksum, byte count, MIME type, first-seen time for the object, occurrence time, fonds path, and ingest job ID when available.
+
+Capture fonds paths use the capture job's UTC `created_at`, not processing time. Retries therefore retain one stable path across midnight. Repair derives the same path and rechecks exact occurrence identity while holding the manifest append lock.
 
 ## Failure Handling
 

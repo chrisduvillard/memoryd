@@ -383,6 +383,125 @@ def test_identical_snapshots_share_one_blob() -> None:
         assert len(list((root / "incoming").glob("*.json"))) == 4
 
 
+def test_snapshot_rejects_invalid_blob_collision_without_losing_bytes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        source = Path(td) / "session.jsonl"
+        expected = b'durable collision evidence\n'
+        source.write_bytes(expected)
+        sha = hashlib.sha256(expected).hexdigest()
+        paths = ensure_layout(root)
+        incumbent = paths["blobs"] / sha
+
+        for corrupt in (b"X" * len(expected), None):
+            if os.path.lexists(incumbent):
+                if incumbent.is_dir():
+                    incumbent.rmdir()
+                else:
+                    incumbent.unlink()
+            if corrupt is None:
+                incumbent.mkdir()
+            else:
+                incumbent.write_bytes(corrupt)
+
+            before_manifests = set(paths["incoming"].glob("*.json"))
+            try:
+                enqueue_capture(
+                    spool_root=root, transcript_path=source,
+                    session_id="collision", project=None, trigger="stop")
+            except spool.PermanentSpoolError as exc:
+                assert "collision" in str(exc)
+            else:
+                raise AssertionError("invalid blob collision was acknowledged")
+
+            assert set(paths["incoming"].glob("*.json")) == before_manifests
+            evidence = list(paths["blobs"].glob(f".collision.{sha}.*"))
+            assert evidence
+            assert evidence[-1].read_bytes() == expected
+
+        incumbent.rmdir()
+        outside = Path(td) / "outside-collision"
+        outside.write_bytes(b"outside")
+        try:
+            os.symlink(outside, incumbent)
+        except OSError:
+            symlink_supported = False
+        else:
+            symlink_supported = True
+            try:
+                enqueue_capture(
+                    spool_root=root, transcript_path=source,
+                    session_id="redirected-collision", project=None,
+                    trigger="stop")
+            except spool.PermanentSpoolError:
+                pass
+            else:
+                raise AssertionError("redirected blob collision was acknowledged")
+            assert outside.read_bytes() == b"outside"
+            incumbent.unlink()
+        if not symlink_supported:
+            assert not os.path.lexists(incumbent)
+
+        incumbent.mkdir()
+        with patch.object(spool.os, "replace", side_effect=OSError("denied")):
+            try:
+                enqueue_capture(
+                    spool_root=root, transcript_path=source,
+                    session_id="preserve-temp", project=None, trigger="stop")
+            except spool.PermanentSpoolError:
+                pass
+            else:
+                raise AssertionError("unpreserved collision was acknowledged")
+        retained_temps = list(paths["blobs"].glob(".job_*.tmp"))
+        assert retained_temps
+        assert retained_temps[-1].read_bytes() == expected
+
+
+def test_publication_fsyncs_blob_json_and_archive_namespaces() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        source = Path(td) / "session.jsonl"
+        source.write_text("fsync me", encoding="utf-8")
+        spool_fsyncs: list[Path] = []
+        with patch.object(
+                spool, "_fsync_directory",
+                side_effect=lambda path: spool_fsyncs.append(Path(path))):
+            enqueue_capture(
+                spool_root=root, transcript_path=source,
+                session_id="fsync", project=None, trigger="stop")
+            spool_fsyncs.clear()
+            enqueue_capture(
+                spool_root=root, transcript_path=source,
+                session_id="fsync-winner", project=None, trigger="stop")
+        assert root / "blobs" in spool_fsyncs
+        assert root / "incoming" in spool_fsyncs
+
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        archive_fsyncs: list[Path] = []
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_fsync_directory",
+                    side_effect=lambda path: archive_fsyncs.append(Path(path))):
+                sha = core.archive_bytes(
+                    b"archive fsync", "text/plain", "safe/fsync.txt")
+                archive_fsyncs.clear()
+                core.archive_bytes(
+                    b"archive fsync", "text/plain", "safe/fsync-retry.txt")
+            obj_dir = (core.CFG.archive / "objects" / "sha256" /
+                       sha[:2] / sha[2:4])
+            assert obj_dir in archive_fsyncs
+            assert core.CFG.archive in archive_fsyncs
+        finally:
+            core.CFG.home = old_home
+
+        with patch.object(spool.os, "open", side_effect=OSError("unsupported")):
+            spool._fsync_directory(root)
+        with patch.object(core.os, "open", side_effect=OSError("unsupported")):
+            core._fsync_directory(Path(td) / "memory")
+
+
 def test_hook_spools_bytes_when_daemon_is_down() -> None:
     with tempfile.TemporaryDirectory() as td:
         home = Path(td) / "memory"
@@ -399,12 +518,15 @@ def test_hook_spools_bytes_when_daemon_is_down() -> None:
 
 
 def test_hook_warns_when_delivery_and_spooling_fail() -> None:
-    stderr = io.StringIO()
-    stdin = {"transcript_path": "missing.jsonl", "session_id": "s1", "cwd": ""}
-    with patch("memoryd.hook._post", side_effect=OSError("down")), \
-         contextlib.redirect_stderr(stderr):
-        capture(stdin, "stop", 7437, Path("unused"))
-    assert "capture not durably saved" in stderr.getvalue()
+    with tempfile.TemporaryDirectory() as td:
+        stderr = io.StringIO()
+        stdin = {
+            "transcript_path": str(Path(td) / "missing.jsonl"),
+            "session_id": "s1", "cwd": ""}
+        with patch("memoryd.hook._post", side_effect=OSError("down")), \
+             contextlib.redirect_stderr(stderr):
+            capture(stdin, "stop", 7437, Path(td) / "memory")
+        assert "capture not durably saved" in stderr.getvalue()
 
 
 def test_capture_persists_snapshot_before_acknowledgement() -> None:
@@ -1222,6 +1344,232 @@ def test_mixed_transcript_line_preserves_text_and_tools() -> None:
         "agent_response", "tool_call"]
     assert [kind for kind, _ in _classify_all(user)] == [
         "user_message", "tool_result"]
+
+
+def test_malformed_transcript_shapes_archive_without_retryable_errors() -> None:
+    malformed = (
+        [],
+        "scalar",
+        {"type": "assistant", "message": "not-an-object"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "shell", "input": ["bad"]},
+        ]}},
+        {"type": "unknown", "message": {"content": ["raw evidence"]}},
+    )
+    for entry in malformed:
+        assert _classify_all(entry) == []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def commit(self) -> None:
+            pass
+
+    class Pool:
+        def connection(self) -> Connection:
+            return Connection()
+
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        transcript = Path(td) / "malformed.jsonl"
+        raw = "\n".join(json.dumps(value) for value in malformed) + "\n"
+        transcript.write_text(raw, encoding="utf-8")
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(ingest, "pool", return_value=Pool()), \
+                 patch.object(ingest, "append_event",
+                              side_effect=AssertionError("unexpected event")):
+                result = ingest.ingest_transcript(
+                    str(transcript), "malformed", None, "stop",
+                    ingest_job_id="malformed-job",
+                    captured_at="2026-07-10T23:59:59+00:00")
+            assert result["ok"] is True
+            assert result["new_events"] == 0
+            assert core.read_blob(result["sha256"]) == transcript.read_bytes()
+            entry = json.loads(
+                (core.CFG.archive / "manifest.jsonl").read_text().splitlines()[0])
+            assert entry["fonds_path"] == (
+                "claude-code/2026/07/10/malformed.jsonl")
+        finally:
+            core.CFG.home = old_home
+
+
+def test_capture_fonds_date_is_stable_across_midnight_retries() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        transcript = Path(td) / "session.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        archived_fonds: list[str] = []
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def commit(self) -> None:
+                pass
+
+        class Pool:
+            def connection(self) -> Connection:
+                return Connection()
+
+        def archive(data: bytes, _mime: str, fonds: str, **_kwargs) -> str:
+            assert data == b""
+            archived_fonds.append(fonds)
+            return hashlib.sha256(b"").hexdigest()
+
+        created_at = "2026-07-10T23:59:59+00:00"
+        with patch.object(ingest, "archive_bytes", side_effect=archive), \
+             patch.object(ingest, "pool", return_value=Pool()):
+            for _attempt in range(2):
+                result = ingest.ingest_transcript(
+                    str(transcript), "midnight", None, "stop",
+                    ingest_job_id="shared-retry-job", captured_at=created_at)
+                assert result["ok"] is True
+        assert archived_fonds == [
+            "claude-code/2026/07/10/midnight.jsonl",
+            "claude-code/2026/07/10/midnight.jsonl",
+        ]
+
+
+def test_validated_blob_bytes_survive_path_swap_and_gc_rechecks_blob() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        transcript = Path(td) / "session.jsonl"
+        expected = b'{"type":"user","message":{"content":"safe"}}\n'
+        transcript.write_bytes(expected)
+        job = enqueue_capture(
+            spool_root=root, transcript_path=transcript,
+            session_id="swap", project=None, trigger="stop")
+        blob = root / "blobs" / job["blob_sha256"]
+        assert spool.read_validated_blob(root, job) == expected
+
+        outside = Path(td) / "outside.bin"
+        redirected = b"redirected bytes"
+        outside.write_bytes(redirected)
+        link_sha = hashlib.sha256(redirected).hexdigest()
+        link = root / "blobs" / link_sha
+        try:
+            os.symlink(outside, link)
+        except OSError:
+            link_supported = False
+        else:
+            link_supported = True
+            linked_job = {
+                **job, "blob_sha256": link_sha,
+                "blob_bytes": len(redirected)}
+            try:
+                spool.read_validated_blob(root, linked_job)
+            except spool.PermanentSpoolError:
+                pass
+            else:
+                raise AssertionError("redirected spool blob accepted")
+
+            canonical = Path(td) / "canonical"
+            canonical.write_bytes(redirected)
+            assert not spool.gc_blob_if_unreferenced(root, link_sha, canonical)
+            assert outside.read_bytes() == redirected
+        if not link_supported:
+            assert not os.path.lexists(link)
+
+        redirected_outside = Path(td) / "redirected-spool-outside"
+        redirected_outside.mkdir()
+        redirected_root = Path(td) / "redirected-spool"
+        _create_directory_link(redirected_outside, redirected_root)
+        outside_before = set(redirected_outside.iterdir())
+        try:
+            spool.read_validated_blob(redirected_root, job)
+        except spool.PermanentSpoolError:
+            pass
+        else:
+            raise AssertionError("redirected spool root accepted")
+        assert set(redirected_outside.iterdir()) == outside_before
+        redirected_canonical = Path(td) / "redirected-canonical"
+        redirected_canonical.write_bytes(expected)
+        assert not spool.gc_blob_if_unreferenced(
+            redirected_root, job["blob_sha256"], redirected_canonical)
+        assert set(redirected_outside.iterdir()) == outside_before
+
+        gc_root = Path(td) / "gc-spool"
+        gc_source = Path(td) / "gc-source.jsonl"
+        gc_source.write_bytes(expected)
+        gc_job = enqueue_capture(
+            spool_root=gc_root, transcript_path=gc_source,
+            session_id="gc-swap", project=None, trigger="stop")
+        next((gc_root / "incoming").glob("*.json")).unlink()
+        gc_blob = gc_root / "blobs" / gc_job["blob_sha256"]
+        gc_canonical = Path(td) / "gc-canonical"
+        gc_canonical.write_bytes(expected)
+        real_state_lock = spool._state_lock
+
+        @contextlib.contextmanager
+        def swap_canonical_before_gc_delete(lock_root: Path):
+            gc_canonical.write_bytes(b"X" * len(expected))
+            with real_state_lock(lock_root):
+                yield
+
+        with patch.object(
+                spool, "_state_lock",
+                side_effect=swap_canonical_before_gc_delete):
+            assert not spool.gc_blob_if_unreferenced(
+                gc_root, gc_job["blob_sha256"], gc_canonical)
+        assert gc_blob.read_bytes() == expected
+        gc_canonical.write_bytes(expected)
+        redirected_state = Path(td) / "redirected-incoming"
+        redirected_state.mkdir()
+        (gc_root / "incoming").rmdir()
+        _create_directory_link(redirected_state, gc_root / "incoming")
+        assert not spool.gc_blob_if_unreferenced(
+            gc_root, gc_job["blob_sha256"], gc_canonical)
+        assert gc_blob.read_bytes() == expected
+
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            core.CFG.spool.mkdir(parents=True, exist_ok=True)
+            drain_source = Path(td) / "drain.jsonl"
+            drain_source.write_bytes(expected)
+            drain_job = enqueue_capture(
+                spool_root=core.CFG.spool, transcript_path=drain_source,
+                session_id="drain-swap", project=None, trigger="stop")
+            drain_blob = core.CFG.spool / "blobs" / drain_job["blob_sha256"]
+            canonical = (core.CFG.archive / "objects" / "sha256" /
+                         drain_job["blob_sha256"][:2] /
+                         drain_job["blob_sha256"][2:4] /
+                         drain_job["blob_sha256"])
+            canonical.parent.mkdir(parents=True)
+            canonical.write_bytes(expected)
+            real_read = spool.read_validated_blob
+            consumed: list[bytes] = []
+
+            def read_then_swap(spool_root: Path, value: dict) -> bytes:
+                data = real_read(spool_root, value)
+                drain_blob.write_bytes(b"X" * len(data))
+                return data
+
+            def consume(_path: str, _session: str, _project: str | None,
+                        _trigger: str, **kwargs) -> dict:
+                consumed.append(kwargs["transcript_bytes"])
+                return {"ok": True, "sha256": drain_job["blob_sha256"],
+                        "new_events": 0}
+
+            with patch.object(spool, "read_validated_blob",
+                              side_effect=read_then_swap), \
+                 patch.object(ingest, "ingest_transcript", side_effect=consume):
+                stats = ingest.drain_spool()
+            assert stats["processed"] == 1
+            assert consumed == [expected]
+            assert drain_blob.exists()
+            assert drain_blob.read_bytes() != expected
+        finally:
+            core.CFG.home = old_home
 
 
 def test_fonds_paths_cannot_escape_archive() -> None:
@@ -2154,10 +2502,60 @@ def test_doctor_reconstructs_each_supported_occurrence_idempotently() -> None:
         assert _tree_snapshot(redirected_object_home) == redirected_object_before
 
 
+def test_doctor_rechecks_occurrence_identity_under_manifest_lock() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        spool_root = home / "spool"
+        paths = ensure_layout(spool_root)
+        archive_root = home / "archive"
+        data = b"repair race"
+        sha = hashlib.sha256(data).hexdigest()
+        obj = (archive_root / "objects" / "sha256" /
+               sha[:2] / sha[2:4] / sha)
+        obj.parent.mkdir(parents=True)
+        obj.write_bytes(data)
+        job = _doctor_job(
+            "repair-race", kind="capture_snapshot", project="memoryd",
+            trigger="stop", original_transcript_path="C:/repair-race.jsonl",
+            blob_sha256=sha, blob_bytes=len(data), session_id="repair-race")
+        job["created_at"] = "2026-07-10T23:59:59+00:00"
+        (paths["dead-letter"] / "repair-race.json").write_text(
+            json.dumps(job), encoding="utf-8")
+
+        real_append = core.append_manifest_occurrence
+        injected = False
+
+        def append_after_competing_writer(
+                root: Path, occurrence: dict, **kwargs) -> bool:
+            nonlocal injected
+            if not injected:
+                injected = True
+                real_append(root, occurrence)
+            return real_append(root, occurrence, **kwargs)
+
+        with patch.object(
+                doctor, "append_manifest_occurrence",
+                side_effect=append_after_competing_writer):
+            actions = repair_archive(archive_root, spool_root)
+
+        entries = [json.loads(line) for line in
+                   (archive_root / "manifest.jsonl").read_text().splitlines()]
+        exact = [entry for entry in entries
+                 if entry.get("ingest_job_id") == "repair-race"]
+        assert len(exact) == 1
+        assert exact[0]["fonds_path"] == (
+            "claude-code/2026/07/10/repair-race.jsonl")
+        assert not any(
+            action.code == "manifest_occurrence_reconstructed"
+            for action in actions)
+
+
 if __name__ == "__main__":
     test_status_counts_spool_states()
     test_snapshot_survives_original_deletion()
     test_identical_snapshots_share_one_blob()
+    test_snapshot_rejects_invalid_blob_collision_without_losing_bytes()
+    test_publication_fsyncs_blob_json_and_archive_namespaces()
     test_hook_spools_bytes_when_daemon_is_down()
     test_hook_warns_when_delivery_and_spooling_fail()
     test_capture_persists_snapshot_before_acknowledgement()
@@ -2165,9 +2563,13 @@ if __name__ == "__main__":
     test_legacy_missing_source_is_preserved()
     test_stale_processing_job_is_requeued()
     test_mixed_transcript_line_preserves_text_and_tools()
+    test_malformed_transcript_shapes_archive_without_retryable_errors()
+    test_capture_fonds_date_is_stable_across_midnight_retries()
+    test_validated_blob_bytes_survive_path_swap_and_gc_rechecks_blob()
     test_fonds_paths_cannot_escape_archive()
     test_archive_records_each_occurrence()
     test_doctor_inspection_is_read_only_and_reports_defects()
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
-    print("15 passed, 0 failed")
+    test_doctor_rechecks_occurrence_identity_under_manifest_lock()
+    print("21 passed, 0 failed")
