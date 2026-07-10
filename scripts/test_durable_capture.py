@@ -484,6 +484,54 @@ def test_claim_retry_and_dead_letter_preserve_manifest() -> None:
         assert spool.is_dead_letter_sidecar(reason_named_sidecar)
         assert not spool.is_dead_letter_sidecar(reason_named_manifest)
 
+        ambiguous_root = Path(td) / "ambiguous-sidecar-spool"
+        ambiguous_job = enqueue_capture(
+            spool_root=ambiguous_root, transcript_path=gc_source,
+            session_id="ambiguous-evidence", project=None, trigger="stop")
+        next((ambiguous_root / "incoming").glob("*.json")).unlink()
+        ambiguous_dead = ambiguous_root / "dead-letter"
+        named_manifest = ambiguous_dead / "job.json"
+        named_manifest.write_text(json.dumps({
+            "schema_version": 2,
+            "job_id": "named-job",
+            "kind": "extraction",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "session_id": "named-session",
+            "attempts": 0,
+            "last_error": None,
+            "next_attempt_at": None,
+        }), encoding="utf-8")
+        ambiguous_manifest = ambiguous_dead / "job.reason.json"
+        ambiguous_manifest.write_text(json.dumps({
+            **ambiguous_job,
+            "dead_lettered_at": datetime.now(timezone.utc).isoformat(),
+            "reason": "capture evidence, not a sidecar",
+            "manifest": named_manifest.name,
+        }), encoding="utf-8")
+        ordinary_manifest = ambiguous_dead / "ordinary.json"
+        ordinary_manifest.write_text(json.dumps({
+            "schema_version": 2,
+            "job_id": "ordinary-job",
+            "kind": "extraction",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "session_id": "ordinary-session",
+            "attempts": 0,
+            "last_error": None,
+            "next_attempt_at": None,
+        }), encoding="utf-8")
+        ordinary_sidecar = ambiguous_dead / "ordinary.reason.json"
+        ordinary_sidecar.write_text(json.dumps({
+            "dead_lettered_at": datetime.now(timezone.utc).isoformat(),
+            "reason": "ordinary exact sidecar",
+            "manifest": ordinary_manifest.name,
+        }), encoding="utf-8")
+        assert spool.is_dead_letter_sidecar(ordinary_sidecar)
+        assert not spool.is_dead_letter_sidecar(ambiguous_manifest)
+        assert not spool.gc_blob_if_unreferenced(
+            ambiguous_root, ambiguous_job["blob_sha256"], canonical)
+        assert (ambiguous_root / "blobs" /
+                ambiguous_job["blob_sha256"]).exists()
+
         gc_race_root = Path(td) / "gc-race-spool"
         gc_race_source = Path(td) / "gc-race.jsonl"
         gc_race_source.write_text("x", encoding="utf-8")
@@ -928,6 +976,87 @@ def _assert_legacy_path_types_are_preserved() -> None:
             core.CFG.home = old_home
 
 
+def _assert_mixed_role_dispatch_is_unambiguous() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "mixed-role"
+        try:
+            core.CFG.ensure_dirs()
+            incoming = ensure_layout(core.CFG.spool)["incoming"]
+            common = {
+                "schema_version": 2,
+                "job_id": "valid-job",
+                "kind": "capture_snapshot",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "session_id": "must-not-extract",
+                "attempts": 0,
+                "last_error": None,
+                "next_attempt_at": None,
+            }
+            capture = {
+                **common,
+                "project": None,
+                "trigger": "stop",
+                "original_transcript_path": "C:/valid/session.jsonl",
+                "blob_sha256": "0" * 64,
+                "blob_bytes": 1,
+            }
+            extraction = {**common, "kind": "extraction"}
+            schema_cases = (
+                {**capture, "blob_bytes": True, "extract_only": True},
+                {**extraction, "job_id": [], "extract_only": True},
+                {**capture, "trigger": [], "extract_only": "yes"},
+                {**extraction, "job_id": {}, "extract_only": ["yes"]},
+                {**capture, "blob_sha256": {}, "extract_only": {"yes": 1}},
+                {**extraction, "session_id": "must-not-extract",
+                 "extract_only": 1, "attempts": True},
+            )
+            legacy_markers = ("yes", 1, [True], {"yes": True})
+            originals: dict[str, dict] = {}
+            for index, value in enumerate(schema_cases):
+                name = f"schema-mixed-{index}.json"
+                originals[name] = value
+                (incoming / name).write_text(json.dumps(value), encoding="utf-8")
+            for index, marker in enumerate(legacy_markers):
+                name = f"legacy-marker-{index}.json"
+                value = {
+                    "extract_only": marker,
+                    "session_id": "must-not-extract",
+                    "attempts": 0,
+                }
+                originals[name] = value
+                (incoming / name).write_text(json.dumps(value), encoding="utf-8")
+            legitimate_legacy = incoming / "zz-legacy-exact.json"
+            legitimate_legacy.write_text(json.dumps({
+                "extract_only": True,
+                "session_id": "legacy-valid",
+                "attempts": 0,
+            }), encoding="utf-8")
+            _write_extraction_job(
+                core.CFG.spool, "zzz-schema-valid.json", "schema-valid")
+
+            extracted_sessions: list[str] = []
+
+            def extracted(session_id: str) -> dict:
+                extracted_sessions.append(session_id)
+                return {"ok": True, "stored": 0}
+
+            with patch("memoryd.extract.run_extraction", side_effect=extracted):
+                stats = ingest.drain_spool()
+            assert stats == {
+                "processed": 2, "retried": 0,
+                "dead_lettered": len(originals), "requeued": 0,
+            }
+            assert extracted_sessions == ["legacy-valid", "schema-valid"]
+            dead = core.CFG.spool / "dead-letter"
+            for name, original in originals.items():
+                preserved = dead / name
+                assert json.loads(preserved.read_text(encoding="utf-8")) == original
+                assert preserved.with_suffix(".reason.json").exists()
+        finally:
+            core.CFG.home = old_home
+
+
 def test_legacy_missing_source_is_preserved() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / "spool"
@@ -945,6 +1074,7 @@ def test_legacy_missing_source_is_preserved() -> None:
     _assert_extraction_replay_classification()
     _assert_strict_manifest_types_are_preserved()
     _assert_legacy_path_types_are_preserved()
+    _assert_mixed_role_dispatch_is_unambiguous()
 
 
 def test_stale_processing_job_is_requeued() -> None:

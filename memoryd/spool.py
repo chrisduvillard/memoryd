@@ -14,6 +14,8 @@ from typing import BinaryIO
 
 SCHEMA_VERSION = 2
 BUFFER_BYTES = 1024 * 1024
+DEAD_LETTER_REASON_FIELDS = frozenset({
+    "dead_lettered_at", "reason", "manifest"})
 _STATE_THREAD_LOCK = threading.RLock()
 
 
@@ -355,7 +357,8 @@ def is_dead_letter_sidecar(path: Path) -> bool:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    if not isinstance(value, dict):
+    if (not isinstance(value, dict) or
+            set(value) != DEAD_LETTER_REASON_FIELDS):
         return False
     manifest_name = value.get("manifest")
     reason = value.get("reason")
