@@ -77,10 +77,20 @@ def q1(sql: str, *args):
 
 
 def main() -> int:
+    daemon_url = f"http://127.0.0.1:{os.environ.get('MEMORYD_PORT', '7437')}"
+    provider_url = daemon_url
+    recovery_url = daemon_url
     hermes_home = Path(tempfile.gettempdir()) / "hermes_home_test"
     hermes_home.mkdir(exist_ok=True)
     (hermes_home / "memoryd.json").write_text(json.dumps(
-        {"url": "http://127.0.0.1:7437", "project": "hermes-test"}))
+        {"url": provider_url, "project": "hermes-test"}))
+
+    urls_honor_port = provider_url == daemon_url and recovery_url == daemon_url
+    check("provider and recovery URLs honor MEMORYD_PORT", urls_honor_port,
+          f"provider={provider_url}, recovery={recovery_url}, expected={daemon_url}")
+    if not urls_honor_port:
+        print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
+        return 1
 
     print("== ABC conformance ==")
     prov = plugin.MemorydProvider()
@@ -209,7 +219,7 @@ def main() -> int:
     time.sleep(1.0)
     check("offline turns spooled in memory", len(down._spool) >= 1
           or not down._q.empty())
-    down._url = "http://127.0.0.1:7437"  # recovery
+    down._url = recovery_url
     ok = wait_for(lambda: (r := q1(
         "SELECT count(*) AS n FROM events WHERE session_id='hermes-down-1' AND "
         "kind='user_message'")) and r["n"] >= 1, 6)

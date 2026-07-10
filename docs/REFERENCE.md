@@ -106,8 +106,8 @@ Schema-v2 jobs share `schema_version`, `job_id`, `kind`, `created_at`,
 `session_id`, `attempts`, `last_error`, and `next_attempt_at`. A
 `capture_snapshot` job also records `trigger`, `original_transcript_path`,
 `blob_sha256`, `blob_bytes`, and optional `project`. An `extraction` job needs
-only the shared fields. Every capture gets a distinct job and occurrence even
-when several captures deduplicate to the same blob bytes.
+only the shared fields. Every accepted capture gets a distinct job. Several
+jobs and repeated attempts can still deduplicate to the same blob bytes.
 
 Claims move jobs from `incoming/` to `processing/` under `state.lock` and touch
 the manifest mtime. A worker requeues a processing lease older than 15 minutes.
@@ -133,10 +133,12 @@ block in order instead of dropping all but one block.
 The archive stores verified objects at
 `archive/objects/sha256/<first-2>/<next-2>/<sha256>`. Before use, memoryd checks
 that an object is a regular file with the expected size and digest.
-`archive/manifest.jsonl` appends one occurrence per capture/job, including its
-`ingest_job_id`, even when the object bytes already exist. The `archive/fonds/`
-view is a platform-safe, best-effort symlink view. Unsupported platforms or a
-link failure do not invalidate the verified object or occurrence manifest.
+Every successful archive attempt appends an occurrence to
+`archive/manifest.jsonl`, including its `ingest_job_id` when available. A retry
+can append another occurrence with the same job ID even when the object bytes
+already exist. The `archive/fonds/` view is a platform-safe, best-effort
+symlink view. Unsupported platforms or a link failure do not invalidate the
+verified object or occurrence manifest.
 
 ### Status and operator action
 
@@ -155,10 +157,11 @@ the cause. Keep the dead-letter evidence.
 `memoryd doctor --repair` performs only conservative actions. It creates a
 missing safe spool layout, requeues stale processing leases, upgrades legacy
 jobs whose transcript source still exists, and moves invalid or unrecoverable
-queued manifests to dead-letter with a reason record. It reconstructs a missing
-archive occurrence only from existing spool evidence and an existing canonical
-object that passes regular-file, size, digest, and file-identity checks. It
-refuses redirected, unreadable, or otherwise untrusted spool/archive topology,
+queued manifests to dead-letter with a reason record. It reconstructs missing
+supported capture-job occurrences idempotently, only from existing spool
+evidence and an existing canonical object that passes regular-file, size,
+digest, and file-identity checks. Repair refuses redirected, unreadable, or
+otherwise untrusted spool/archive topology,
 including unsafe ancestors, locks, evidence files, blobs, and object shards.
 It never recreates missing bytes, deletes evidence, rewrites archive objects, or
 manufactures fonds links.

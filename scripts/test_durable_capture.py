@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memoryd import core, doctor, ingest, server, spool
-from memoryd.cli import _spool_counts
+from memoryd.cli import _spool_counts, status
 from memoryd.doctor import (
     inspect_archive,
     inspect_spool,
@@ -101,6 +101,52 @@ def test_status_counts_spool_states() -> None:
             "processing": 1,
             "dead_letter": 2,
         }
+
+        class StatusResult:
+            def __init__(self, rows: list[tuple]) -> None:
+                self.rows = rows
+
+            def fetchall(self) -> list[tuple]:
+                return self.rows
+
+            def fetchone(self) -> tuple:
+                return self.rows[0]
+
+        class StatusConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def execute(self, sql: str) -> StatusResult:
+                if "schema_migrations" in sql:
+                    migration_count = len(list(
+                        (Path(__file__).parents[1] / "migrations").glob("*.sql")))
+                    return StatusResult([(str(i),) for i in range(migration_count)])
+                if "GROUP BY status" in sql:
+                    return StatusResult([("active", 1)])
+                if "review_queue" in sql:
+                    return StatusResult([(0,)])
+                raise AssertionError(f"unexpected status query: {sql}")
+
+        output = io.StringIO()
+        with patch.dict(os.environ, {
+                "MEMORYD_HOME": td,
+                "MEMORYD_DSN": "postgresql://status:test@127.0.0.1/status",
+             }), patch(
+                "psycopg.connect", return_value=StatusConnection()), patch(
+                "memoryd.cli._docker", return_value=(1, "")), patch(
+                "memoryd.cli._health", return_value={"ok": True}), patch(
+                "memoryd.cli._run", return_value=(1, "")), \
+                contextlib.redirect_stdout(output):
+            result = status()
+
+        spool_line = (
+            "  spool      incoming=2 processing=1 dead-letter=2"
+            "  <- run `memoryd doctor`")
+        assert spool_line in output.getvalue().splitlines()
+        assert result == 1
 
 
 def _archive_with_synchronized_publication(
