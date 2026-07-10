@@ -289,8 +289,24 @@ def test_fonds_paths_cannot_escape_archive() -> None:
             raise AssertionError("unsafe parent symlink accepted")
 
         old_home = core.CFG.home
-        core.CFG.home = Path(td) / "memory"
         try:
+            core.CFG.home = Path(td) / "pre-swapped-memory"
+            core.CFG.ensure_dirs()
+            redirected_root = core.CFG.archive / "fonds"
+            redirected_root.rmdir()
+            redirected_outside = Path(td) / "pre-swapped-outside"
+            redirected_outside.mkdir()
+            _create_directory_link(redirected_outside, redirected_root)
+            try:
+                core.archive_bytes(b"redirected", "text/plain", "capture.txt")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("pre-swapped fonds root accepted")
+            assert not os.path.lexists(redirected_outside / "capture.txt")
+            assert not (core.CFG.archive / "manifest.jsonl").exists()
+
+            core.CFG.home = Path(td) / "memory"
             core.CFG.ensure_dirs()
             outside = Path(td) / "swap-outside"
             outside.mkdir()

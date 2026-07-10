@@ -163,9 +163,15 @@ def validate_fonds_path(archive_root: Path, fonds_path: str) -> Path:
     parts = normalized.split("/")
     if rel.is_absolute() or any(part in ("", ".", "..") for part in parts):
         raise ValueError(f"unsafe fonds path: {fonds_path!r}")
-    root = (archive_root / "fonds").resolve()
-    target = root / Path(*parts)
-    if not target.parent.resolve().is_relative_to(root):
+    trusted_root = archive_root.resolve()
+    fonds_root = trusted_root / "fonds"
+    if os.path.lexists(fonds_root):
+        root_stat = fonds_root.stat(follow_symlinks=False)
+        if (not stat.S_ISDIR(root_stat.st_mode) or
+                fonds_root.resolve() != fonds_root):
+            raise ValueError(f"unsafe fonds root: {fonds_root}")
+    target = fonds_root / Path(*parts)
+    if not target.parent.resolve().is_relative_to(fonds_root):
         raise ValueError(f"fonds path escapes archive: {fonds_path!r}")
     return target
 
@@ -255,7 +261,8 @@ def _safe_fonds_links_supported() -> bool:
     )
 
 
-def _create_fonds_link(obj_path: Path, link: Path, fonds_path: str) -> None:
+def _create_fonds_link(archive_root: Path, obj_path: Path,
+                       link: Path, fonds_path: str) -> None:
     if not _safe_fonds_links_supported():
         return
 
@@ -263,7 +270,6 @@ def _create_fonds_link(obj_path: Path, link: Path, fonds_path: str) -> None:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     descriptors = []
     try:
-        archive_root = link.parents[len(parts)]
         current = os.open(archive_root, flags)
         descriptors.append(current)
         current = os.open("fonds", flags, dir_fd=current)
@@ -329,9 +335,10 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
     obj_stat = _verify_archive_object(obj_path, sha, len(data))
 
     # fonds symlink (original-order view); best effort, never fatal
-    link = validate_fonds_path(CFG.archive, fonds_path)
+    trusted_archive_root = CFG.archive.resolve()
+    link = validate_fonds_path(trusted_archive_root, fonds_path)
     try:
-        _create_fonds_link(obj_path, link, fonds_path)
+        _create_fonds_link(trusted_archive_root, obj_path, link, fonds_path)
     except OSError:
         pass
 
