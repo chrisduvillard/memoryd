@@ -101,6 +101,18 @@ def ensure_layout(spool_root: Path) -> dict[str, Path]:
     return paths
 
 
+def _collision_safe_target(directory: Path, name: str,
+                           *, reserve_reason: bool = False) -> Path:
+    target = directory / name
+    reason_path = dead_letter_reason_path(target) if reserve_reason else None
+    while (os.path.lexists(target) or
+           (reason_path is not None and os.path.lexists(reason_path))):
+        target = target.with_name(
+            f"{target.stem}-{secrets.token_hex(4)}{target.suffix}")
+        reason_path = dead_letter_reason_path(target) if reserve_reason else None
+    return target
+
+
 def _job_id() -> str:
     return f"job_{time.time_ns()}_{os.getpid()}_{secrets.token_hex(8)}"
 
@@ -308,9 +320,7 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
                 job = {}
             if not ignore_schedule and _scheduled(job):
                 continue
-            target = paths["processing"] / source.name
-            if target.exists():
-                continue
+            target = _collision_safe_target(paths["processing"], source.name)
             os.utime(source, None)
             deadline = time.monotonic() + 5
             while True:
@@ -339,7 +349,8 @@ def release_job(spool_root: Path, processing_path: Path, error: str,
         job["next_attempt_at"] = (
             datetime.now(timezone.utc) + timedelta(seconds=delay_s)).isoformat()
         _atomic_json(processing_path, job)
-        target = ensure_layout(spool_root)["incoming"] / processing_path.name
+        target = _collision_safe_target(
+            ensure_layout(spool_root)["incoming"], processing_path.name)
         os.replace(processing_path, target)
         return target
 
@@ -376,12 +387,9 @@ def is_dead_letter_sidecar(path: Path) -> bool:
 def dead_letter(spool_root: Path, job_path: Path, reason: str) -> Path:
     with _state_lock(spool_root):
         paths = ensure_layout(spool_root)
-        target = paths["dead-letter"] / job_path.name
+        target = _collision_safe_target(
+            paths["dead-letter"], job_path.name, reserve_reason=True)
         reason_path = dead_letter_reason_path(target)
-        while target.exists() or reason_path.exists():
-            target = target.with_name(
-                f"{target.stem}-{secrets.token_hex(4)}{target.suffix}")
-            reason_path = dead_letter_reason_path(target)
         _atomic_json(reason_path, {
             "dead_lettered_at": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
@@ -402,10 +410,10 @@ def requeue_stale(spool_root: Path, *, stale_after_s: int = 900) -> int:
         cutoff = time.time() - stale_after_s
         moved = 0
         for source in paths["processing"].glob("*.json"):
-            target = paths["incoming"] / source.name
             try:
                 if source.stat().st_mtime >= cutoff:
                     continue
+                target = _collision_safe_target(paths["incoming"], source.name)
                 os.replace(source, target)
                 moved += 1
             except FileNotFoundError:

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from memoryd import core, ingest, server, spool
+from memoryd import core, doctor, ingest, server, spool
 from memoryd.doctor import (
     inspect_archive,
     inspect_spool,
@@ -1412,6 +1412,29 @@ def test_doctor_inspection_is_read_only_and_reports_defects() -> None:
         named_like_sidecar = paths["dead-letter"] / "capture.reason.json"
         named_like_sidecar.write_text(
             json.dumps(_doctor_job("named-like-sidecar")), encoding="utf-8")
+        missing_reason = paths["dead-letter"] / "missing-reason.json"
+        missing_reason.write_text(
+            json.dumps(_doctor_job("missing-reason")), encoding="utf-8")
+        malformed_reason_job = paths["dead-letter"] / "malformed-reason.json"
+        malformed_reason_job.write_text(
+            json.dumps(_doctor_job("malformed-reason")), encoding="utf-8")
+        dead_letter_reason_path(malformed_reason_job).write_text(
+            "{}", encoding="utf-8")
+        mismatched_reason_job = paths["dead-letter"] / "mismatch.json"
+        mismatched_reason_job.write_text(
+            json.dumps(_doctor_job("mismatch")), encoding="utf-8")
+        (paths["dead-letter"] / "misplaced-record.json").write_text(
+            json.dumps({
+                "dead_lettered_at": "2026-07-10T08:06:00+00:00",
+                "reason": "wrong path",
+                "manifest": mismatched_reason_job.name,
+            }), encoding="utf-8")
+        (paths["dead-letter"] / "absent.reason.json").write_text(
+            json.dumps({
+                "dead_lettered_at": "2026-07-10T08:07:00+00:00",
+                "reason": "orphan",
+                "manifest": "absent.json",
+            }), encoding="utf-8")
 
         archive = home / "archive"
         object_root = archive / "objects" / "sha256"
@@ -1443,10 +1466,12 @@ def test_doctor_inspection_is_read_only_and_reports_defects() -> None:
         assert {
             "invalid_manifest", "legacy_source_missing", "spool_blob_invalid",
             "stale_processing_job", "dead_letter_jobs",
+            "dead_letter_reason_missing", "dead_letter_reason_invalid",
+            "dead_letter_reason_mismatched", "dead_letter_reason_orphan",
         } <= spool_codes
         dead_count = next(
             item for item in spool_findings if item.code == "dead_letter_jobs")
-        assert dead_count.detail == "2"
+        assert dead_count.detail == "5"
         assert all(item.path != str(sidecar) for item in spool_findings)
 
         archive_codes = {item.code for item in archive_findings}
@@ -1455,6 +1480,36 @@ def test_doctor_inspection_is_read_only_and_reports_defects() -> None:
             "manifest_object_missing", "object_hash_mismatch", "orphan_object",
             "invalid_object_name",
         } <= archive_codes
+
+        topology_home = base / "topology"
+        topology_spool = topology_home / "spool"
+        topology_spool.mkdir(parents=True)
+        (topology_spool / "incoming").write_text(
+            "not a directory", encoding="utf-8")
+        outside_archive = base / "outside-inspection-archive"
+        outside_archive.mkdir()
+        _create_directory_link(outside_archive, topology_home / "archive")
+        before_topology = _tree_snapshot(topology_home)
+        before_outside = _tree_snapshot(outside_archive)
+        assert "spool_topology_invalid" in {
+            item.code for item in inspect_spool(topology_spool)}
+        assert "archive_topology_invalid" in {
+            item.code for item in inspect_archive(topology_home / "archive")}
+        old_home = core.CFG.home
+        output = io.StringIO()
+        try:
+            core.CFG.home = topology_home
+            with patch("memoryd.core.pool", side_effect=OSError("database down")), \
+                 patch("memoryd.doctor.urllib.request.urlopen",
+                       side_effect=OSError("daemon down")), \
+                 contextlib.redirect_stdout(output):
+                assert doctor_main() == 1
+        finally:
+            core.CFG.home = old_home
+        assert "spool_topology_invalid" in output.getvalue()
+        assert "archive_topology_invalid" in output.getvalue()
+        assert _tree_snapshot(topology_home) == before_topology
+        assert _tree_snapshot(outside_archive) == before_outside
 
 
 def test_doctor_repair_preserves_and_requeues_spool_evidence() -> None:
@@ -1501,6 +1556,14 @@ def test_doctor_repair_preserves_and_requeues_spool_evidence() -> None:
             "reason": "existing evidence",
             "manifest": preserved_dead.name,
         }), encoding="utf-8")
+        collision_dead = paths["dead-letter"] / missing.name
+        collision_dead.write_text(
+            json.dumps(_doctor_job("existing-missing")), encoding="utf-8")
+        dead_letter_reason_path(collision_dead).write_text(json.dumps({
+            "dead_lettered_at": "2026-07-10T08:05:30+00:00",
+            "reason": "existing collision",
+            "manifest": collision_dead.name,
+        }), encoding="utf-8")
         dead_before = {
             preserved_dead.name: preserved_dead.read_bytes(),
             preserved_reason.name: preserved_reason.read_bytes(),
@@ -1512,6 +1575,11 @@ def test_doctor_repair_preserves_and_requeues_spool_evidence() -> None:
             "stale_jobs_requeued", "legacy_upgraded", "legacy_dead_lettered",
             "invalid_job_dead_lettered", "corrupt_job_dead_lettered",
         } <= action_codes
+        dead_lettered = next(
+            item for item in actions if item.code == "legacy_dead_lettered")
+        assert Path(dead_lettered.path).is_file()
+        assert Path(dead_lettered.path).parent == paths["dead-letter"]
+        assert Path(dead_lettered.path).name != collision_dead.name
         assert source.read_bytes() == b"source evidence"
         assert (paths["incoming"] / "stale.json").exists()
 
@@ -1530,6 +1598,89 @@ def test_doctor_repair_preserves_and_requeues_spool_evidence() -> None:
             preserved_dead.name: preserved_dead.read_bytes(),
             preserved_reason.name: preserved_reason.read_bytes(),
         } == dead_before
+
+        transition_root = base / "transition-spool"
+        transition_paths = ensure_layout(transition_root)
+        incoming_collision = transition_paths["incoming"] / "collision.json"
+        processing_collision = transition_paths["processing"] / "collision.json"
+        incoming_collision.write_text(
+            json.dumps({"marker": "incoming"}), encoding="utf-8")
+        processing_collision.write_text(
+            json.dumps({"marker": "processing"}), encoding="utf-8")
+        os.utime(processing_collision, (old, old))
+        assert spool.requeue_stale(transition_root) == 1
+        collision_values = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in transition_paths["incoming"].glob("collision*.json")]
+        assert {value["marker"] for value in collision_values} == {
+            "incoming", "processing"}
+
+        retry_processing = transition_paths["processing"] / "retry.json"
+        retry_processing.write_text(
+            json.dumps(_doctor_job("retry")), encoding="utf-8")
+        retry_incoming = transition_paths["incoming"] / "retry.json"
+        retry_incoming.write_text(
+            json.dumps({"marker": "preserved retry"}), encoding="utf-8")
+        released = spool.release_job(
+            transition_root, retry_processing, "retry", delay_s=1)
+        assert released != retry_incoming
+        assert json.loads(retry_incoming.read_text())["marker"] == "preserved retry"
+        assert json.loads(released.read_text())["last_error"] == "retry"
+
+        root_claim = transition_root / "claim.json"
+        root_claim.write_text(
+            json.dumps(_doctor_job("claim-source")), encoding="utf-8")
+        occupied_claim = transition_paths["processing"] / "claim.json"
+        occupied_claim.write_text(
+            json.dumps(_doctor_job("claim-occupied")), encoding="utf-8")
+        claimed = spool.claim_next(transition_root)
+        assert claimed is not None and claimed != occupied_claim
+        assert occupied_claim.is_file()
+
+        unsafe_root = base / "unsafe-lock-spool"
+        unsafe_root.mkdir()
+        (unsafe_root / "state.lock").mkdir()
+        before_unsafe = _tree_snapshot(unsafe_root)
+        refused = repair_spool(unsafe_root)
+        assert any(item.code == "repair_refused" for item in refused)
+        assert _tree_snapshot(unsafe_root) == before_unsafe
+
+        redirected_root = base / "redirected-spool"
+        redirected_root.mkdir()
+        redirected_outside = base / "redirected-spool-outside"
+        redirected_outside.mkdir()
+        redirected_job = redirected_outside / "redirected.json"
+        redirected_job.write_text(
+            json.dumps(missing_value), encoding="utf-8")
+        _create_directory_link(
+            redirected_outside, redirected_root / "incoming")
+        before_redirected = _tree_snapshot(redirected_root)
+        before_redirected_outside = _tree_snapshot(redirected_outside)
+        redirected_actions = repair_spool(redirected_root)
+        assert any(
+            item.code == "repair_refused" for item in redirected_actions)
+        assert _tree_snapshot(redirected_root) == before_redirected
+        assert _tree_snapshot(redirected_outside) == before_redirected_outside
+
+        cli_home = base / "unsafe-cli-home"
+        cli_home.mkdir()
+        cli_outside = base / "unsafe-cli-archive"
+        cli_outside.mkdir()
+        _create_directory_link(cli_outside, cli_home / "archive")
+        before_cli_home = _tree_snapshot(cli_home)
+        before_cli_outside = _tree_snapshot(cli_outside)
+        old_home = core.CFG.home
+        try:
+            core.CFG.home = cli_home
+            with patch("memoryd.core.pool", side_effect=OSError("database down")), \
+                 patch("memoryd.doctor.urllib.request.urlopen",
+                       side_effect=OSError("daemon down")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                assert doctor_main(repair=True) == 1
+        finally:
+            core.CFG.home = old_home
+        assert _tree_snapshot(cli_home) == before_cli_home
+        assert _tree_snapshot(cli_outside) == before_cli_outside
 
 
 def test_doctor_reconstructs_each_supported_occurrence_idempotently() -> None:
@@ -1569,22 +1720,33 @@ def test_doctor_reconstructs_each_supported_occurrence_idempotently() -> None:
         }
         (spool_root / "legacy.json").write_text(
             json.dumps(legacy), encoding="utf-8")
+        second_legacy = {
+            **legacy,
+            "transcript_path": str(home / "legacy-source-two.jsonl"),
+            "created_at": "2026-07-10T09:01:00+00:00",
+        }
+        Path(second_legacy["transcript_path"]).write_bytes(data)
+        (spool_root / "legacy-two.json").write_text(
+            json.dumps(second_legacy), encoding="utf-8")
         fonds_evidence = home / "archive" / "fonds" / "preserved.txt"
         fonds_evidence.parent.mkdir(parents=True)
         fonds_evidence.write_bytes(b"fonds evidence")
         manifest = home / "archive" / "manifest.jsonl"
-        manifest.write_text("{preserved malformed line\n", encoding="utf-8")
+        preserved_tail = b"{preserved malformed line"
+        manifest.write_bytes(preserved_tail)
 
         actions = repair_archive(home / "archive", spool_root)
         reconstructed = [
             item for item in actions
             if item.code == "manifest_occurrence_reconstructed"]
-        assert len(reconstructed) == 3
+        assert len(reconstructed) == 4
+        assert manifest.read_bytes().startswith(preserved_tail + b"\n")
         lines = manifest.read_text(encoding="utf-8").splitlines()
         assert lines[0] == "{preserved malformed line"
         entries = [json.loads(line) for line in lines[1:]]
         assert {entry["ingest_job_id"] for entry in entries} == {
             "job-one", "job-two", None}
+        assert sum(entry["ingest_job_id"] is None for entry in entries) == 2
         assert all(entry["sha256"] == sha for entry in entries)
         assert legacy_source.read_bytes() == data
         assert fonds_evidence.read_bytes() == b"fonds evidence"
@@ -1592,6 +1754,153 @@ def test_doctor_reconstructs_each_supported_occurrence_idempotently() -> None:
         before_second_repair = _tree_snapshot(home)
         assert repair_archive(home / "archive", spool_root) == []
         assert _tree_snapshot(home) == before_second_repair
+
+        fallback_home = home / "fallback-case"
+        fallback_spool = fallback_home / "spool"
+        ensure_layout(fallback_spool)
+        fallback_archive = fallback_home / "archive"
+        fallback_obj = (fallback_archive / "objects" / "sha256" /
+                        sha[:2] / sha[2:4] / sha)
+        fallback_obj.parent.mkdir(parents=True)
+        fallback_obj.write_bytes(data)
+        fallback_source = fallback_home / "source.jsonl"
+        fallback_source.write_bytes(data)
+        fallback_jobs = (
+            {
+                **legacy,
+                "transcript_path": str(fallback_source),
+                "created_at": "2026-07-10T10:00:00+00:00",
+            },
+            {
+                **legacy,
+                "transcript_path": str(fallback_source),
+                "created_at": "2026-07-10T10:01:00+00:00",
+            },
+        )
+        for index, value in enumerate(fallback_jobs):
+            (fallback_spool / f"legacy-{index}.json").write_text(
+                json.dumps(value), encoding="utf-8")
+        fallback_fonds = "claude-code/2026/07/10/legacy-session.jsonl"
+        fallback_manifest = fallback_archive / "manifest.jsonl"
+        fallback_manifest.write_text(json.dumps({
+            "sha256": sha,
+            "bytes": len(data),
+            "mime": "application/x-jsonl",
+            "occurrence_at": "2026-07-10T10:00:00+00:00",
+            "fonds_path": fallback_fonds,
+            "ingest_job_id": None,
+        }) + "\n", encoding="utf-8")
+        fallback_actions = repair_archive(fallback_archive, fallback_spool)
+        assert sum(
+            item.code == "manifest_occurrence_reconstructed"
+            for item in fallback_actions) == 1
+        fallback_after = fallback_manifest.read_bytes()
+        assert repair_archive(fallback_archive, fallback_spool) == []
+        assert fallback_manifest.read_bytes() == fallback_after
+
+        conflict_home = home / "identity-conflict"
+        conflict_spool = conflict_home / "spool"
+        conflict_paths = ensure_layout(conflict_spool)
+        conflict_archive = conflict_home / "archive"
+        conflict_obj = (conflict_archive / "objects" / "sha256" /
+                        sha[:2] / sha[2:4] / sha)
+        conflict_obj.parent.mkdir(parents=True)
+        conflict_obj.write_bytes(data)
+        conflict_job = _doctor_job(
+            "duplicate-id", kind="capture_snapshot", project="memoryd",
+            trigger="stop", original_transcript_path="C:/conflict.jsonl",
+            blob_sha256=sha, blob_bytes=len(data), session_id="conflict")
+        (conflict_paths["dead-letter"] / "conflict.json").write_text(
+            json.dumps(conflict_job), encoding="utf-8")
+        conflict_manifest = conflict_archive / "manifest.jsonl"
+        conflict_manifest.write_text("\n".join((
+            json.dumps({
+                "sha256": sha,
+                "fonds_path": "claude-code/2026/07/10/conflict.jsonl",
+                "ingest_job_id": "duplicate-id",
+            }),
+            json.dumps({
+                "sha256": "e" * 64,
+                "fonds_path": "claude-code/2026/07/10/other.jsonl",
+                "ingest_job_id": "duplicate-id",
+            }),
+        )) + "\n", encoding="utf-8")
+        assert "occurrence_identity_collision" in {
+            item.code for item in inspect_archive(conflict_archive)}
+        conflict_before = conflict_manifest.read_bytes()
+        conflict_actions = repair_archive(conflict_archive, conflict_spool)
+        assert any(
+            item.code == "occurrence_identity_collision"
+            for item in conflict_actions)
+        assert conflict_manifest.read_bytes() == conflict_before
+
+        race_home = home / "object-race"
+        race_spool = race_home / "spool"
+        race_paths = ensure_layout(race_spool)
+        race_archive = race_home / "archive"
+        race_obj = (race_archive / "objects" / "sha256" /
+                    sha[:2] / sha[2:4] / sha)
+        race_obj.parent.mkdir(parents=True)
+        race_obj.write_bytes(data)
+        (race_paths["dead-letter"] / "race.json").write_text(json.dumps(
+            _doctor_job(
+                "race", kind="capture_snapshot", project="memoryd",
+                trigger="stop", original_transcript_path="C:/race.jsonl",
+                blob_sha256=sha, blob_bytes=len(data), session_id="race")),
+            encoding="utf-8")
+        real_fstat = os.fstat
+        fstat_calls = 0
+
+        def unstable_fstat(fd: int):
+            nonlocal fstat_calls
+            fstat_calls += 1
+            result = real_fstat(fd)
+            if fstat_calls == 2:
+                fields = list(result)
+                fields[1] += 1
+                return os.stat_result(fields)
+            return result
+
+        with patch.object(doctor.os, "fstat", side_effect=unstable_fstat):
+            race_actions = repair_archive(race_archive, race_spool)
+        assert fstat_calls >= 2
+        assert not any(
+            item.code == "manifest_occurrence_reconstructed"
+            for item in race_actions)
+        assert not (race_archive / "manifest.jsonl").exists()
+
+        unsafe_archive = home / "unsafe-archive"
+        unsafe_archive.mkdir()
+        (unsafe_archive / "manifest.lock").mkdir()
+        unsafe_spool = home / "unsafe-archive-spool"
+        ensure_layout(unsafe_spool)
+        unsafe_before = _tree_snapshot(unsafe_archive)
+        unsafe_actions = repair_archive(unsafe_archive, unsafe_spool)
+        assert any(item.code == "repair_refused" for item in unsafe_actions)
+        assert _tree_snapshot(unsafe_archive) == unsafe_before
+
+        shard_home = home / "redirected-shard"
+        shard_spool = shard_home / "spool"
+        shard_paths = ensure_layout(shard_spool)
+        shard_archive = shard_home / "archive"
+        shard_root = shard_archive / "objects" / "sha256"
+        shard_root.mkdir(parents=True)
+        shard_outside = shard_home / "outside-shard"
+        (shard_outside / sha[2:4]).mkdir(parents=True)
+        (shard_outside / sha[2:4] / sha).write_bytes(data)
+        _create_directory_link(shard_outside, shard_root / sha[:2])
+        (shard_paths["dead-letter"] / "shard.json").write_text(json.dumps(
+            _doctor_job(
+                "shard", kind="capture_snapshot", project="memoryd",
+                trigger="stop", original_transcript_path="C:/shard.jsonl",
+                blob_sha256=sha, blob_bytes=len(data), session_id="shard")),
+            encoding="utf-8")
+        shard_before = _tree_snapshot(shard_archive)
+        shard_outside_before = _tree_snapshot(shard_outside)
+        shard_actions = repair_archive(shard_archive, shard_spool)
+        assert any(item.code == "repair_refused" for item in shard_actions)
+        assert _tree_snapshot(shard_archive) == shard_before
+        assert _tree_snapshot(shard_outside) == shard_outside_before
 
 
 if __name__ == "__main__":

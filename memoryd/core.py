@@ -15,6 +15,7 @@ import shutil
 import stat
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -291,11 +292,22 @@ def _create_fonds_link(archive_root: Path, obj_path: Path,
             os.close(descriptor)
 
 
-def append_manifest_occurrence(archive_root: Path, occurrence: dict) -> None:
+def append_manifest_occurrence(
+        archive_root: Path, occurrence: dict,
+        *, pre_append: Callable[[], bool] | None = None) -> None:
     manifest = archive_root / "manifest.jsonl"
-    line = json.dumps(occurrence, sort_keys=True, default=str) + "\n"
+    line = (json.dumps(occurrence, sort_keys=True, default=str) + "\n").encode()
     with _manifest_file_lock(manifest):
-        with manifest.open("a", encoding="utf-8") as handle:
+        if pre_append is not None and not pre_append():
+            raise ValueError("manifest append precondition failed")
+        with manifest.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell():
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(b"\n")
+            handle.seek(0, os.SEEK_END)
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
