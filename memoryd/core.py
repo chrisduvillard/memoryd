@@ -726,6 +726,45 @@ def _write_occurrence_index_marker(archive_root: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _ensure_occurrence_index_unlocked(archive_root: Path) -> None:
+    """Materialize the index while the caller holds the manifest lock."""
+    if _occurrence_index_is_complete(archive_root):
+        return
+    identity_dir = archive_root / "occurrence-identities"
+    _mkdir_durable(identity_dir)
+    # Validate the complete history before writing any derived identity.
+    groups = _stream_manifest_occurrence_groups(archive_root)
+    for ingest_job_id, (expected, occurrence) in groups.items():
+        path = _occurrence_identity_path(archive_root, ingest_job_id)
+        with _manifest_file_lock(path):
+            existing = _read_occurrence_identity(
+                archive_root, ingest_job_id)
+            if existing is not None:
+                actual = _occurrence_identity(
+                    existing["sha256"],
+                    _occurrence_request_metadata(existing),
+                    existing.get("fonds_path"))
+                if actual != expected:
+                    raise ArchiveOccurrenceCollision(
+                        "archive occurrence identity collision")
+                value = {**existing, "published": True}
+            else:
+                request_metadata = _occurrence_request_metadata(occurrence)
+                value = {
+                    "ingest_job_id": ingest_job_id,
+                    "sha256": occurrence.get("sha256"),
+                    "request_id": request_metadata[0],
+                    "request_endpoint": request_metadata[1],
+                    "request_body_sha256": request_metadata[2],
+                    "fonds_path": (
+                        None if request_metadata[0] is not None else
+                        occurrence.get("fonds_path")),
+                    "published": True,
+                }
+            _write_occurrence_identity(archive_root, value)
+    _write_occurrence_index_marker(archive_root)
+
+
 def ensure_occurrence_index(archive_root: Path) -> None:
     """One-time, crash-safe materialization of legacy occurrence identities."""
     if _occurrence_index_is_complete(archive_root):
@@ -734,39 +773,7 @@ def ensure_occurrence_index(archive_root: Path) -> None:
     _mkdir_durable(identity_dir)
     manifest = archive_root / "manifest.jsonl"
     with _manifest_file_lock(manifest):
-        if _occurrence_index_is_complete(archive_root):
-            return
-        # Validate the complete history before writing any derived identity.
-        groups = _stream_manifest_occurrence_groups(archive_root)
-        for ingest_job_id, (expected, occurrence) in groups.items():
-            path = _occurrence_identity_path(archive_root, ingest_job_id)
-            with _manifest_file_lock(path):
-                existing = _read_occurrence_identity(
-                    archive_root, ingest_job_id)
-                if existing is not None:
-                    actual = _occurrence_identity(
-                        existing["sha256"],
-                        _occurrence_request_metadata(existing),
-                        existing.get("fonds_path"))
-                    if actual != expected:
-                        raise ArchiveOccurrenceCollision(
-                            "archive occurrence identity collision")
-                    value = {**existing, "published": True}
-                else:
-                    request_metadata = _occurrence_request_metadata(occurrence)
-                    value = {
-                        "ingest_job_id": ingest_job_id,
-                        "sha256": occurrence.get("sha256"),
-                        "request_id": request_metadata[0],
-                        "request_endpoint": request_metadata[1],
-                        "request_body_sha256": request_metadata[2],
-                        "fonds_path": (
-                            None if request_metadata[0] is not None else
-                            occurrence.get("fonds_path")),
-                        "published": True,
-                    }
-                _write_occurrence_identity(archive_root, value)
-        _write_occurrence_index_marker(archive_root)
+        _ensure_occurrence_index_unlocked(archive_root)
 
 
 def _claim_archive_occurrence(
@@ -782,6 +789,7 @@ def _claim_archive_occurrence(
     # must use the same order so it cannot bless a provisional line that may
     # still be rolled back by the publisher's postcondition.
     with _manifest_file_lock(manifest):
+        _ensure_occurrence_index_unlocked(archive_root)
         with _manifest_file_lock(path):
             existing = _read_occurrence_identity(
                 archive_root, ingest_job_id)
@@ -859,6 +867,10 @@ def _archive_occurrence_is_published(
         archive_root: Path, ingest_job_id: str, sha256: str,
         request_metadata: tuple[object, object, object],
         fonds_path: str) -> bool:
+    # Called by append_manifest_occurrence.skip_if while the manifest lock is
+    # held. Doctor may have invalidated/appended after the earlier claim, so
+    # reconcile the watermark again before trusting the keyed sidecar.
+    _ensure_occurrence_index_unlocked(archive_root)
     existing = _read_occurrence_identity(archive_root, ingest_job_id)
     if (existing is None or _occurrence_identity(
             existing["sha256"], _occurrence_request_metadata(existing),
@@ -891,8 +903,6 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                     for c in request_body_sha256)):
             raise ValueError("invalid archive request body digest")
     sha = hashlib.sha256(data).hexdigest()
-    if ingest_job_id is not None:
-        ensure_occurrence_index(CFG.archive)
     if request_id is not None:
         claim_archive_request_identity(
             CFG.archive, request_id, request_endpoint,

@@ -1869,6 +1869,126 @@ def test_absent_occurrence_marker_is_refsynced_before_doctor_append() -> None:
             core.CFG.home = old_home
 
 
+def test_claim_rechecks_marker_after_doctor_invalidation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        worker_at_claim = threading.Event()
+        doctor_finished = threading.Event()
+        worker_errors: list[Exception] = []
+        real_claim = core._claim_archive_occurrence
+        data = b"doctor-worker interleaving"
+        ingest_id = "doctor-worker-race-job"
+        fonds = "claude-code/2026/07/13/doctor-worker.jsonl"
+        occurrence = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data), "mime": "application/x-jsonl",
+            "first_seen": "2026-07-13T00:00:00+00:00",
+            "occurrence_at": "2026-07-13T00:00:00+00:00",
+            "fonds_path": fonds, "ingest_job_id": ingest_id,
+        }
+
+        def pause_before_claim(*args, **kwargs):
+            worker_at_claim.set()
+            assert doctor_finished.wait(timeout=5)
+            return real_claim(*args, **kwargs)
+
+        def ingest_worker() -> None:
+            try:
+                core.archive_bytes(
+                    data, "application/x-jsonl", fonds,
+                    ingest_job_id=ingest_id)
+            except Exception as exc:
+                worker_errors.append(exc)
+
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_claim_archive_occurrence",
+                    side_effect=pause_before_claim):
+                worker = threading.Thread(target=ingest_worker)
+                worker.start()
+                assert worker_at_claim.wait(timeout=5)
+                core.append_manifest_occurrence(
+                    core.CFG.archive, occurrence,
+                    invalidate_occurrence_index=True)
+                doctor_finished.set()
+                worker.join(timeout=10)
+            assert not worker_errors, worker_errors
+            manifest = core.CFG.archive / "manifest.jsonl"
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") == ingest_id]
+            assert len(matches) == 1
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert marker.is_file()
+            sidecars = [json.loads(path.read_text()) for path in
+                        marker.parent.glob("*.json")]
+            assert any(value.get("ingest_job_id") == ingest_id and
+                       value.get("published") is True for value in sidecars)
+        finally:
+            doctor_finished.set()
+            core.CFG.home = old_home
+
+
+def test_append_rechecks_marker_after_postclaim_doctor_append() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        worker_before_append = threading.Event()
+        doctor_finished = threading.Event()
+        worker_errors: list[Exception] = []
+        real_append = core.append_manifest_occurrence
+        data = b"doctor after worker claim"
+        ingest_id = "doctor-postclaim-race-job"
+        fonds = "claude-code/2026/07/13/doctor-postclaim.jsonl"
+        occurrence = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data), "mime": "application/x-jsonl",
+            "first_seen": "2026-07-13T00:00:00+00:00",
+            "occurrence_at": "2026-07-13T00:00:00+00:00",
+            "fonds_path": fonds, "ingest_job_id": ingest_id,
+        }
+
+        def pause_worker_append(*args, **kwargs):
+            if threading.current_thread().name == "postclaim-worker":
+                worker_before_append.set()
+                assert doctor_finished.wait(timeout=5)
+            return real_append(*args, **kwargs)
+
+        def ingest_worker() -> None:
+            try:
+                core.archive_bytes(
+                    data, "application/x-jsonl", fonds,
+                    ingest_job_id=ingest_id)
+            except Exception as exc:
+                worker_errors.append(exc)
+
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "append_manifest_occurrence",
+                    side_effect=pause_worker_append):
+                worker = threading.Thread(
+                    target=ingest_worker, name="postclaim-worker")
+                worker.start()
+                assert worker_before_append.wait(timeout=5)
+                real_append(
+                    core.CFG.archive, occurrence,
+                    invalidate_occurrence_index=True)
+                doctor_finished.set()
+                worker.join(timeout=10)
+            assert not worker_errors, worker_errors
+            manifest = core.CFG.archive / "manifest.jsonl"
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") == ingest_id]
+            assert len(matches) == 1
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert marker.is_file()
+        finally:
+            doctor_finished.set()
+            core.CFG.home = old_home
+
+
 def test_concurrent_occurrence_publishers_append_once() -> None:
     with tempfile.TemporaryDirectory() as td:
         old_home = core.CFG.home
@@ -4568,6 +4688,8 @@ if __name__ == "__main__":
     test_occurrence_index_migration_refuses_conflicts()
     test_doctor_append_invalidates_occurrence_index()
     test_absent_occurrence_marker_is_refsynced_before_doctor_append()
+    test_claim_rechecks_marker_after_doctor_invalidation()
+    test_append_rechecks_marker_after_postclaim_doctor_append()
     test_concurrent_occurrence_publishers_append_once()
     test_sidecar_fsync_failure_preserves_durable_occurrence()
     test_occurrence_publish_waits_for_manifest_directory_fsync()
@@ -4594,4 +4716,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("50 passed, 0 failed")
+    print("52 passed, 0 failed")
