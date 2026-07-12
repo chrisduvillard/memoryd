@@ -1770,6 +1770,105 @@ def test_occurrence_index_migration_refuses_conflicts() -> None:
             core.CFG.home = old_home
 
 
+def test_doctor_append_invalidates_occurrence_index() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            core.ensure_occurrence_index(core.CFG.archive)
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert marker.is_file()
+
+            data = b"doctor reconstructed occurrence"
+            ingest_id = "doctor-reconstructed-job"
+            fonds = "claude-code/2026/07/12/doctor.jsonl"
+            core.append_manifest_occurrence(
+                core.CFG.archive, {
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data), "mime": "application/x-jsonl",
+                    "first_seen": "2026-07-12T00:00:00+00:00",
+                    "occurrence_at": "2026-07-12T00:00:00+00:00",
+                    "fonds_path": fonds, "ingest_job_id": ingest_id,
+                }, invalidate_occurrence_index=True)
+            assert not marker.exists()
+
+            core.archive_bytes(
+                data, "application/x-jsonl", fonds,
+                ingest_job_id=ingest_id)
+            matches = [json.loads(line) for line in
+                       (core.CFG.archive / "manifest.jsonl").read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") == ingest_id]
+            assert len(matches) == 1
+            assert marker.is_file()
+            sidecars = [json.loads(path.read_text()) for path in
+                        (core.CFG.archive / "occurrence-identities").glob("*.json")]
+            assert any(value.get("ingest_job_id") == ingest_id and
+                       value.get("published") is True for value in sidecars)
+
+            doctor_source = (Path(__file__).resolve().parents[1] /
+                             "memoryd" / "doctor.py").read_text()
+            assert "invalidate_occurrence_index=True" in doctor_source
+        finally:
+            core.CFG.home = old_home
+
+
+def test_absent_occurrence_marker_is_refsynced_before_doctor_append() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            core.ensure_occurrence_index(core.CFG.archive)
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            marker_parent = marker.parent
+            occurrence = {
+                "sha256": hashlib.sha256(b"doctor retry").hexdigest(),
+                "bytes": 12, "mime": "application/x-jsonl",
+                "first_seen": "2026-07-12T00:00:00+00:00",
+                "occurrence_at": "2026-07-12T00:00:00+00:00",
+                "fonds_path": "doctor/retry.jsonl",
+                "ingest_job_id": "doctor-retry-job",
+            }
+            real_fsync = core._fsync_directory
+
+            def fail_first_marker_fsync(path: Path) -> None:
+                if path == marker_parent:
+                    raise OSError(errno.EIO, "marker unlink fsync failed")
+                real_fsync(path)
+
+            with patch.object(
+                    core, "_fsync_directory",
+                    side_effect=fail_first_marker_fsync):
+                try:
+                    core.append_manifest_occurrence(
+                        core.CFG.archive, occurrence,
+                        invalidate_occurrence_index=True)
+                except OSError as exc:
+                    assert exc.errno == errno.EIO
+                else:
+                    raise AssertionError("marker unlink fsync failure suppressed")
+            assert not marker.exists()
+            manifest = core.CFG.archive / "manifest.jsonl"
+            assert not manifest.exists() or not manifest.read_text().strip()
+
+            fsynced: list[Path] = []
+
+            def record_retry_fsync(path: Path) -> None:
+                fsynced.append(path)
+                real_fsync(path)
+
+            with patch.object(
+                    core, "_fsync_directory", side_effect=record_retry_fsync):
+                core.append_manifest_occurrence(
+                    core.CFG.archive, occurrence,
+                    invalidate_occurrence_index=True)
+            assert marker_parent in fsynced
+            assert len(manifest.read_text().splitlines()) == 1
+        finally:
+            core.CFG.home = old_home
+
+
 def test_concurrent_occurrence_publishers_append_once() -> None:
     with tempfile.TemporaryDirectory() as td:
         old_home = core.CFG.home
@@ -4467,6 +4566,8 @@ if __name__ == "__main__":
     test_preupgrade_occurrence_index_migrates_once()
     test_occurrence_index_migration_resumes_after_crash()
     test_occurrence_index_migration_refuses_conflicts()
+    test_doctor_append_invalidates_occurrence_index()
+    test_absent_occurrence_marker_is_refsynced_before_doctor_append()
     test_concurrent_occurrence_publishers_append_once()
     test_sidecar_fsync_failure_preserves_durable_occurrence()
     test_occurrence_publish_waits_for_manifest_directory_fsync()
@@ -4493,4 +4594,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("48 passed, 0 failed")
+    print("50 passed, 0 failed")

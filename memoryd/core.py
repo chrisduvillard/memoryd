@@ -445,7 +445,8 @@ def append_manifest_occurrence(
         *, pre_append: Callable[[], bool] | None = None,
         post_append: Callable[[], bool] | None = None,
         skip_if: Callable[[], bool] | None = None,
-        preserve_on_post_error: bool = False) -> bool:
+        preserve_on_post_error: bool = False,
+        invalidate_occurrence_index: bool = False) -> bool:
     manifest = archive_root / "manifest.jsonl"
     line = (json.dumps(occurrence, sort_keys=True, default=str) + "\n").encode()
     with _manifest_file_lock(manifest):
@@ -453,6 +454,8 @@ def append_manifest_occurrence(
             return False
         if pre_append is not None and not pre_append():
             raise ValueError("manifest append precondition failed")
+        if invalidate_occurrence_index:
+            _invalidate_occurrence_index_unlocked(archive_root)
         with manifest.open("a+b") as handle:
             handle.seek(0, os.SEEK_END)
             original_size = handle.tell()
@@ -635,6 +638,27 @@ def _manifest_occurrence_identity(value: dict) -> tuple[object, tuple, object]:
 
 def _occurrence_index_marker(archive_root: Path) -> Path:
     return archive_root / "occurrence-identities" / ".index-complete"
+
+
+def _invalidate_occurrence_index_unlocked(archive_root: Path) -> bool:
+    marker = _occurrence_index_marker(archive_root)
+    removed = True
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        removed = False
+    # Absence may be the visible result of an earlier unlink whose parent
+    # fsync failed. Re-fsync that absence before any bypass append proceeds.
+    if marker.parent.is_dir():
+        _fsync_directory(marker.parent)
+    return removed
+
+
+def invalidate_occurrence_index(archive_root: Path) -> bool:
+    """Durably invalidate the derived occurrence index under manifest lock."""
+    manifest = archive_root / "manifest.jsonl"
+    with _manifest_file_lock(manifest):
+        return _invalidate_occurrence_index_unlocked(archive_root)
 
 
 def _occurrence_index_is_complete(archive_root: Path) -> bool:
