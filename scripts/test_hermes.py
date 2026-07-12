@@ -14,7 +14,7 @@ Exercises the full provider lifecycle:
   on_pre_compress -> snapshot captured before context death
   SUBAGENT context -> writes skipped entirely
   on_session_end -> flush + extraction_run event (mock LLM)
-  daemon-down fail-open -> visible marker once, spool, recovery flush
+  daemon-down fail-open -> visible marker once, durable spool, recovery flush
 """
 from __future__ import annotations
 
@@ -217,8 +217,9 @@ def main() -> int:
     check("second failure silent", down.prefetch("x", session_id="hermes-down-1") == "")
     down.sync_turn("offline turn", "offline answer", session_id="hermes-down-1")
     time.sleep(1.0)
-    check("offline turns spooled in memory", len(down._spool) >= 1
-          or not down._q.empty())
+    counts = down._spool_store.counts()
+    check("offline turns durably spooled",
+          counts["incoming"] + counts["processing"] >= 1, str(counts))
     down._url = recovery_url
     ok = wait_for(lambda: (r := q1(
         "SELECT count(*) AS n FROM events WHERE session_id='hermes-down-1' AND "

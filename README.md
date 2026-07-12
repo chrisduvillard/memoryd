@@ -148,6 +148,7 @@ memoryd status                     # daemon, DB, hooks, autostart, spool states
 memoryd doctor                     # read-only integrity inspection
 memoryd doctor --repair            # apply only conservative, evidence-preserving repairs
 python scripts/test_durable_capture.py # DB-free durable capture and recovery
+python scripts/test_hermes_spool.py # DB-free Hermes crash-durable queue checks
 python scripts/smoke_test.py       # storage integrity, recall, canaries
 python scripts/test_extract.py     # fact extraction and promotion rules
 python scripts/test_vector.py      # semantic search and index rebuild
@@ -156,8 +157,9 @@ python scripts/test_bitter_lesson.py # DB-free checks: model/policy/eval extensi
 ```
 
 The DB-backed scripts write throwaway `smoketest`/test rows into your live
-database; use a fresh install. `test_durable_capture.py` and
-`test_bitter_lesson.py` are DB-free and need no daemon.
+database; use a fresh install. `test_durable_capture.py`,
+`test_hermes_spool.py`, and `test_bitter_lesson.py` are DB-free and need no
+daemon.
 
 </details>
 

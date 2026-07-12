@@ -316,8 +316,8 @@ verbatim ABC from the Hermes repo, vendored in scripts/_stubs/):
   with one visible marker.
 - **sync_turn** — every turn to the ledger via `/capture-events` (agent=
   'hermes'); oversize text auto-archived content-addressed + truncated
-  inline; in-memory spool (500) while the daemon is down, flushed on
-  recovery.
+  inline; synchronously fsynced to the profile-scoped disk spool before the
+  hook returns, then retried with persisted backoff while the daemon is down.
 - **on_pre_compress** — snapshot captured BEFORE Hermes compresses context
   (the PreCompact equivalent).
 - **on_memory_write** — built-in MEMORY.md/USER.md writes mirrored to

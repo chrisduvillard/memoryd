@@ -6,6 +6,20 @@ on:
   pull_request:
 
 jobs:
+  hermes-spool:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run cross-platform Hermes durable-spool checks
+        run: python scripts/test_hermes_spool.py
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -46,7 +60,10 @@ jobs:
         run: pip install .            # also validates the wheel builds/installs
 
       - name: Run DB-free durable-capture checks
-        run: python scripts/test_durable_capture.py
+        run: |
+          python scripts/test_durable_capture.py
+          python scripts/test_hermes_spool.py
+          python scripts/test_bitter_lesson.py
 
       - name: Compile check
         run: python -m compileall memoryd scripts
