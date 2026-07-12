@@ -444,7 +444,8 @@ def append_manifest_occurrence(
         archive_root: Path, occurrence: dict,
         *, pre_append: Callable[[], bool] | None = None,
         post_append: Callable[[], bool] | None = None,
-        skip_if: Callable[[], bool] | None = None) -> bool:
+        skip_if: Callable[[], bool] | None = None,
+        preserve_on_post_error: bool = False) -> bool:
     manifest = archive_root / "manifest.jsonl"
     line = (json.dumps(occurrence, sort_keys=True, default=str) + "\n").encode()
     with _manifest_file_lock(manifest):
@@ -470,9 +471,10 @@ def append_manifest_occurrence(
                 _fsync_directory(manifest.parent)
                 valid = post_append is None or post_append()
             except Exception:
-                handle.truncate(original_size)
-                handle.flush()
-                os.fsync(handle.fileno())
+                if not preserve_on_post_error:
+                    handle.truncate(original_size)
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 raise
             if not valid:
                 handle.truncate(original_size)
@@ -615,9 +617,26 @@ def _occurrence_request_metadata(value: dict) -> tuple[object, object, object]:
             value.get("request_body_sha256"))
 
 
+def _occurrence_identity(
+        sha256: object, request_metadata: tuple[object, object, object],
+        fonds_path: object) -> tuple[object, tuple[object, object, object], object]:
+    # Request-backed event paths may drift across midnight retries; their
+    # canonical request digest is the durable identity. Transcript jobs have
+    # no request digest, so their stable fonds path remains part of identity.
+    stable_fonds = None if request_metadata[0] is not None else fonds_path
+    return sha256, request_metadata, stable_fonds
+
+
+def _manifest_occurrence_identity(value: dict) -> tuple[object, tuple, object]:
+    return _occurrence_identity(
+        value.get("sha256"), _occurrence_request_metadata(value),
+        value.get("fonds_path"))
+
+
 def _claim_archive_occurrence(
         archive_root: Path, ingest_job_id: str, sha256: str,
         request_metadata: tuple[object, object, object],
+        fonds_path: str,
         *, legacy_fallback: bool) -> dict:
     identity_dir = archive_root / "occurrence-identities"
     _mkdir_durable(identity_dir)
@@ -630,10 +649,13 @@ def _claim_archive_occurrence(
         with _manifest_file_lock(path):
             existing = _read_occurrence_identity(
                 archive_root, ingest_job_id)
-            expected = (sha256, request_metadata)
+            expected = _occurrence_identity(
+                sha256, request_metadata, fonds_path)
             if existing is not None:
-                actual = (existing["sha256"],
-                          _occurrence_request_metadata(existing))
+                actual = _occurrence_identity(
+                    existing["sha256"],
+                    _occurrence_request_metadata(existing),
+                    existing.get("fonds_path"))
                 if actual != expected:
                     raise ArchiveOccurrenceCollision(
                         "archive occurrence identity collision")
@@ -642,8 +664,7 @@ def _claim_archive_occurrence(
                         archive_root, ingest_job_id)
                     if matches:
                         identities = {
-                            (match.get("sha256"),
-                             _occurrence_request_metadata(match))
+                            _manifest_occurrence_identity(match)
                             for match in matches}
                         if identities != {expected}:
                             raise ArchiveOccurrenceCollision(
@@ -658,8 +679,7 @@ def _claim_archive_occurrence(
                     archive_root, ingest_job_id)
                 if matches:
                     identities = {
-                        (match.get("sha256"),
-                         _occurrence_request_metadata(match))
+                        _manifest_occurrence_identity(match)
                         for match in matches}
                     if identities != {expected}:
                         raise ArchiveOccurrenceCollision(
@@ -671,6 +691,8 @@ def _claim_archive_occurrence(
                 "request_id": request_metadata[0],
                 "request_endpoint": request_metadata[1],
                 "request_body_sha256": request_metadata[2],
+                "fonds_path": (
+                    None if request_metadata[0] is not None else fonds_path),
                 "published": published,
             }
             _write_occurrence_identity(archive_root, claim)
@@ -679,15 +701,17 @@ def _claim_archive_occurrence(
 
 def _mark_archive_occurrence_published(
         archive_root: Path, ingest_job_id: str, sha256: str,
-        request_metadata: tuple[object, object, object]) -> None:
+        request_metadata: tuple[object, object, object],
+        fonds_path: str) -> None:
     path = _occurrence_identity_path(archive_root, ingest_job_id)
     with _manifest_file_lock(path):
         existing = _read_occurrence_identity(
             archive_root, ingest_job_id)
-        if (existing is None or
-                (existing["sha256"],
-                 _occurrence_request_metadata(existing)) !=
-                (sha256, request_metadata)):
+        if (existing is None or _occurrence_identity(
+                existing["sha256"],
+                _occurrence_request_metadata(existing),
+                existing.get("fonds_path")) != _occurrence_identity(
+                    sha256, request_metadata, fonds_path)):
             raise ArchiveOccurrenceCollision(
                 "archive occurrence identity collision")
         if not existing["published"]:
@@ -695,11 +719,26 @@ def _mark_archive_occurrence_published(
                 archive_root, {**existing, "published": True})
 
 
+def _archive_occurrence_is_published(
+        archive_root: Path, ingest_job_id: str, sha256: str,
+        request_metadata: tuple[object, object, object],
+        fonds_path: str) -> bool:
+    existing = _read_occurrence_identity(archive_root, ingest_job_id)
+    if (existing is None or _occurrence_identity(
+            existing["sha256"], _occurrence_request_metadata(existing),
+            existing.get("fonds_path")) != _occurrence_identity(
+                sha256, request_metadata, fonds_path)):
+        raise ArchiveOccurrenceCollision(
+            "archive occurrence identity collision")
+    return existing["published"]
+
+
 def archive_bytes(data: bytes, mime: str, fonds_path: str,
                   ingest_job_id: str | None = None,
                   request_id: str | None = None,
                   request_endpoint: str | None = None,
-                  request_body_sha256: str | None = None) -> str:
+                  request_body_sha256: str | None = None,
+                  legacy_ingest_identity: bool = False) -> str:
     """Store blob content-addressed; append occurrence; symlink into fonds.
 
     Returns sha256. Identical bytes share one immutable object while every
@@ -724,7 +763,8 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
     if ingest_job_id is not None:
         occurrence_claim = _claim_archive_occurrence(
             CFG.archive, ingest_job_id, sha, request_metadata,
-            legacy_fallback=request_id is None)
+            fonds_path.replace("\\", "/"),
+            legacy_fallback=legacy_ingest_identity)
     obj_dir, obj_path = _archive_object_namespace(
         CFG.archive, sha, create=True)
     trusted_archive_root = CFG.archive.resolve()
@@ -788,15 +828,23 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                         if ingest_job_id is not None:
                             _mark_archive_occurrence_published(
                                 CFG.archive, ingest_job_id, sha,
-                                request_metadata)
+                                request_metadata,
+                                fonds_path.replace("\\", "/"))
                         return True
 
                     occurrence_published = append_manifest_occurrence(
                         CFG.archive, occurrence,
+                        skip_if=(
+                            (lambda: _archive_occurrence_is_published(
+                                CFG.archive, ingest_job_id, sha,
+                                request_metadata,
+                                fonds_path.replace("\\", "/")))
+                            if ingest_job_id is not None else None),
                         pre_append=lambda: _archive_object_still_bound(
                             obj_handle, obj_path, obj_stat,
                             CFG.archive, sha),
-                        post_append=finalize_occurrence)
+                        post_append=finalize_occurrence,
+                        preserve_on_post_error=True)
             except Exception as exc:
                 binding_failure = (
                     isinstance(exc, ValueError) and

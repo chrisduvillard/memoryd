@@ -1572,7 +1572,8 @@ def test_legacy_occurrence_conflicts_are_not_first_match_accepted() -> None:
             try:
                 core.archive_bytes(
                     b"A", "text/plain", "legacy/retry.txt",
-                    ingest_job_id=ingest_id)
+                    ingest_job_id=ingest_id,
+                    legacy_ingest_identity=True)
             except core.ArchiveOccurrenceCollision:
                 pass
             else:
@@ -1617,14 +1618,125 @@ def test_current_archive_occurrence_lookup_is_keyed() -> None:
                     b"keyed event", "text/plain", "current/first.txt", **kwargs)
                 retry = core.archive_bytes(
                     b"keyed event", "text/plain", "current/retry.txt", **kwargs)
+                transcript_first = core.archive_bytes(
+                    b"schema-v2 transcript", "application/jsonl",
+                    "claude-code/2026/07/13/session.jsonl",
+                    ingest_job_id="schema-v2-current-job")
+                transcript_retry = core.archive_bytes(
+                    b"schema-v2 transcript", "application/jsonl",
+                    "claude-code/2026/07/13/session.jsonl",
+                    ingest_job_id="schema-v2-current-job")
             assert first == retry
+            assert transcript_first == transcript_retry
             sidecars = list(
                 (core.CFG.archive / "occurrence-identities").glob("*.json"))
-            assert len(sidecars) == 1
-            assert json.loads(sidecars[0].read_text())["published"] is True
+            assert len(sidecars) == 2
+            assert all(json.loads(path.read_text())["published"] is True
+                       for path in sidecars)
             matching = [json.loads(line) for line in manifest.read_text().splitlines()
                         if json.loads(line).get("ingest_job_id") == kwargs["ingest_job_id"]]
             assert len(matching) == 1
+        finally:
+            core.CFG.home = old_home
+
+
+def test_concurrent_occurrence_publishers_append_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+        real_claim = core._claim_archive_occurrence
+        kwargs = {
+            "ingest_job_id": "req-concurrent:event:0",
+            "request_id": "req-concurrent",
+            "request_endpoint": "/capture-events",
+            "request_body_sha256": "6" * 64,
+        }
+
+        def synchronized_claim(*args, **claim_kwargs):
+            claim = real_claim(*args, **claim_kwargs)
+            barrier.wait(timeout=5)
+            return claim
+
+        def publish() -> None:
+            try:
+                core.archive_bytes(
+                    b"one concurrent occurrence", "text/plain",
+                    "concurrent/one.txt", **kwargs)
+            except Exception as exc:
+                errors.append(exc)
+
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_claim_archive_occurrence",
+                    side_effect=synchronized_claim):
+                threads = [threading.Thread(target=publish) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+            assert not errors, errors
+            manifest = core.CFG.archive / "manifest.jsonl"
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") ==
+                       kwargs["ingest_job_id"]]
+            assert len(matches) == 1
+        finally:
+            core.CFG.home = old_home
+
+
+def test_sidecar_fsync_failure_preserves_durable_occurrence() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        real_fsync = core._fsync_directory
+        identity_dir = core.CFG.archive / "occurrence-identities"
+        identity_fsyncs = 0
+        kwargs = {
+            "ingest_job_id": "req-sidecar-fsync:event:0",
+            "request_id": "req-sidecar-fsync",
+            "request_endpoint": "/capture-events",
+            "request_body_sha256": "7" * 64,
+        }
+
+        def fail_published_sidecar_fsync(path: Path) -> None:
+            nonlocal identity_fsyncs
+            if path == identity_dir:
+                identity_fsyncs += 1
+                if identity_fsyncs == 2:
+                    raise OSError(errno.EIO, "published sidecar fsync failed")
+            real_fsync(path)
+
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_fsync_directory",
+                    side_effect=fail_published_sidecar_fsync):
+                try:
+                    core.archive_bytes(
+                        b"audit survives", "text/plain",
+                        "sidecar/first.txt", **kwargs)
+                except OSError as exc:
+                    assert exc.errno == errno.EIO
+                else:
+                    raise AssertionError("sidecar fsync failure suppressed")
+            manifest = core.CFG.archive / "manifest.jsonl"
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") ==
+                       kwargs["ingest_job_id"]]
+            assert len(matches) == 1
+
+            core.archive_bytes(
+                b"audit survives", "text/plain",
+                "sidecar/retry.txt", **kwargs)
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") ==
+                       kwargs["ingest_job_id"]]
+            assert len(matches) == 1
+            sidecar = next(identity_dir.glob("*.json"))
+            assert json.loads(sidecar.read_text())["published"] is True
         finally:
             core.CFG.home = old_home
 
@@ -1693,6 +1805,7 @@ def test_false_occurrence_claim_cannot_bless_provisional_line() -> None:
             core.CFG.ensure_dirs()
             claim = core._claim_archive_occurrence(
                 core.CFG.archive, ingest_id, sha, metadata,
+                "provisional/line.txt",
                 legacy_fallback=False)
             assert claim["published"] is False
             occurrence = {
@@ -1721,6 +1834,7 @@ def test_false_occurrence_claim_cannot_bless_provisional_line() -> None:
             def recover_false_claim() -> None:
                 core._claim_archive_occurrence(
                     core.CFG.archive, ingest_id, sha, metadata,
+                    "provisional/line.txt",
                     legacy_fallback=False)
                 recovery_done.set()
 
@@ -4214,6 +4328,8 @@ if __name__ == "__main__":
     test_archive_occurrence_identity_survives_path_drift()
     test_legacy_occurrence_conflicts_are_not_first_match_accepted()
     test_current_archive_occurrence_lookup_is_keyed()
+    test_concurrent_occurrence_publishers_append_once()
+    test_sidecar_fsync_failure_preserves_durable_occurrence()
     test_occurrence_publish_waits_for_manifest_directory_fsync()
     test_false_occurrence_claim_cannot_bless_provisional_line()
     test_lost_response_retries_return_committed_mutations()
@@ -4238,4 +4354,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("43 passed, 0 failed")
+    print("45 passed, 0 failed")
