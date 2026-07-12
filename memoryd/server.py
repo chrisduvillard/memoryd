@@ -23,7 +23,13 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import ArchiveOccurrenceCollision, CFG, new_id, pool
+from .core import (
+    ArchiveOccurrenceCollision,
+    CFG,
+    find_archive_request_identity,
+    new_id,
+    pool,
+)
 from .ingest import drain_spool
 from .recall import build_packet
 from .spool import (
@@ -81,9 +87,17 @@ def _start_idempotent_request(conn, *, request_id: str,
         "SELECT endpoint, body_sha256, response FROM api_request_ledger "
         "WHERE request_id=%s", (request_id,)).fetchone()
     try:
-        durable = find_request_identity(CFG.spool, request_id)
-    except JobIdentityCollision as exc:
+        spool_identity = find_request_identity(CFG.spool, request_id)
+        archive_identity = find_archive_request_identity(
+            CFG.archive, request_id)
+    except (JobIdentityCollision, ArchiveOccurrenceCollision) as exc:
         raise RequestIdentityCollision("request_id collision") from exc
+    durable_identities = {
+        identity for identity in (spool_identity, archive_identity)
+        if identity is not None}
+    if len(durable_identities) > 1:
+        raise RequestIdentityCollision("request_id collision")
+    durable = next(iter(durable_identities), None)
     if row is None:
         if durable is None:
             return None
@@ -122,6 +136,7 @@ def _store_capture_events(conn, body: dict) -> int:
                "session_start", "session_end", "external_note", "delegation"}
     agent = body.get("agent", "unknown")
     project = body.get("project")
+    request_identity = _request_identity(body)
     stored = 0
     for ev in body["events"][:200]:
         envelope = event_to_envelope({
@@ -152,7 +167,16 @@ def _store_capture_events(conn, body: dict) -> int:
                 f"{agent}/{day:%Y/%m/%d}/{body['session_id']}-{stored}.txt",
                 ingest_job_id=(
                     f"{body['request_id']}:event:{stored}"
-                    if "request_id" in body else None))
+                    if request_identity is not None else None),
+                request_id=(
+                    request_identity[0]
+                    if request_identity is not None else None),
+                request_endpoint=(
+                    "/capture-events"
+                    if request_identity is not None else None),
+                request_body_sha256=(
+                    request_identity[1]
+                    if request_identity is not None else None))
             payload = {**payload, "text": text[:4000], "truncated": True}
         append_event(
             conn, kind=kind, session_id=body["session_id"],

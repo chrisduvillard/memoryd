@@ -486,6 +486,72 @@ def _manifest_occurrence(
     return None
 
 
+def find_archive_request_identity(
+        archive_root: Path, request_id: str) -> tuple[str, str] | None:
+    """Return a durable API identity by keyed lookup, without scanning history."""
+    identity_path = (
+        archive_root / "request-identities" /
+        f"{hashlib.sha256(request_id.encode()).hexdigest()}.json")
+    try:
+        value = json.loads(identity_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise ArchiveOccurrenceCollision(
+            "invalid archive request identity") from exc
+    if (not isinstance(value, dict) or
+            value.get("request_id") != request_id or
+            not isinstance(value.get("endpoint"), str) or
+            not isinstance(value.get("body_sha256"), str)):
+        raise ArchiveOccurrenceCollision(
+            "invalid archive request identity")
+    digest = value["body_sha256"]
+    if (len(digest) != 64 or
+            any(c not in "0123456789abcdef" for c in digest)):
+        raise ArchiveOccurrenceCollision(
+            "invalid archive request identity")
+    return value["endpoint"], digest
+
+
+def claim_archive_request_identity(
+        archive_root: Path, request_id: str,
+        endpoint: str, body_sha256: str) -> None:
+    """Durably claim one archive-backed API identity before archive mutation."""
+    if (not request_id or not endpoint or len(body_sha256) != 64 or
+            any(c not in "0123456789abcdef" for c in body_sha256)):
+        raise ValueError("invalid archive request identity")
+    identity_dir = archive_root / "request-identities"
+    _mkdir_durable(identity_dir)
+    identity_path = (
+        identity_dir /
+        f"{hashlib.sha256(request_id.encode()).hexdigest()}.json")
+    with _manifest_file_lock(identity_path):
+        existing = find_archive_request_identity(
+            archive_root, request_id)
+        expected = (endpoint, body_sha256)
+        if existing is not None:
+            if existing != expected:
+                raise ArchiveOccurrenceCollision(
+                    "archive request identity collision")
+            return
+        value = {
+            "request_id": request_id,
+            "endpoint": endpoint,
+            "body_sha256": body_sha256,
+        }
+        temporary = identity_path.with_name(
+            f".{identity_path.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, identity_path)
+            _fsync_directory(identity_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def _manifest_has_occurrence(archive_root: Path, occurrence: dict) -> bool:
     existing = _manifest_occurrence(
         archive_root, occurrence["ingest_job_id"])
@@ -498,18 +564,41 @@ def _manifest_has_occurrence(archive_root: Path, occurrence: dict) -> bool:
 
 
 def archive_bytes(data: bytes, mime: str, fonds_path: str,
-                  ingest_job_id: str | None = None) -> str:
+                  ingest_job_id: str | None = None,
+                  request_id: str | None = None,
+                  request_endpoint: str | None = None,
+                  request_body_sha256: str | None = None) -> str:
     """Store blob content-addressed; append occurrence; symlink into fonds.
 
     Returns sha256. Identical bytes share one immutable object while every
     archive call records its own occurrence.
     """
+    request_metadata = (
+        request_id, request_endpoint, request_body_sha256)
+    if any(value is not None for value in request_metadata):
+        if not all(isinstance(value, str) and value
+                   for value in request_metadata):
+            raise ValueError("incomplete archive request identity")
+        if (len(request_body_sha256) != 64 or
+                any(c not in "0123456789abcdef"
+                    for c in request_body_sha256)):
+            raise ValueError("invalid archive request body digest")
     sha = hashlib.sha256(data).hexdigest()
     if ingest_job_id is not None:
         existing = _manifest_occurrence(CFG.archive, ingest_job_id)
         if existing is not None and existing.get("sha256") != sha:
             raise ArchiveOccurrenceCollision(
                 "archive occurrence identity collision")
+        if (existing is not None and request_id is not None and
+                (existing.get("request_id"),
+                 existing.get("request_endpoint"),
+                 existing.get("request_body_sha256")) != request_metadata):
+            raise ArchiveOccurrenceCollision(
+                "archive request identity collision")
+    if request_id is not None:
+        claim_archive_request_identity(
+            CFG.archive, request_id, request_endpoint,
+            request_body_sha256)
     obj_dir, obj_path = _archive_object_namespace(
         CFG.archive, sha, create=True)
     trusted_archive_root = CFG.archive.resolve()
@@ -555,6 +644,12 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                     "fonds_path": fonds_path.replace("\\", "/"),
                     "ingest_job_id": ingest_job_id,
                 }
+                if request_id is not None:
+                    occurrence.update({
+                        "request_id": request_id,
+                        "request_endpoint": request_endpoint,
+                        "request_body_sha256": request_body_sha256,
+                    })
                 occurrence_published = append_manifest_occurrence(
                     CFG.archive, occurrence,
                     skip_if=(

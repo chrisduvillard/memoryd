@@ -1057,16 +1057,44 @@ def test_extraction_request_identity_is_durable() -> None:
                 assert len(jobs) == 1
                 assert jobs[0]["job_id"] == "req-extract-1"
 
-                manifest_path = next(
+                canonical_job = next(
                     (core.CFG.spool / "incoming").glob("*.json"))
-                mismatched = {**jobs[0], "request_body_sha256": "f" * 64}
-                manifest_path.write_text(
+                moved_job = canonical_job.with_name(
+                    f"{canonical_job.stem}-collision{canonical_job.suffix}")
+                os.replace(canonical_job, moved_job)
+
+                real_glob = Path.glob
+                history = core.CFG.spool / "request-identities"
+                for index in range(100):
+                    (history / f"history-{index}.json").write_text(
+                        json.dumps({
+                            "job_id": f"old-{index}",
+                            "request_endpoint": "/extract",
+                            "request_body_sha256": "0" * 64,
+                        }), encoding="utf-8")
+
+                def reject_broad_spool_scan(path: Path, pattern: str):
+                    if pattern == "*.json":
+                        raise AssertionError("request lookup scanned spool state")
+                    return real_glob(path, pattern)
+
+                with patch.object(Path, "glob", new=reject_broad_spool_scan):
+                    assert spool.find_request_identity(
+                        core.CFG.spool, "req-extract-1") == (
+                            "/extract",
+                            jobs[0]["request_body_sha256"])
+
+                claim_path = next(
+                    (core.CFG.spool / "request-claims").glob("*.json"))
+                saved_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+                mismatched = {**saved_claim, "body_sha256": "f" * 64}
+                claim_path.write_text(
                     json.dumps(mismatched), encoding="utf-8")
                 code, split_identity = post(httpd, {
                     "request_id": "req-extract-1", "session_id": "extract-idem"})
                 assert code == 409
                 assert split_identity["error"] == "request_id collision"
-                manifest_path.write_text(json.dumps(jobs[0]), encoding="utf-8")
+                claim_path.write_text(json.dumps(saved_claim), encoding="utf-8")
 
                 # Simulate a drain that completes before the API transaction
                 # commits, followed by loss of that transaction. The durable
@@ -1117,6 +1145,56 @@ def test_extraction_request_identity_is_durable() -> None:
                     server.CAPTURE_Q.task_done()
 
 
+def test_extraction_claim_precedes_collision_safe_move() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        digest = "1" * 64
+        job = spool.enqueue_extraction(
+            spool_root=root, session_id="claim-order",
+            request_id="req-claim-order", request_endpoint="/extract",
+            request_body_sha256=digest)
+        claim_path = next((root / "request-claims").glob("*.json"))
+        claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        claim_path.write_text(
+            json.dumps({**claim, "published": False}), encoding="utf-8")
+
+        incoming = next((root / "incoming").glob("*.json"))
+        blocking = root / "processing" / incoming.name
+        blocking.write_text(json.dumps({
+            "schema_version": 2, "job_id": "blocking-job",
+            "kind": "extraction", "created_at": job["created_at"],
+            "session_id": "blocking", "attempts": 0,
+            "last_error": None, "next_attempt_at": None,
+        }), encoding="utf-8")
+
+        with patch.object(
+                spool, "_sync_replaced_path",
+                side_effect=RuntimeError("crash immediately after move")):
+            try:
+                spool.claim_next(root)
+            except RuntimeError as exc:
+                assert "after move" in str(exc)
+            else:
+                raise AssertionError("post-move crash was not injected")
+
+        durable_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        assert durable_claim["published"] is True
+        moved = [path for path in (root / "processing").glob("*.json")
+                 if path != blocking]
+        assert len(moved) == 1
+        assert json.loads(moved[0].read_text())["job_id"] == "req-claim-order"
+        retry = spool.enqueue_extraction(
+            spool_root=root, session_id="claim-order",
+            request_id="req-claim-order", request_endpoint="/extract",
+            request_body_sha256=digest)
+        assert retry["duplicate"] is True
+        assert not list((root / "incoming").glob("*.json"))
+        moved_after_retry = [
+            path for path in (root / "processing").glob("*.json")
+            if path != blocking]
+        assert moved_after_retry == moved
+
+
 def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
     class Result:
         def __init__(self, row=None):
@@ -1132,6 +1210,7 @@ def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
             self.committed_events = 0
             self.pending_request = None
             self.fail_first_record = True
+            self.misses = 0
 
         def __enter__(self):
             return self
@@ -1157,6 +1236,9 @@ def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
                     request_id, endpoint, digest,
                     json.loads(response) if isinstance(response, str) else response)
                 return Result()
+            if normalized.startswith("insert into miss_signals"):
+                self.misses += 1
+                return Result()
             raise AssertionError(f"unexpected SQL: {sql}")
 
         def commit(self) -> None:
@@ -1177,7 +1259,6 @@ def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
     class MidnightClock:
         moments = iter((
             datetime(2026, 7, 12, 23, 59, 59, tzinfo=timezone.utc),
-            datetime(2026, 7, 12, 23, 59, 59, tzinfo=timezone.utc),
             datetime(2026, 7, 13, 0, 0, 1, tzinfo=timezone.utc),
         ))
 
@@ -1185,9 +1266,9 @@ def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
         def now(cls, _timezone):
             return next(cls.moments)
 
-    def post(httpd, body: dict) -> tuple[int, dict]:
+    def post(httpd, body: dict, path: str = "/capture-events") -> tuple[int, dict]:
         request = urllib.request.Request(
-            f"http://127.0.0.1:{httpd.server_port}/capture-events",
+            f"http://127.0.0.1:{httpd.server_port}{path}",
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
         try:
@@ -1223,6 +1304,28 @@ def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
                 assert code == 500
                 assert "forced rollback" in failed["error"], failed
 
+                same_text_changed_body = {
+                    **body, "session_id": "changed-session", "agent": "codex"}
+                code, collision = post(httpd, same_text_changed_body)
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert conn.committed_events == 0
+
+                code, collision = post(httpd, {
+                    "request_id": body["request_id"],
+                    "session_id": "miss-cross", "signal": "manual"},
+                    path="/miss")
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert conn.misses == 0
+
+                code, collision = post(httpd, {
+                    "request_id": body["request_id"],
+                    "session_id": "extract-cross"}, path="/extract")
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert not list((core.CFG.spool / "incoming").glob("*.json"))
+
                 changed = {**body, "events": [{
                     "kind": "user_message",
                     "payload": {"text": "Y" * 5000}}]}
@@ -1233,18 +1336,36 @@ def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
 
                 code, retried = post(httpd, body)
                 assert code == 200 and retried["duplicate"] is False
+
+                reserved_body = {
+                    "request_id": "req-reserved-before-archive",
+                    "session_id": "reserved", "events": [{
+                        "kind": "user_message",
+                        "payload": {"text": "reservation survived"}}]}
+                reserved_digest = server._request_identity(reserved_body)[1]
+                core.claim_archive_request_identity(
+                    core.CFG.archive, reserved_body["request_id"],
+                    "/capture-events", reserved_digest)
+                code, resumed = post(httpd, reserved_body)
+                assert code == 200
+                assert resumed["duplicate"] is False
+                assert resumed["stored"] == 1
             entries = [json.loads(line) for line in
                        (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
             assert len(entries) == 1
             assert entries[0]["ingest_job_id"] == (
                 "req-oversize-rollback:event:0")
+            assert entries[0]["request_id"] == "req-oversize-rollback"
+            assert entries[0]["request_endpoint"] == "/capture-events"
+            assert entries[0]["request_body_sha256"] == (
+                server._request_identity(body)[1])
             assert entries[0]["fonds_path"] == (
                 "hermes/2026/07/12/oversize-session-0.txt")
             objects = [path for path in
                        (core.CFG.archive / "objects" / "sha256").rglob("*")
                        if path.is_file()]
             assert len(objects) == 1
-            assert conn.committed_events == 1
+            assert conn.committed_events == 2
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -1262,11 +1383,15 @@ def test_archive_occurrence_identity_survives_path_drift() -> None:
             core.archive_bytes(
                 b"same oversize event", "text/plain",
                 "hermes/2026/07/12/session-0.txt",
-                ingest_job_id=occurrence_id)
+                ingest_job_id=occurrence_id, request_id="req-midnight",
+                request_endpoint="/capture-events",
+                request_body_sha256="0" * 64)
             core.archive_bytes(
                 b"same oversize event", "text/plain",
                 "hermes/2026/07/13/session-0.txt",
-                ingest_job_id=occurrence_id)
+                ingest_job_id=occurrence_id, request_id="req-midnight",
+                request_endpoint="/capture-events",
+                request_body_sha256="0" * 64)
             entries = [json.loads(line) for line in
                        (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
             assert len(entries) == 1
@@ -1274,6 +1399,37 @@ def test_archive_occurrence_identity_survives_path_drift() -> None:
                 "hermes/2026/07/12/session-0.txt")
             second_view = core.CFG.archive / "fonds/hermes/2026/07/13/session-0.txt"
             assert not os.path.lexists(second_view)
+
+            manifest = core.CFG.archive / "manifest.jsonl"
+            real_read_text = Path.read_text
+
+            def reject_manifest_scan(path: Path, *args, **kwargs):
+                if path == manifest:
+                    raise AssertionError("request lookup scanned full manifest")
+                return real_read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", new=reject_manifest_scan):
+                assert core.find_archive_request_identity(
+                    core.CFG.archive, "req-midnight") == (
+                        "/capture-events", "0" * 64)
+            sidecars = list(
+                (core.CFG.archive / "request-identities").glob("*.json"))
+            assert len(sidecars) == 1
+
+            core.archive_bytes(
+                b"legacy occurrence", "text/plain", "legacy/original.txt",
+                ingest_job_id="legacy-job")
+            try:
+                core.archive_bytes(
+                    b"legacy occurrence", "text/plain", "legacy/adopted.txt",
+                    ingest_job_id="legacy-job", request_id="legacy-job",
+                    request_endpoint="/capture-events",
+                    request_body_sha256="0" * 64)
+            except core.ArchiveOccurrenceCollision:
+                pass
+            else:
+                raise AssertionError(
+                    "request identity adopted a legacy occurrence")
         finally:
             core.CFG.home = old_home
 
@@ -3741,6 +3897,7 @@ if __name__ == "__main__":
     test_capture_persists_snapshot_before_acknowledgement()
     test_daemon_mutations_are_request_idempotent()
     test_extraction_request_identity_is_durable()
+    test_extraction_claim_precedes_collision_safe_move()
     test_oversize_capture_retry_has_one_archive_occurrence()
     test_archive_occurrence_identity_survives_path_drift()
     test_lost_response_retries_return_committed_mutations()
@@ -3765,4 +3922,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("37 passed, 0 failed")
+    print("38 passed, 0 failed")

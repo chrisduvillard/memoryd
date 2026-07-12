@@ -113,7 +113,7 @@ def validate_legacy_job(value: object) -> dict:
 def ensure_layout(spool_root: Path) -> dict[str, Path]:
     paths = {name: spool_root / name for name in
              ("blobs", "incoming", "processing", "dead-letter",
-              "request-identities")}
+              "request-identities", "request-claims")}
     _mkdir_durable(spool_root)
     _require_plain_directory(spool_root)
     for path in paths.values():
@@ -507,13 +507,21 @@ def enqueue_extraction(*, spool_root: Path, session_id: str,
     validate_job(job)
     with _state_lock(spool_root):
         if request_id is not None:
-            existing = _find_request_identity_unlocked(
+            claim = _ensure_request_claim_unlocked(
+                paths, request_id, request_endpoint,
+                request_body_sha256, published=False)
+            if claim["published"]:
+                return {**job, "duplicate": True}
+            existing = _find_request_job_unlocked(
                 spool_root, paths, request_id)
             if existing is not None:
                 endpoint, digest, manifest = existing
                 if (manifest.get("kind") == "extraction" and
                         endpoint == request_endpoint and
                         digest == request_body_sha256):
+                    _ensure_request_claim_unlocked(
+                        paths, request_id, request_endpoint,
+                        request_body_sha256, published=True)
                     return {**manifest, "duplicate": True}
                 raise JobIdentityCollision("request_id collision")
             filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
@@ -523,23 +531,75 @@ def enqueue_extraction(*, spool_root: Path, session_id: str,
         else:
             target = paths["incoming"] / f"{job_id}.json"
         _atomic_json(target, job)
+        if request_id is not None:
+            _ensure_request_claim_unlocked(
+                paths, request_id, request_endpoint,
+                request_body_sha256, published=True)
     return {**job, "duplicate": False}
 
 
-def _find_request_identity_unlocked(
+def _request_claim_path(paths: dict[str, Path], request_id: str) -> Path:
+    filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
+    return paths["request-claims"] / filename
+
+
+def _read_request_claim_unlocked(
+        paths: dict[str, Path], request_id: str) -> dict | None:
+    path = _request_claim_path(paths, request_id)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise JobIdentityCollision("request_id collision") from exc
+    if (not isinstance(value, dict) or
+            value.get("request_id") != request_id or
+            not isinstance(value.get("endpoint"), str) or
+            not isinstance(value.get("body_sha256"), str) or
+            type(value.get("published")) is not bool):
+        raise JobIdentityCollision("request_id collision")
+    return value
+
+
+def _ensure_request_claim_unlocked(
+        paths: dict[str, Path], request_id: str,
+        endpoint: str, body_sha256: str, *, published: bool) -> dict:
+    existing = _read_request_claim_unlocked(paths, request_id)
+    if existing is not None:
+        if ((existing["endpoint"], existing["body_sha256"]) !=
+                (endpoint, body_sha256)):
+            raise JobIdentityCollision("request_id collision")
+        if published and not existing["published"]:
+            existing = {**existing, "published": True}
+            _atomic_json(_request_claim_path(paths, request_id), existing)
+        return existing
+    claim = {
+        "request_id": request_id,
+        "endpoint": endpoint,
+        "body_sha256": body_sha256,
+        "published": published,
+    }
+    _atomic_json(_request_claim_path(paths, request_id), claim)
+    return claim
+
+
+def _find_request_job_unlocked(
         spool_root: Path, paths: dict[str, Path],
         request_id: str) -> tuple[str, str, dict] | None:
-    candidates = [*spool_root.glob("*.json")]
-    for state in (
+    filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
+    candidates = [spool_root / filename]
+    candidates.extend(
+        paths[state] / filename for state in (
             "incoming", "processing", "dead-letter",
-            "request-identities"):
-        candidates.extend(paths[state].glob("*.json"))
+            "request-identities"))
     found = None
     for candidate in candidates:
         try:
             manifest = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
             continue
+        except (OSError, ValueError) as exc:
+            raise JobIdentityCollision("request_id collision") from exc
         if (not isinstance(manifest, dict) or
                 manifest.get("job_id") != request_id):
             continue
@@ -560,7 +620,10 @@ def find_request_identity(
     _require_nonempty_string(request_id, "request_id")
     with _state_lock(spool_root):
         paths = ensure_layout(spool_root)
-        found = _find_request_identity_unlocked(
+        claim = _read_request_claim_unlocked(paths, request_id)
+        if claim is not None:
+            return claim["endpoint"], claim["body_sha256"]
+        found = _find_request_job_unlocked(
             spool_root, paths, request_id)
         return None if found is None else found[:2]
 
@@ -619,6 +682,15 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
                 job = {}
             if not ignore_schedule and _scheduled(job):
                 continue
+            if (isinstance(job, dict) and
+                    isinstance(job.get("request_endpoint"), str) and
+                    isinstance(job.get("request_body_sha256"), str) and
+                    isinstance(job.get("job_id"), str)):
+                # The incoming manifest is already durable. Publish its stable
+                # identity before a collision-safe move can change its name.
+                _ensure_request_claim_unlocked(
+                    paths, job["job_id"], job["request_endpoint"],
+                    job["request_body_sha256"], published=True)
             target = _collision_safe_target(paths["processing"], source.name)
             deadline = time.monotonic() + 5
             while True:
