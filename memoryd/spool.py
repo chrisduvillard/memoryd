@@ -298,7 +298,15 @@ def _atomic_json(path: Path, value: dict) -> None:
             json.dump(value, handle, ensure_ascii=False, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
         _fsync_directory(path.parent)
     finally:
         tmp.unlink(missing_ok=True)

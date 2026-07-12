@@ -261,6 +261,18 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _replace_with_retry(source: Path, target: Path) -> None:
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.005)
+
+
 def _redirected_directory(path: Path, path_stat: os.stat_result) -> bool:
     if stat.S_ISLNK(path_stat.st_mode):
         return True
@@ -453,6 +465,9 @@ def append_manifest_occurrence(
             handle.flush()
             os.fsync(handle.fileno())
             try:
+                # On first creation the directory entry must be durable before
+                # a postcondition publishes any keyed completion sidecar.
+                _fsync_directory(manifest.parent)
                 valid = post_append is None or post_append()
             except Exception:
                 handle.truncate(original_size)
@@ -468,13 +483,14 @@ def append_manifest_occurrence(
     return True
 
 
-def _manifest_occurrence(
-        archive_root: Path, ingest_job_id: str) -> dict | None:
+def _manifest_occurrences(
+        archive_root: Path, ingest_job_id: str) -> list[dict]:
     manifest = archive_root / "manifest.jsonl"
     try:
         lines = manifest.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        return None
+        return []
+    matches = []
     for line in lines:
         try:
             existing = json.loads(line)
@@ -482,8 +498,8 @@ def _manifest_occurrence(
             continue
         if (isinstance(existing, dict) and
                 existing.get("ingest_job_id") == ingest_job_id):
-            return existing
-    return None
+            matches.append(existing)
+    return matches
 
 
 def find_archive_request_identity(
@@ -546,21 +562,137 @@ def claim_archive_request_identity(
                 json.dump(value, handle, ensure_ascii=False, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, identity_path)
+            _replace_with_retry(temporary, identity_path)
             _fsync_directory(identity_dir)
         finally:
             temporary.unlink(missing_ok=True)
 
 
-def _manifest_has_occurrence(archive_root: Path, occurrence: dict) -> bool:
-    existing = _manifest_occurrence(
-        archive_root, occurrence["ingest_job_id"])
-    if existing is None:
-        return False
-    if existing.get("sha256") != occurrence["sha256"]:
+def _occurrence_identity_path(
+        archive_root: Path, ingest_job_id: str) -> Path:
+    return (archive_root / "occurrence-identities" /
+            f"{hashlib.sha256(ingest_job_id.encode()).hexdigest()}.json")
+
+
+def _read_occurrence_identity(
+        archive_root: Path, ingest_job_id: str) -> dict | None:
+    path = _occurrence_identity_path(archive_root, ingest_job_id)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
         raise ArchiveOccurrenceCollision(
-            "archive occurrence identity collision")
-    return True
+            "invalid archive occurrence identity") from exc
+    if (not isinstance(value, dict) or
+            value.get("ingest_job_id") != ingest_job_id or
+            not isinstance(value.get("sha256"), str) or
+            type(value.get("published")) is not bool):
+        raise ArchiveOccurrenceCollision(
+            "invalid archive occurrence identity")
+    return value
+
+
+def _write_occurrence_identity(
+        archive_root: Path, value: dict) -> None:
+    path = _occurrence_identity_path(
+        archive_root, value["ingest_job_id"])
+    temporary = path.with_name(
+        f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_with_retry(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _occurrence_request_metadata(value: dict) -> tuple[object, object, object]:
+    return (value.get("request_id"), value.get("request_endpoint"),
+            value.get("request_body_sha256"))
+
+
+def _claim_archive_occurrence(
+        archive_root: Path, ingest_job_id: str, sha256: str,
+        request_metadata: tuple[object, object, object],
+        *, legacy_fallback: bool) -> dict:
+    identity_dir = archive_root / "occurrence-identities"
+    _mkdir_durable(identity_dir)
+    path = _occurrence_identity_path(archive_root, ingest_job_id)
+    manifest = archive_root / "manifest.jsonl"
+    # Publication holds manifest -> occurrence locks in this order. Recovery
+    # must use the same order so it cannot bless a provisional line that may
+    # still be rolled back by the publisher's postcondition.
+    with _manifest_file_lock(manifest):
+        with _manifest_file_lock(path):
+            existing = _read_occurrence_identity(
+                archive_root, ingest_job_id)
+            expected = (sha256, request_metadata)
+            if existing is not None:
+                actual = (existing["sha256"],
+                          _occurrence_request_metadata(existing))
+                if actual != expected:
+                    raise ArchiveOccurrenceCollision(
+                        "archive occurrence identity collision")
+                if not existing["published"]:
+                    matches = _manifest_occurrences(
+                        archive_root, ingest_job_id)
+                    if matches:
+                        identities = {
+                            (match.get("sha256"),
+                             _occurrence_request_metadata(match))
+                            for match in matches}
+                        if identities != {expected}:
+                            raise ArchiveOccurrenceCollision(
+                                "archive occurrence identity collision")
+                        existing = {**existing, "published": True}
+                        _write_occurrence_identity(archive_root, existing)
+                return existing
+
+            published = False
+            if legacy_fallback:
+                matches = _manifest_occurrences(
+                    archive_root, ingest_job_id)
+                if matches:
+                    identities = {
+                        (match.get("sha256"),
+                         _occurrence_request_metadata(match))
+                        for match in matches}
+                    if identities != {expected}:
+                        raise ArchiveOccurrenceCollision(
+                            "archive occurrence identity collision")
+                    published = True
+            claim = {
+                "ingest_job_id": ingest_job_id,
+                "sha256": sha256,
+                "request_id": request_metadata[0],
+                "request_endpoint": request_metadata[1],
+                "request_body_sha256": request_metadata[2],
+                "published": published,
+            }
+            _write_occurrence_identity(archive_root, claim)
+            return claim
+
+
+def _mark_archive_occurrence_published(
+        archive_root: Path, ingest_job_id: str, sha256: str,
+        request_metadata: tuple[object, object, object]) -> None:
+    path = _occurrence_identity_path(archive_root, ingest_job_id)
+    with _manifest_file_lock(path):
+        existing = _read_occurrence_identity(
+            archive_root, ingest_job_id)
+        if (existing is None or
+                (existing["sha256"],
+                 _occurrence_request_metadata(existing)) !=
+                (sha256, request_metadata)):
+            raise ArchiveOccurrenceCollision(
+                "archive occurrence identity collision")
+        if not existing["published"]:
+            _write_occurrence_identity(
+                archive_root, {**existing, "published": True})
 
 
 def archive_bytes(data: bytes, mime: str, fonds_path: str,
@@ -584,21 +716,15 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                     for c in request_body_sha256)):
             raise ValueError("invalid archive request body digest")
     sha = hashlib.sha256(data).hexdigest()
-    if ingest_job_id is not None:
-        existing = _manifest_occurrence(CFG.archive, ingest_job_id)
-        if existing is not None and existing.get("sha256") != sha:
-            raise ArchiveOccurrenceCollision(
-                "archive occurrence identity collision")
-        if (existing is not None and request_id is not None and
-                (existing.get("request_id"),
-                 existing.get("request_endpoint"),
-                 existing.get("request_body_sha256")) != request_metadata):
-            raise ArchiveOccurrenceCollision(
-                "archive request identity collision")
     if request_id is not None:
         claim_archive_request_identity(
             CFG.archive, request_id, request_endpoint,
             request_body_sha256)
+    occurrence_claim = None
+    if ingest_job_id is not None:
+        occurrence_claim = _claim_archive_occurrence(
+            CFG.archive, ingest_job_id, sha, request_metadata,
+            legacy_fallback=request_id is None)
     obj_dir, obj_path = _archive_object_namespace(
         CFG.archive, sha, create=True)
     trusted_archive_root = CFG.archive.resolve()
@@ -650,16 +776,27 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                         "request_endpoint": request_endpoint,
                         "request_body_sha256": request_body_sha256,
                     })
-                occurrence_published = append_manifest_occurrence(
-                    CFG.archive, occurrence,
-                    skip_if=(
-                        (lambda: _manifest_has_occurrence(
-                            CFG.archive, occurrence))
-                        if ingest_job_id is not None else None),
-                    pre_append=lambda: _archive_object_still_bound(
-                        obj_handle, obj_path, obj_stat, CFG.archive, sha),
-                    post_append=lambda: _archive_object_still_bound(
-                        obj_handle, obj_path, obj_stat, CFG.archive, sha))
+                if (occurrence_claim is not None and
+                        occurrence_claim["published"]):
+                    occurrence_published = False
+                else:
+                    def finalize_occurrence() -> bool:
+                        if not _archive_object_still_bound(
+                                obj_handle, obj_path, obj_stat,
+                                CFG.archive, sha):
+                            return False
+                        if ingest_job_id is not None:
+                            _mark_archive_occurrence_published(
+                                CFG.archive, ingest_job_id, sha,
+                                request_metadata)
+                        return True
+
+                    occurrence_published = append_manifest_occurrence(
+                        CFG.archive, occurrence,
+                        pre_append=lambda: _archive_object_still_bound(
+                            obj_handle, obj_path, obj_stat,
+                            CFG.archive, sha),
+                        post_append=finalize_occurrence)
             except Exception as exc:
                 binding_failure = (
                     isinstance(exc, ValueError) and

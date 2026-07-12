@@ -183,6 +183,10 @@ def _archive_with_synchronized_publication(
 
     def synchronized_publish(real_publish):
         def publish(source: Path, target: Path) -> None:
+            if ("occurrence-identities" in target.parts or
+                    "request-identities" in target.parts):
+                real_publish(source, target)
+                return
             ready.wait(timeout=10)
             if winner:
                 core.time.sleep(0.05)
@@ -1431,6 +1435,201 @@ def test_archive_occurrence_identity_survives_path_drift() -> None:
                 raise AssertionError(
                     "request identity adopted a legacy occurrence")
         finally:
+            core.CFG.home = old_home
+
+
+def test_legacy_occurrence_conflicts_are_not_first_match_accepted() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            ingest_id = "legacy-conflicting-occurrence"
+            base = {
+                "bytes": 1, "mime": "text/plain",
+                "first_seen": "2026-07-12T00:00:00+00:00",
+                "occurrence_at": "2026-07-12T00:00:00+00:00",
+                "fonds_path": "legacy/a.txt", "ingest_job_id": ingest_id,
+            }
+            core.append_manifest_occurrence(
+                core.CFG.archive, {**base, "sha256": hashlib.sha256(b"A").hexdigest()})
+            core.append_manifest_occurrence(
+                core.CFG.archive, {
+                    **base, "sha256": hashlib.sha256(b"B").hexdigest(),
+                    "fonds_path": "legacy/b.txt"})
+            try:
+                core.archive_bytes(
+                    b"A", "text/plain", "legacy/retry.txt",
+                    ingest_job_id=ingest_id)
+            except core.ArchiveOccurrenceCollision:
+                pass
+            else:
+                raise AssertionError("conflicting occurrences used first match")
+            assert not list(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+        finally:
+            core.CFG.home = old_home
+
+
+def test_current_archive_occurrence_lookup_is_keyed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            manifest = core.CFG.archive / "manifest.jsonl"
+            manifest.write_text("".join(
+                json.dumps({
+                    "sha256": hashlib.sha256(str(index).encode()).hexdigest(),
+                    "bytes": 1, "mime": "text/plain",
+                    "first_seen": "2026-07-12T00:00:00+00:00",
+                    "occurrence_at": "2026-07-12T00:00:00+00:00",
+                    "fonds_path": f"history/{index}.txt",
+                    "ingest_job_id": f"historical-{index}",
+                }) + "\n" for index in range(500)), encoding="utf-8")
+            real_read_text = Path.read_text
+
+            def reject_manifest_scan(path: Path, *args, **kwargs):
+                if path == manifest:
+                    raise AssertionError("current occurrence scanned manifest")
+                return real_read_text(path, *args, **kwargs)
+
+            kwargs = {
+                "ingest_job_id": "req-keyed:event:0",
+                "request_id": "req-keyed",
+                "request_endpoint": "/capture-events",
+                "request_body_sha256": "2" * 64,
+            }
+            with patch.object(Path, "read_text", new=reject_manifest_scan):
+                first = core.archive_bytes(
+                    b"keyed event", "text/plain", "current/first.txt", **kwargs)
+                retry = core.archive_bytes(
+                    b"keyed event", "text/plain", "current/retry.txt", **kwargs)
+            assert first == retry
+            sidecars = list(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+            assert len(sidecars) == 1
+            assert json.loads(sidecars[0].read_text())["published"] is True
+            matching = [json.loads(line) for line in manifest.read_text().splitlines()
+                        if json.loads(line).get("ingest_job_id") == kwargs["ingest_job_id"]]
+            assert len(matching) == 1
+        finally:
+            core.CFG.home = old_home
+
+
+def test_occurrence_publish_waits_for_manifest_directory_fsync() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        manifest = core.CFG.archive / "manifest.jsonl"
+        real_fsync_directory = core._fsync_directory
+        failed = False
+
+        def crash_before_manifest_dir_fsync(path: Path) -> None:
+            nonlocal failed
+            if path == core.CFG.archive and manifest.exists() and not failed:
+                failed = True
+                raise RuntimeError("crash before manifest directory fsync")
+            real_fsync_directory(path)
+
+        kwargs = {
+            "ingest_job_id": "req-dir-fsync:event:0",
+            "request_id": "req-dir-fsync",
+            "request_endpoint": "/capture-events",
+            "request_body_sha256": "3" * 64,
+        }
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_fsync_directory",
+                    side_effect=crash_before_manifest_dir_fsync):
+                try:
+                    core.archive_bytes(
+                        b"directory durable", "text/plain",
+                        "fsync/first.txt", **kwargs)
+                except RuntimeError as exc:
+                    assert "directory fsync" in str(exc)
+                else:
+                    raise AssertionError("directory-fsync crash was not injected")
+            manifest.unlink(missing_ok=True)  # simulate lost first directory entry
+            core.archive_bytes(
+                b"directory durable", "text/plain",
+                "fsync/retry.txt", **kwargs)
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") ==
+                       kwargs["ingest_job_id"]]
+            assert len(matches) == 1
+            sidecar = next(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+            assert json.loads(sidecar.read_text())["published"] is True
+        finally:
+            core.CFG.home = old_home
+
+
+def test_false_occurrence_claim_cannot_bless_provisional_line() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        ingest_id = "req-provisional:event:0"
+        sha = hashlib.sha256(b"provisional").hexdigest()
+        metadata = ("req-provisional", "/capture-events", "4" * 64)
+        line_ready = threading.Event()
+        allow_rollback = threading.Event()
+        recovery_done = threading.Event()
+        publisher_errors: list[Exception] = []
+        try:
+            core.CFG.ensure_dirs()
+            claim = core._claim_archive_occurrence(
+                core.CFG.archive, ingest_id, sha, metadata,
+                legacy_fallback=False)
+            assert claim["published"] is False
+            occurrence = {
+                "sha256": sha, "bytes": 11, "mime": "text/plain",
+                "first_seen": "2026-07-12T00:00:00+00:00",
+                "occurrence_at": "2026-07-12T00:00:00+00:00",
+                "fonds_path": "provisional/line.txt",
+                "ingest_job_id": ingest_id,
+                "request_id": metadata[0],
+                "request_endpoint": metadata[1],
+                "request_body_sha256": metadata[2],
+            }
+
+            def publish_then_rollback() -> None:
+                def reject_after_write() -> bool:
+                    line_ready.set()
+                    assert allow_rollback.wait(timeout=5)
+                    return False
+                try:
+                    core.append_manifest_occurrence(
+                        core.CFG.archive, occurrence,
+                        post_append=reject_after_write)
+                except Exception as exc:  # expected postcondition rollback
+                    publisher_errors.append(exc)
+
+            def recover_false_claim() -> None:
+                core._claim_archive_occurrence(
+                    core.CFG.archive, ingest_id, sha, metadata,
+                    legacy_fallback=False)
+                recovery_done.set()
+
+            publisher = threading.Thread(target=publish_then_rollback)
+            recovery = threading.Thread(target=recover_false_claim)
+            publisher.start()
+            assert line_ready.wait(timeout=5)
+            recovery.start()
+            assert not recovery_done.wait(timeout=0.2)
+            allow_rollback.set()
+            publisher.join(timeout=5)
+            recovery.join(timeout=5)
+            assert publisher_errors
+            assert recovery_done.is_set()
+            sidecar = next(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+            assert json.loads(sidecar.read_text())["published"] is False
+            manifest = core.CFG.archive / "manifest.jsonl"
+            assert not manifest.read_text().strip()
+        finally:
+            allow_rollback.set()
             core.CFG.home = old_home
 
 
@@ -3900,6 +4099,10 @@ if __name__ == "__main__":
     test_extraction_claim_precedes_collision_safe_move()
     test_oversize_capture_retry_has_one_archive_occurrence()
     test_archive_occurrence_identity_survives_path_drift()
+    test_legacy_occurrence_conflicts_are_not_first_match_accepted()
+    test_current_archive_occurrence_lookup_is_keyed()
+    test_occurrence_publish_waits_for_manifest_directory_fsync()
+    test_false_occurrence_claim_cannot_bless_provisional_line()
     test_lost_response_retries_return_committed_mutations()
     test_api_request_ledger_migration()
     test_claim_retry_and_dead_letter_preserve_manifest()
@@ -3922,4 +4125,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("38 passed, 0 failed")
+    print("42 passed, 0 failed")
