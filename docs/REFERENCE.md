@@ -74,15 +74,138 @@ memoryd/policies.py       versioned recall policies + packet compilers
 memoryd/source_pack.py    deterministic source packing for extraction/replay
 memoryd/evaluator.py      static eval core used by admin + microsleep
 memoryd/cli.py            memoryd install|status|serve|review|microsleep|uninstall
+memoryd/doctor.py         read-only integrity inspection + conservative repair
 scripts/init_db.sh        role + db + ALL migrations (manual/psql path)
-scripts/smoke_test.py     the 19-check verification suite
+scripts/smoke_test.py     the DB-backed verification suite
 ```
+
+## Durable capture and recovery
+
+The Claude Code capture hook sends the transcript path to the daemon first. It
+snapshots transcript bytes into the local spool only after daemon delivery
+fails. If delivery and local spooling both fail, the hook stays fail-open and
+prints a visible evidence-loss warning.
+
+The daemon persists work before acknowledging it. `/capture` copies and hashes
+the transcript, then writes its capture manifest. `/extract` writes an
+extraction manifest. Each healthy endpoint then returns HTTP 202 with exactly
+`{"queued": true}`.
+
+The spool uses this layout:
+
+```text
+~/memory/spool/
+  blobs/<sha256>       content-addressed transcript snapshots
+  incoming/*.json     queued jobs; legacy flat *.json jobs also remain readable
+  processing/*.json   claimed jobs with an mtime-based lease
+  dead-letter/*.json  preserved jobs and their reason records
+  state.lock           persistent cross-process state-transition lock
+```
+
+Schema-v2 jobs share `schema_version`, `job_id`, `kind`, `created_at`,
+`session_id`, `attempts`, `last_error`, and `next_attempt_at`. A
+`capture_snapshot` job also records `trigger`, `original_transcript_path`,
+`blob_sha256`, `blob_bytes`, and optional `project`. An `extraction` job needs
+only the shared fields. Every accepted capture gets a distinct job. Several
+jobs and repeated attempts can still deduplicate to the same blob bytes.
+Blob and manifest publication syncs every newly created parent entry and the
+containing directory where the platform permits it. Known platform limitations
+disable directory sync; genuine I/O failures abort acknowledgement. A process
+discards a duplicate temporary blob only after
+the incumbent is a regular file with the expected size and digest. If that
+check fails, memoryd preserves the known-good bytes separately and refuses the
+capture instead of acknowledging untrusted evidence.
+
+Claims move jobs from `incoming/` to `processing/` under `state.lock` and touch
+and file-sync the manifest mtime. Each cross-directory state move syncs the
+destination before the source directory; completion syncs the processing
+directory after unlink. A worker requeues a processing lease older than 15 minutes.
+Rename-race handling covers only the rename syscall. If a post-rename sync or
+lease touch fails, the error propagates with the manifest already in its new
+state; it is never misreported as a missing-source no-op.
+Transient failures increment `attempts`, record `last_error`, set an
+exponential `next_attempt_at`, and return the job to `incoming/`. Permanent
+validation failures move the manifest to `dead-letter/`.
+
+A dead-letter transition preserves the manifest and writes its derived reason
+record. Code recognizes a reason sidecar only when its JSON object contains
+exactly `dead_lettered_at`, `reason`, and `manifest`; `manifest` names an
+existing sibling file; and the sidecar path exactly matches
+`dead_letter_reason_path(manifest)`. A `.reason.json` suffix alone proves
+nothing. Malformed or unreadable ambiguity counts as evidence instead of
+hiding a job.
+
+Transcript parsing gives each ledger event a stable source identity. It uses
+the transcript's native UUID when present; otherwise, it combines the line
+number with the raw-line SHA-256. It then appends the block ordinal and event
+kind. Replaying the same transcript therefore does not duplicate ledger rows.
+A mixed content line emits each supported text, tool-call, and tool-result
+block in order instead of dropping all but one block.
+Malformed or unsupported JSON values, including non-string text and tool
+results, stay in the raw archive but emit no ledger event. Spool replay reads
+and verifies the blob through one file
+descriptor, then passes those exact bytes to archival and classification.
+
+The archive stores verified objects at
+`archive/objects/sha256/<first-2>/<next-2>/<sha256>`. Before use, memoryd checks
+that an object is a regular file with the expected size and digest.
+Every successful archive attempt appends an occurrence to
+`archive/manifest.jsonl`, including its `ingest_job_id` when available. A retry
+can append another occurrence with the same job ID even when the object bytes
+already exist. The `archive/fonds/` view is a platform-safe, best-effort
+symlink view. Unsupported platforms or a link failure do not invalidate the
+verified object or occurrence manifest.
+Archive publication keeps its fsynced temporary inode and an open verified
+canonical descriptor through manifest-lock preconditions before and after the
+append. A leaf replacement rolls back the occurrence and retains the temporary
+file as evidence. Successful publication removes and directory-syncs the
+temporary name only after the occurrence is durable.
+Unrelated failures, such as manifest-lock timeout or I/O while the canonical
+leaf remains verified, remove the temporary file. Fonds paths are validated
+before object bytes are published, preventing invalid-path temp accumulation.
+Capture fonds dates come from the job's UTC `created_at`, so a retry after
+midnight retains the same path. Repair derives the path from the same field and
+rechecks occurrence identity while holding the manifest append lock. Fonds
+construction normalizes session backslashes to slashes before archival and
+repair compare identities.
+
+### Status and operator action
+
+`memoryd status` reports `incoming`, `processing`, and `dead-letter`. Incoming
+includes legacy flat jobs and `incoming/` jobs. Dead-letter excludes only exact
+structural reason sidecars. Any dead-letter evidence marks status unhealthy and
+points the operator to `memoryd doctor`.
+
+Run `memoryd doctor` first. It reads spool and archive topology, jobs, blob
+digests, leases, sidecars, objects, occurrence manifests, database health, and
+daemon health without creating or changing files. Inspect each dead-letter
+manifest with its matching reason record. Restore missing bytes from a trusted
+source or backup outside memoryd, then queue only a validated copy after fixing
+the cause. Keep the dead-letter evidence.
+
+`memoryd doctor --repair` performs only conservative actions. It creates a
+missing safe spool layout, requeues stale processing leases, upgrades legacy
+jobs whose transcript source still exists, and moves invalid or unrecoverable
+queued manifests to dead-letter with a reason record. It reconstructs missing
+supported capture-job occurrences idempotently, only from existing spool
+evidence and an existing canonical object that passes regular-file, size,
+digest, and file-identity checks. Repair refuses redirected, unreadable, or
+otherwise untrusted spool/archive topology,
+including unsafe ancestors, locks, evidence files, blobs, and object shards.
+It never recreates missing bytes, deletes evidence, rewrites archive objects, or
+manufactures fonds links.
+
+`memoryd doctor` reports hidden `.collision.*` and `.job_*.tmp` spool files as
+`unmanifested_capture_evidence`. These files contain bytes preserved after a
+publication failure but have no replay manifest. Retain and review them; repair
+never deletes them automatically.
 
 ## Operating notes
 
 - **Fail-open** (P9): if the daemon is down at recall, the agent proceeds with a
-  visible `[memory: unavailable this turn]` marker; capture failures spool to
-  `~/memory/spool/` and drain on daemon start. Raw evidence is never lost.
+  visible `[memory: unavailable this turn]` marker. After a capture delivery
+  failure, the hook snapshots readable transcript bytes into
+  `~/memory/spool/`; the daemon drains that spool after recovery.
 - **Meta events** (`recall_packet`, `capture_ack`) carry `meta=true` and are
   excluded from future extraction — the regress firebreak.
 - **Canary alarms** write a `veto` event to the ledger; check

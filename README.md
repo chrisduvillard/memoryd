@@ -126,7 +126,9 @@ Both agents now share one memory: what Claude Code learns, Hermes knows, and vic
 You mostly do nothing. Occasionally:
 
 ```bash
-memoryd status                     # is everything actually working?
+memoryd status                     # health plus incoming/processing/dead-letter counts
+memoryd doctor                     # inspect spool and archive; read-only
+memoryd doctor --repair            # conservative repair; preserves evidence
 memoryd review queue               # approve/reject pending memories (~1 min)
 memoryd review approve 3
 cat ~/memory/digest/$(date +%F).md # daily health report (written nightly)
@@ -142,17 +144,20 @@ cat ~/memory/digest/$(date +%F).md # daily health report (written nightly)
 <br>
 
 ```bash
-memoryd status                     # daemon, DB, hooks, autostart, spool backlog
-python scripts/smoke_test.py       # 19 checks: storage integrity, recall, canaries
-python scripts/test_extract.py     # 20 checks: fact extraction & promotion rules
-python scripts/test_vector.py      # 13 checks: semantic search & index rebuild
-python scripts/test_hermes.py      # 23 checks: Hermes plugin lifecycle
+memoryd status                     # daemon, DB, hooks, autostart, spool states
+memoryd doctor                     # read-only integrity inspection
+memoryd doctor --repair            # apply only conservative, evidence-preserving repairs
+python scripts/test_durable_capture.py # DB-free durable capture and recovery
+python scripts/smoke_test.py       # storage integrity, recall, canaries
+python scripts/test_extract.py     # fact extraction and promotion rules
+python scripts/test_vector.py      # semantic search and index rebuild
+python scripts/test_hermes.py      # Hermes plugin lifecycle
 python scripts/test_bitter_lesson.py # DB-free checks: model/policy/eval extension points
 ```
 
-(The test scripts write throwaway `smoketest`/test rows into your live database; fine for a fresh install.)
-`test_bitter_lesson.py` is the exception: it is DB-free and safe to run without
-a daemon.
+The DB-backed scripts write throwaway `smoketest`/test rows into your live
+database; use a fresh install. `test_durable_capture.py` and
+`test_bitter_lesson.py` are DB-free and need no daemon.
 
 </details>
 

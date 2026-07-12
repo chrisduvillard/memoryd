@@ -4,6 +4,9 @@
                        hooks + autostart + Hermes plugin (when ~/.hermes exists)
   memoryd status       is it actually working? (the antidote to fail-open silence)
   memoryd serve        run the daemon in the foreground
+  memoryd doctor       inspect spool and archive integrity (read-only)
+  memoryd doctor --repair
+                       apply conservative, evidence-preserving repairs
   memoryd review ...   human review CLI (delegates to memoryd.review)
   memoryd microsleep   nightly consolidation (normally runs on a schedule)
   memoryd uninstall    remove hooks/autostart; data is never touched
@@ -68,6 +71,22 @@ def _home() -> Path:
 def _mask(dsn: str) -> str:
     import re
     return re.sub(r"(://[^:/@]+:)[^@]+@", r"\1***@", dsn)
+
+
+def _spool_counts(spool_root: Path) -> dict[str, int]:
+    from .spool import is_dead_letter_sidecar
+
+    legacy = len(list(spool_root.glob("*.json")))
+    dead_letter = sum(
+        1 for path in (spool_root / "dead-letter").glob("*.json")
+        if not is_dead_letter_sidecar(path))
+    return {
+        "incoming": legacy + len(list(
+            (spool_root / "incoming").glob("*.json"))),
+        "processing": len(list(
+            (spool_root / "processing").glob("*.json"))),
+        "dead_letter": dead_letter,
+    }
 
 
 def _health(timeout: float = 2) -> dict | None:
@@ -516,10 +535,15 @@ def status() -> int:
     hp = Path("~/.hermes/plugins/memory/memoryd").expanduser()
     print(f"  hermes     {'plugin installed' if hp.is_dir() else 'not installed (~/.hermes missing)'}")
 
-    spool = home / "spool"
-    n_spool = len(list(spool.glob("*.json"))) if spool.is_dir() else 0
-    print(f"  spool      {n_spool} pending capture(s)"
-          + ("  <- captures are failing; is the daemon up?" if n_spool else ""))
+    spool_counts = _spool_counts(home / "spool")
+    if spool_counts["dead_letter"]:
+        ok = False
+    print("  spool      "
+          f"incoming={spool_counts['incoming']} "
+          f"processing={spool_counts['processing']} "
+          f"dead-letter={spool_counts['dead_letter']}"
+          + ("  <- run `memoryd doctor`"
+             if spool_counts["dead_letter"] else ""))
 
     mem_line = " ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none yet"
     print(f"  memories   {mem_line}"
@@ -607,6 +631,13 @@ def main() -> None:
         sys.exit(install())
     elif cmd == "status":
         sys.exit(status())
+    elif cmd == "doctor":
+        args = sys.argv[2:]
+        if args not in ([], ["--repair"]):
+            print("usage: memoryd doctor [--repair]", file=sys.stderr)
+            sys.exit(2)
+        from .doctor import main as doctor_main
+        sys.exit(doctor_main(repair=args == ["--repair"]))
     elif cmd == "review":
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         from .review import main as review_main

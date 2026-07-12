@@ -45,13 +45,16 @@ jobs:
       - name: Install package
         run: pip install .            # also validates the wheel builds/installs
 
+      - name: Run DB-free durable-capture checks
+        run: python scripts/test_durable_capture.py
+
       - name: Compile check
         run: python -m compileall memoryd scripts
 
       - name: Apply migrations
         run: python -c "import os; from memoryd.cli import apply_migrations; print('applied:', apply_migrations(os.environ['MEMORYD_DSN']))"
 
-      - name: Run the suite (77 checks)
+      - name: Run DB-backed integration suites
         run: |
           set -euo pipefail
           echo "[]" > /tmp/mock_llm.json            # valid fixture for the daemon's extractor
@@ -62,10 +65,10 @@ jobs:
             sleep 1
           done
           if [ "${ok:-}" != "1" ]; then echo "daemon did not become healthy"; cat memoryd.out; exit 1; fi
-          python scripts/smoke_test.py    # 19
-          python scripts/test_extract.py  # 22
-          python scripts/test_vector.py   # 13
-          python scripts/test_hermes.py   # 23
+          python scripts/smoke_test.py
+          python scripts/test_extract.py
+          python scripts/test_vector.py
+          python scripts/test_hermes.py
           kill "$daemon" 2>/dev/null || true
 
       - name: Daemon log on failure

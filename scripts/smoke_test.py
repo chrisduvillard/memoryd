@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,7 +19,9 @@ sys.stdout.reconfigure(encoding="utf-8")  # ✓/✗ on cp1252 Windows consoles
 
 import psycopg  # noqa: E402
 from memoryd.core import CFG, append_event, new_id, pool  # noqa: E402
+from memoryd.ingest import ingest_transcript  # noqa: E402
 
+DSN = CFG.dsn
 PASS: list[str] = []
 FAIL: list[str] = []
 
@@ -38,6 +41,94 @@ def http(path: str, body: dict | None = None, method: str = "POST") -> tuple[int
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
+
+
+def event_count(session_id: str, *, non_meta: bool = False) -> int:
+    where = " AND NOT meta" if non_meta else ""
+    with psycopg.connect(DSN) as conn:
+        return conn.execute(
+            f"SELECT count(*) FROM events WHERE session_id=%s{where}",
+            (session_id,),
+        ).fetchone()[0]
+
+
+def wait_for_events(session_id: str, *, minimum: int,
+                    non_meta: bool = False, timeout_s: float = 10) -> int:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        count = event_count(session_id, non_meta=non_meta)
+        if count >= minimum or time.monotonic() >= deadline:
+            return count
+        time.sleep(0.05)
+
+
+def check_durable_transcript_replay() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mixed_session = f"smoke-mixed-{new_id('s')}"
+        mixed = Path(temp_dir) / "mixed.jsonl"
+        mixed.write_text(json.dumps({
+            "uuid": "stable-mixed-line",
+            "type": "assistant",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"content": [
+                {"type": "text", "text": "kept answer"},
+                {"type": "tool_use", "name": "shell", "input": {"command": "pwd"}},
+            ]},
+        }) + "\n", encoding="utf-8")
+
+        first = ingest_transcript(
+            str(mixed), mixed_session, "smoketest", "session_end")
+        session_replay = ingest_transcript(
+            str(mixed), mixed_session, "smoketest", "session_end")
+        pre_compact = ingest_transcript(
+            str(mixed), mixed_session, "smoketest", "pre_compact")
+        pre_compact_replay = ingest_transcript(
+            str(mixed), mixed_session, "smoketest", "pre_compact")
+
+        check("synchronous mixed ingest reports both insertions",
+              first["new_events"] == 2, str(first))
+        check("exact session-end replay reports zero insertions",
+              session_replay["new_events"] == 0, str(session_replay))
+        check("pre-compact transcript replays report zero insertions",
+              pre_compact["new_events"] == 0
+              and pre_compact_replay["new_events"] == 0,
+              f"{pre_compact}, {pre_compact_replay}")
+
+        with psycopg.connect(DSN) as conn:
+            event_rows = conn.execute(
+                """SELECT kind, source_adapter, source_event_id, source_seq
+                   FROM events WHERE session_id=%s AND NOT meta
+                   ORDER BY source_event_id""",
+                (mixed_session,)).fetchall()
+            ack_rows = conn.execute(
+                """SELECT payload->>'trigger', count(*),
+                          bool_and(source_adapter IS NOT NULL
+                                   AND source_event_id IS NOT NULL)
+                   FROM events
+                   WHERE session_id=%s AND kind='capture_ack'
+                   GROUP BY payload->>'trigger'""",
+                (mixed_session,)).fetchall()
+
+        kinds = [row[0] for row in event_rows]
+        check("mixed transcript preserves text and tool call",
+              kinds == ["agent_response", "tool_call"], str(kinds))
+        expected_provenance = [
+            ("agent_response", "claude-code",
+             "uuid:stable-mixed-line:0:agent_response", 0),
+            ("tool_call", "claude-code",
+             "uuid:stable-mixed-line:1:tool_call", 0),
+        ]
+        check("stable source provenance is recorded",
+              event_rows == expected_provenance, str(event_rows))
+        acknowledgements = {
+            trigger: (count, has_provenance)
+            for trigger, count, has_provenance in ack_rows
+        }
+        check("replayed capture acknowledgements are source-idempotent",
+              acknowledgements == {
+                  "session_end": (1, True),
+                  "pre_compact": (1, True),
+              }, str(acknowledgements))
 
 
 def main() -> int:
@@ -144,24 +235,45 @@ def main() -> int:
             f.write(json.dumps(line) + "\n")
         tpath = f.name
 
-    code, resp = http("/capture", {"transcript_path": tpath, "session_id": "smoketest-s2",
+    capture_session = f"smoketest-s2-{int(time.time())}"
+    code, resp = http("/capture", {"transcript_path": tpath, "session_id": capture_session,
                                    "project": "smoketest", "trigger": "session_end"})
-    check("capture returns 202", code == 202, str(resp))
-    time.sleep(1.0)  # async worker
+    check("capture returns exact healthy response",
+          code == 202 and resp == {"queued": True}, str(resp))
+    captured_events = wait_for_events(capture_session, minimum=3, non_meta=True)
 
     with pool().connection() as conn:
-        n = conn.execute("SELECT count(*) FROM events WHERE session_id='smoketest-s2' AND NOT meta").fetchone()[0]
-        check("ledger events written from transcript", n == 3, f"got {n}")
-        # idempotency: capture same transcript again
-        http("/capture", {"transcript_path": tpath, "session_id": "smoketest-s2",
-                          "project": "smoketest", "trigger": "session_end"})
-        time.sleep(1.0)
-        n2 = conn.execute("SELECT count(*) FROM events WHERE session_id='smoketest-s2' AND NOT meta").fetchone()[0]
-        check("re-ingestion is idempotent", n2 == n, f"{n} -> {n2}")
+        check("ledger events written from transcript",
+              captured_events == 3, f"got {captured_events}")
         sha = conn.execute(
-            "SELECT raw_sha256 FROM events WHERE session_id='smoketest-s2' AND NOT meta LIMIT 1").fetchone()[0]
+            "SELECT raw_sha256 FROM events WHERE session_id=%s AND NOT meta LIMIT 1",
+            (capture_session,)).fetchone()[0]
         blob = CFG.archive / "objects" / "sha256" / sha[:2] / sha[2:4] / sha
         check("raw blob archived, content-addressed", blob.exists())
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        durable_session = f"smoke-durable-{new_id('s')}"
+        durable = Path(temp_dir) / "durable.jsonl"
+        durable.write_text(json.dumps({
+            "uuid": "durable-line",
+            "type": "user",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"content": "survives source deletion"},
+        }) + "\n", encoding="utf-8")
+        code, response = http("/capture", {
+            "transcript_path": str(durable),
+            "session_id": durable_session,
+            "project": "smoketest",
+            "trigger": "stop",
+        })
+        check("capture acknowledges durable spool job",
+              code == 202 and response == {"queued": True}, str(response))
+        durable.unlink()
+        durable_rows = wait_for_events(durable_session, minimum=1)
+        check("durable spool replays after source deletion",
+              durable_rows >= 1, f"rows={durable_rows}")
+
+    check_durable_transcript_replay()
 
     print("== 3. recall packet ==")
     code, pkt = http("/recall", {"prompt": "should I modify the backfill cron for the indicator job?",

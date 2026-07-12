@@ -14,9 +14,10 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 import urllib.request
 from pathlib import Path
+
+from .spool import enqueue_capture
 
 UNAVAILABLE = "[memory: unavailable this turn — proceeding without recall]"
 
@@ -75,15 +76,17 @@ def capture(stdin: dict, trigger: str, port: int, home: Path) -> None:
     }
     try:
         _post(port, "/capture", body, timeout=2)
-    except Exception:  # noqa: BLE001 — spool; drained on daemon start / microsleep
+    except Exception:  # daemon unavailable: preserve transcript bytes locally
         try:
-            spool = home / "spool"
-            spool.mkdir(parents=True, exist_ok=True)
-            # time_ns+pid is collision-safe across concurrent hook processes
-            (spool / f"cap-{time.time_ns()}-{os.getpid()}.json").write_text(
-                json.dumps(body), encoding="utf-8")
-        except OSError:
-            pass
+            enqueue_capture(
+                spool_root=home / "spool",
+                transcript_path=Path(transcript),
+                session_id=body["session_id"],
+                project=body["project"],
+                trigger=trigger,
+            )
+        except Exception as exc:  # fail-open, but never hide evidence loss
+            print(f"[memoryd: capture not durably saved: {exc}]", file=sys.stderr)
 
 
 def main() -> None:
