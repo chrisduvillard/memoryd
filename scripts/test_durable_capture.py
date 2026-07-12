@@ -8,6 +8,7 @@ import io
 import json
 import multiprocessing
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1600,6 +1601,7 @@ def test_current_archive_occurrence_lookup_is_keyed() -> None:
                     "fonds_path": f"history/{index}.txt",
                     "ingest_job_id": f"historical-{index}",
                 }) + "\n" for index in range(500)), encoding="utf-8")
+            core.ensure_occurrence_index(core.CFG.archive)
             real_read_text = Path.read_text
 
             def reject_manifest_scan(path: Path, *args, **kwargs):
@@ -1630,12 +1632,140 @@ def test_current_archive_occurrence_lookup_is_keyed() -> None:
             assert transcript_first == transcript_retry
             sidecars = list(
                 (core.CFG.archive / "occurrence-identities").glob("*.json"))
-            assert len(sidecars) == 2
-            assert all(json.loads(path.read_text())["published"] is True
-                       for path in sidecars)
+            current_sidecars = [
+                json.loads(path.read_text()) for path in sidecars
+                if json.loads(path.read_text()).get("ingest_job_id") in {
+                    kwargs["ingest_job_id"], "schema-v2-current-job"}]
+            assert len(current_sidecars) == 2
+            assert all(value["published"] is True
+                       for value in current_sidecars)
             matching = [json.loads(line) for line in manifest.read_text().splitlines()
                         if json.loads(line).get("ingest_job_id") == kwargs["ingest_job_id"]]
             assert len(matching) == 1
+        finally:
+            core.CFG.home = old_home
+
+
+def test_preupgrade_occurrence_index_migrates_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            data = b"pre-upgrade schema-v2 transcript"
+            ingest_id = "preupgrade-schema-v2-job"
+            fonds = "claude-code/2026/07/12/preupgrade.jsonl"
+            occurrence = {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": len(data), "mime": "application/jsonl",
+                "first_seen": "2026-07-12T00:00:00+00:00",
+                "occurrence_at": "2026-07-12T00:00:00+00:00",
+                "fonds_path": fonds, "ingest_job_id": ingest_id,
+            }
+            core.append_manifest_occurrence(core.CFG.archive, occurrence)
+            before = (core.CFG.archive / "manifest.jsonl").read_text().splitlines()
+            core.archive_bytes(
+                data, "application/jsonl", fonds, ingest_job_id=ingest_id)
+            after = (core.CFG.archive / "manifest.jsonl").read_text().splitlines()
+            assert after == before
+
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert marker.is_file()
+            if os.name != "nt":
+                assert stat.S_IMODE(marker.stat().st_mode) & 0o077 == 0
+            sidecar = next(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+            assert json.loads(sidecar.read_text())["published"] is True
+
+            manifest = core.CFG.archive / "manifest.jsonl"
+            real_open = Path.open
+
+            def reject_historical_rescan(path: Path, *args, **kwargs):
+                mode = args[0] if args else kwargs.get("mode", "r")
+                if path == manifest and mode.startswith("r"):
+                    raise AssertionError("completed occurrence index rescanned")
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", new=reject_historical_rescan):
+                core.archive_bytes(
+                    b"new indexed transcript", "application/jsonl",
+                    "claude-code/2026/07/13/new.jsonl",
+                    ingest_job_id="post-migration-job")
+        finally:
+            core.CFG.home = old_home
+
+
+def test_occurrence_index_migration_resumes_after_crash() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            for index in range(2):
+                data = f"legacy-{index}".encode()
+                core.append_manifest_occurrence(core.CFG.archive, {
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data), "mime": "text/plain",
+                    "first_seen": "2026-07-12T00:00:00+00:00",
+                    "occurrence_at": "2026-07-12T00:00:00+00:00",
+                    "fonds_path": f"legacy/{index}.txt",
+                    "ingest_job_id": f"legacy-migrate-{index}",
+                })
+            real_write = core._write_occurrence_identity
+            writes = 0
+
+            def crash_during_second_sidecar(archive_root: Path, value: dict) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError(errno.EIO, "migration sidecar crash")
+                real_write(archive_root, value)
+
+            with patch.object(
+                    core, "_write_occurrence_identity",
+                    side_effect=crash_during_second_sidecar):
+                try:
+                    core.ensure_occurrence_index(core.CFG.archive)
+                except OSError as exc:
+                    assert exc.errno == errno.EIO
+                else:
+                    raise AssertionError("partial index migration did not fail")
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert not marker.exists()
+            assert len(list(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))) == 1
+
+            core.ensure_occurrence_index(core.CFG.archive)
+            assert marker.is_file()
+            assert len(list(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))) == 2
+        finally:
+            core.CFG.home = old_home
+
+
+def test_occurrence_index_migration_refuses_conflicts() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            for label in ("A", "B"):
+                core.append_manifest_occurrence(core.CFG.archive, {
+                    "sha256": hashlib.sha256(label.encode()).hexdigest(),
+                    "bytes": 1, "mime": "text/plain",
+                    "first_seen": "2026-07-12T00:00:00+00:00",
+                    "occurrence_at": "2026-07-12T00:00:00+00:00",
+                    "fonds_path": f"conflict/{label}.txt",
+                    "ingest_job_id": "conflicting-upgrade-job",
+                })
+            try:
+                core.ensure_occurrence_index(core.CFG.archive)
+            except core.ArchiveOccurrenceCollision:
+                pass
+            else:
+                raise AssertionError("conflicting migration was accepted")
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert not marker.exists()
         finally:
             core.CFG.home = old_home
 
@@ -1693,7 +1823,7 @@ def test_sidecar_fsync_failure_preserves_durable_occurrence() -> None:
         core.CFG.home = Path(td) / "memory"
         real_fsync = core._fsync_directory
         identity_dir = core.CFG.archive / "occurrence-identities"
-        identity_fsyncs = 0
+        failed_published_fsync = False
         kwargs = {
             "ingest_job_id": "req-sidecar-fsync:event:0",
             "request_id": "req-sidecar-fsync",
@@ -1702,10 +1832,16 @@ def test_sidecar_fsync_failure_preserves_durable_occurrence() -> None:
         }
 
         def fail_published_sidecar_fsync(path: Path) -> None:
-            nonlocal identity_fsyncs
+            nonlocal failed_published_fsync
             if path == identity_dir:
-                identity_fsyncs += 1
-                if identity_fsyncs == 2:
+                published = [
+                    json.loads(candidate.read_text())
+                    for candidate in identity_dir.glob("*.json")]
+                if (not failed_published_fsync and
+                        any(value.get("ingest_job_id") ==
+                            kwargs["ingest_job_id"] and value.get("published")
+                            for value in published)):
+                    failed_published_fsync = True
                     raise OSError(errno.EIO, "published sidecar fsync failed")
             real_fsync(path)
 
@@ -4328,6 +4464,9 @@ if __name__ == "__main__":
     test_archive_occurrence_identity_survives_path_drift()
     test_legacy_occurrence_conflicts_are_not_first_match_accepted()
     test_current_archive_occurrence_lookup_is_keyed()
+    test_preupgrade_occurrence_index_migrates_once()
+    test_occurrence_index_migration_resumes_after_crash()
+    test_occurrence_index_migration_refuses_conflicts()
     test_concurrent_occurrence_publishers_append_once()
     test_sidecar_fsync_failure_preserves_durable_occurrence()
     test_occurrence_publish_waits_for_manifest_directory_fsync()
@@ -4354,4 +4493,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("45 passed, 0 failed")
+    print("48 passed, 0 failed")

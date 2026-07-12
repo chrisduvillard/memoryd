@@ -633,6 +633,118 @@ def _manifest_occurrence_identity(value: dict) -> tuple[object, tuple, object]:
         value.get("fonds_path"))
 
 
+def _occurrence_index_marker(archive_root: Path) -> Path:
+    return archive_root / "occurrence-identities" / ".index-complete"
+
+
+def _occurrence_index_is_complete(archive_root: Path) -> bool:
+    marker = _occurrence_index_marker(archive_root)
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as exc:
+        raise ArchiveOccurrenceCollision(
+            "invalid occurrence index completion marker") from exc
+    if value != {"version": 1}:
+        raise ArchiveOccurrenceCollision(
+            "invalid occurrence index completion marker")
+    return True
+
+
+def _stream_manifest_occurrence_groups(
+        archive_root: Path) -> dict[str, tuple[tuple, dict]]:
+    manifest = archive_root / "manifest.jsonl"
+    groups: dict[str, tuple[tuple, dict]] = {}
+    try:
+        handle = manifest.open("r", encoding="utf-8")
+    except FileNotFoundError:
+        return groups
+    with handle:
+        for line in handle:
+            try:
+                occurrence = json.loads(line)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ArchiveOccurrenceCollision(
+                    "invalid archive occurrence during index migration") from exc
+            if not isinstance(occurrence, dict):
+                raise ArchiveOccurrenceCollision(
+                    "invalid archive occurrence during index migration")
+            ingest_job_id = occurrence.get("ingest_job_id")
+            if ingest_job_id is None:
+                continue
+            if not isinstance(ingest_job_id, str) or not ingest_job_id:
+                raise ArchiveOccurrenceCollision(
+                    "invalid ingest_job_id during index migration")
+            identity = _manifest_occurrence_identity(occurrence)
+            previous = groups.get(ingest_job_id)
+            if previous is not None and previous[0] != identity:
+                raise ArchiveOccurrenceCollision(
+                    "archive occurrence identity collision")
+            groups.setdefault(ingest_job_id, (identity, occurrence))
+    return groups
+
+
+def _write_occurrence_index_marker(archive_root: Path) -> None:
+    marker = _occurrence_index_marker(archive_root)
+    temporary = marker.with_name(
+        f".{marker.name}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1}, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_with_retry(temporary, marker)
+        _fsync_directory(marker.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def ensure_occurrence_index(archive_root: Path) -> None:
+    """One-time, crash-safe materialization of legacy occurrence identities."""
+    if _occurrence_index_is_complete(archive_root):
+        return
+    identity_dir = archive_root / "occurrence-identities"
+    _mkdir_durable(identity_dir)
+    manifest = archive_root / "manifest.jsonl"
+    with _manifest_file_lock(manifest):
+        if _occurrence_index_is_complete(archive_root):
+            return
+        # Validate the complete history before writing any derived identity.
+        groups = _stream_manifest_occurrence_groups(archive_root)
+        for ingest_job_id, (expected, occurrence) in groups.items():
+            path = _occurrence_identity_path(archive_root, ingest_job_id)
+            with _manifest_file_lock(path):
+                existing = _read_occurrence_identity(
+                    archive_root, ingest_job_id)
+                if existing is not None:
+                    actual = _occurrence_identity(
+                        existing["sha256"],
+                        _occurrence_request_metadata(existing),
+                        existing.get("fonds_path"))
+                    if actual != expected:
+                        raise ArchiveOccurrenceCollision(
+                            "archive occurrence identity collision")
+                    value = {**existing, "published": True}
+                else:
+                    request_metadata = _occurrence_request_metadata(occurrence)
+                    value = {
+                        "ingest_job_id": ingest_job_id,
+                        "sha256": occurrence.get("sha256"),
+                        "request_id": request_metadata[0],
+                        "request_endpoint": request_metadata[1],
+                        "request_body_sha256": request_metadata[2],
+                        "fonds_path": (
+                            None if request_metadata[0] is not None else
+                            occurrence.get("fonds_path")),
+                        "published": True,
+                    }
+                _write_occurrence_identity(archive_root, value)
+        _write_occurrence_index_marker(archive_root)
+
+
 def _claim_archive_occurrence(
         archive_root: Path, ingest_job_id: str, sha256: str,
         request_metadata: tuple[object, object, object],
@@ -755,6 +867,8 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                     for c in request_body_sha256)):
             raise ValueError("invalid archive request body digest")
     sha = hashlib.sha256(data).hexdigest()
+    if ingest_job_id is not None:
+        ensure_occurrence_index(CFG.archive)
     if request_id is not None:
         claim_archive_request_identity(
             CFG.archive, request_id, request_endpoint,
