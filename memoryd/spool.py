@@ -507,23 +507,14 @@ def enqueue_extraction(*, spool_root: Path, session_id: str,
     validate_job(job)
     with _state_lock(spool_root):
         if request_id is not None:
-            candidates = [*spool_root.glob("*.json")]
-            for state in (
-                    "incoming", "processing", "dead-letter",
-                    "request-identities"):
-                candidates.extend(paths[state].glob("*.json"))
-            for candidate in candidates:
-                try:
-                    existing = json.loads(candidate.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                if (not isinstance(existing, dict) or
-                        existing.get("job_id") != request_id):
-                    continue
-                if (existing.get("kind") == "extraction" and
-                        existing.get("request_endpoint") == request_endpoint and
-                        existing.get("request_body_sha256") == request_body_sha256):
-                    return {**existing, "duplicate": True}
+            existing = _find_request_identity_unlocked(
+                spool_root, paths, request_id)
+            if existing is not None:
+                endpoint, digest, manifest = existing
+                if (manifest.get("kind") == "extraction" and
+                        endpoint == request_endpoint and
+                        digest == request_body_sha256):
+                    return {**manifest, "duplicate": True}
                 raise JobIdentityCollision("request_id collision")
             filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
             target = paths["incoming"] / filename
@@ -533,6 +524,45 @@ def enqueue_extraction(*, spool_root: Path, session_id: str,
             target = paths["incoming"] / f"{job_id}.json"
         _atomic_json(target, job)
     return {**job, "duplicate": False}
+
+
+def _find_request_identity_unlocked(
+        spool_root: Path, paths: dict[str, Path],
+        request_id: str) -> tuple[str, str, dict] | None:
+    candidates = [*spool_root.glob("*.json")]
+    for state in (
+            "incoming", "processing", "dead-letter",
+            "request-identities"):
+        candidates.extend(paths[state].glob("*.json"))
+    found = None
+    for candidate in candidates:
+        try:
+            manifest = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (not isinstance(manifest, dict) or
+                manifest.get("job_id") != request_id):
+            continue
+        endpoint = manifest.get("request_endpoint")
+        digest = manifest.get("request_body_sha256")
+        if not isinstance(endpoint, str) or not isinstance(digest, str):
+            raise JobIdentityCollision("request_id collision")
+        identity = (endpoint, digest, manifest)
+        if found is not None and found[:2] != identity[:2]:
+            raise JobIdentityCollision("request_id collision")
+        found = identity
+    return found
+
+
+def find_request_identity(
+        spool_root: Path, request_id: str) -> tuple[str, str] | None:
+    """Return the durable extraction request identity across every job state."""
+    _require_nonempty_string(request_id, "request_id")
+    with _state_lock(spool_root):
+        paths = ensure_layout(spool_root)
+        found = _find_request_identity_unlocked(
+            spool_root, paths, request_id)
+        return None if found is None else found[:2]
 
 
 def load_job(path: Path) -> dict:

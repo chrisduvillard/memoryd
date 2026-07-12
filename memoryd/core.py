@@ -106,6 +106,10 @@ POOL: ConnectionPool | None = None
 _POOL_LOCK = threading.Lock()
 
 
+class ArchiveOccurrenceCollision(ValueError):
+    pass
+
+
 def pool() -> ConnectionPool:
     global POOL
     if POOL is None:
@@ -464,6 +468,35 @@ def append_manifest_occurrence(
     return True
 
 
+def _manifest_occurrence(
+        archive_root: Path, ingest_job_id: str) -> dict | None:
+    manifest = archive_root / "manifest.jsonl"
+    try:
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    for line in lines:
+        try:
+            existing = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (isinstance(existing, dict) and
+                existing.get("ingest_job_id") == ingest_job_id):
+            return existing
+    return None
+
+
+def _manifest_has_occurrence(archive_root: Path, occurrence: dict) -> bool:
+    existing = _manifest_occurrence(
+        archive_root, occurrence["ingest_job_id"])
+    if existing is None:
+        return False
+    if existing.get("sha256") != occurrence["sha256"]:
+        raise ArchiveOccurrenceCollision(
+            "archive occurrence identity collision")
+    return True
+
+
 def archive_bytes(data: bytes, mime: str, fonds_path: str,
                   ingest_job_id: str | None = None) -> str:
     """Store blob content-addressed; append occurrence; symlink into fonds.
@@ -472,6 +505,11 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
     archive call records its own occurrence.
     """
     sha = hashlib.sha256(data).hexdigest()
+    if ingest_job_id is not None:
+        existing = _manifest_occurrence(CFG.archive, ingest_job_id)
+        if existing is not None and existing.get("sha256") != sha:
+            raise ArchiveOccurrenceCollision(
+                "archive occurrence identity collision")
     obj_dir, obj_path = _archive_object_namespace(
         CFG.archive, sha, create=True)
     trusted_archive_root = CFG.archive.resolve()
@@ -517,8 +555,12 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
                     "fonds_path": fonds_path.replace("\\", "/"),
                     "ingest_job_id": ingest_job_id,
                 }
-                append_manifest_occurrence(
+                occurrence_published = append_manifest_occurrence(
                     CFG.archive, occurrence,
+                    skip_if=(
+                        (lambda: _manifest_has_occurrence(
+                            CFG.archive, occurrence))
+                        if ingest_job_id is not None else None),
                     pre_append=lambda: _archive_object_still_bound(
                         obj_handle, obj_path, obj_stat, CFG.archive, sha),
                     post_append=lambda: _archive_object_still_bound(
@@ -541,11 +583,12 @@ def archive_bytes(data: bytes, mime: str, fonds_path: str,
 
         # Fonds is a best-effort derived view, created only after the durable
         # occurrence binds the verified object to its canonical pathname.
-        try:
-            _create_fonds_link(
-                trusted_archive_root, obj_path, link, fonds_path)
-        except OSError:
-            pass
+        if occurrence_published:
+            try:
+                _create_fonds_link(
+                    trusted_archive_root, obj_path, link, fonds_path)
+            except OSError:
+                pass
 
         return sha
     finally:

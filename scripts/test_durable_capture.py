@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import http.client
 import io
 import json
 import multiprocessing
@@ -974,6 +975,7 @@ def test_extraction_request_identity_is_durable() -> None:
     class Connection:
         def __init__(self):
             self.requests: dict[str, tuple[str, str, dict]] = {}
+            self.misses = 0
 
         def __enter__(self):
             return self
@@ -993,6 +995,9 @@ def test_extraction_request_identity_is_durable() -> None:
                     endpoint, digest,
                     json.loads(response) if isinstance(response, str) else response)
                 return Result()
+            if normalized.startswith("insert into miss_signals"):
+                self.misses += 1
+                return Result()
             raise AssertionError(f"unexpected SQL: {sql}")
 
         def commit(self) -> None:
@@ -1005,9 +1010,9 @@ def test_extraction_request_identity_is_durable() -> None:
         def connection(self) -> Connection:
             return self.conn
 
-    def post(httpd, body: dict) -> tuple[int, dict]:
+    def post(httpd, body: dict, path: str = "/extract") -> tuple[int, dict]:
         request = urllib.request.Request(
-            f"http://127.0.0.1:{httpd.server_port}/extract",
+            f"http://127.0.0.1:{httpd.server_port}{path}",
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
         try:
@@ -1025,6 +1030,17 @@ def test_extraction_request_identity_is_durable() -> None:
         try:
             thread.start()
             with patch.object(server, "pool", return_value=Pool(conn)):
+                conn.requests["req-db-other"] = (
+                    "/miss", "0" * 64,
+                    {"ok": True, "request_id": "req-db-other",
+                     "duplicate": False})
+                code, db_collision = post(httpd, {
+                    "session_id": "must-not-publish",
+                    "request_id": "req-db-other"})
+                assert code == 409
+                assert db_collision["error"] == "request_id collision"
+                assert not list((core.CFG.spool / "incoming").glob("*.json"))
+
                 code, first = post(httpd, {
                     "session_id": "extract-idem", "request_id": "req-extract-1"})
                 assert code == 202
@@ -1041,6 +1057,17 @@ def test_extraction_request_identity_is_durable() -> None:
                 assert len(jobs) == 1
                 assert jobs[0]["job_id"] == "req-extract-1"
 
+                manifest_path = next(
+                    (core.CFG.spool / "incoming").glob("*.json"))
+                mismatched = {**jobs[0], "request_body_sha256": "f" * 64}
+                manifest_path.write_text(
+                    json.dumps(mismatched), encoding="utf-8")
+                code, split_identity = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "extract-idem"})
+                assert code == 409
+                assert split_identity["error"] == "request_id collision"
+                manifest_path.write_text(json.dumps(jobs[0]), encoding="utf-8")
+
                 # Simulate a drain that completes before the API transaction
                 # commits, followed by loss of that transaction. The durable
                 # spool identity must still prevent a second publication.
@@ -1055,6 +1082,19 @@ def test_extraction_request_identity_is_durable() -> None:
                 assert not list((core.CFG.spool / "incoming").glob("*.json"))
 
                 conn.requests.clear()
+                code, cross_collision = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "cross",
+                    "signal": "manual"}, path="/miss")
+                assert code == 409
+                assert cross_collision["error"] == "request_id collision"
+                assert conn.misses == 0
+
+                code, cross_collision = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "cross",
+                    "events": []}, path="/capture-events")
+                assert code == 409
+                assert cross_collision["error"] == "request_id collision"
+
                 code, collision = post(httpd, {
                     "session_id": "different", "request_id": "req-extract-1"})
                 assert code == 409
@@ -1063,6 +1103,298 @@ def test_extraction_request_identity_is_durable() -> None:
 
                 code, legacy = post(httpd, {"session_id": "legacy-extract"})
                 assert code == 202 and legacy == {"queued": True}
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            core.CFG.home = old_home
+            while True:
+                try:
+                    server.CAPTURE_Q.get_nowait()
+                except server.queue.Empty:
+                    break
+                else:
+                    server.CAPTURE_Q.task_done()
+
+
+def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
+    class Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self):
+            self.requests: dict[str, tuple[str, str, dict]] = {}
+            self.pending_events = 0
+            self.committed_events = 0
+            self.pending_request = None
+            self.fail_first_record = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, *_args):
+            if exc_type is not None:
+                self.pending_events = 0
+                self.pending_request = None
+            return False
+
+        def execute(self, sql: str, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if "pg_advisory_xact_lock" in normalized:
+                return Result((True,))
+            if normalized.startswith("select endpoint, body_sha256, response"):
+                return Result(self.requests.get(params[0]))
+            if normalized.startswith("insert into api_request_ledger"):
+                if self.fail_first_record:
+                    self.fail_first_record = False
+                    raise RuntimeError("forced rollback after archive publication")
+                request_id, endpoint, digest, response = params
+                self.pending_request = (
+                    request_id, endpoint, digest,
+                    json.loads(response) if isinstance(response, str) else response)
+                return Result()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self) -> None:
+            self.committed_events += self.pending_events
+            self.pending_events = 0
+            if self.pending_request is not None:
+                request_id, endpoint, digest, response = self.pending_request
+                self.requests[request_id] = (endpoint, digest, response)
+                self.pending_request = None
+
+    class Pool:
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def connection(self) -> Connection:
+            return self.conn
+
+    class MidnightClock:
+        moments = iter((
+            datetime(2026, 7, 12, 23, 59, 59, tzinfo=timezone.utc),
+            datetime(2026, 7, 12, 23, 59, 59, tzinfo=timezone.utc),
+            datetime(2026, 7, 13, 0, 0, 1, tzinfo=timezone.utc),
+        ))
+
+        @classmethod
+        def now(cls, _timezone):
+            return next(cls.moments)
+
+    def post(httpd, body: dict) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}/capture-events",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        conn = Connection()
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever)
+
+        def append_event(fake_conn, **_event):
+            fake_conn.pending_events += 1
+            return "evt-pending"
+
+        body = {
+            "request_id": "req-oversize-rollback",
+            "session_id": "oversize-session",
+            "agent": "hermes",
+            "events": [{
+                "kind": "user_message", "payload": {"text": "X" * 5000}}],
+        }
+        try:
+            thread.start()
+            with patch.object(server, "pool", return_value=Pool(conn)), \
+                 patch.object(server, "datetime", MidnightClock), \
+                 patch("memoryd.core.append_event", side_effect=append_event):
+                code, failed = post(httpd, body)
+                assert code == 500
+                assert "forced rollback" in failed["error"], failed
+
+                changed = {**body, "events": [{
+                    "kind": "user_message",
+                    "payload": {"text": "Y" * 5000}}]}
+                code, collision = post(httpd, changed)
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert conn.committed_events == 0
+
+                code, retried = post(httpd, body)
+                assert code == 200 and retried["duplicate"] is False
+            entries = [json.loads(line) for line in
+                       (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
+            assert len(entries) == 1
+            assert entries[0]["ingest_job_id"] == (
+                "req-oversize-rollback:event:0")
+            assert entries[0]["fonds_path"] == (
+                "hermes/2026/07/12/oversize-session-0.txt")
+            objects = [path for path in
+                       (core.CFG.archive / "objects" / "sha256").rglob("*")
+                       if path.is_file()]
+            assert len(objects) == 1
+            assert conn.committed_events == 1
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            core.CFG.home = old_home
+
+
+def test_archive_occurrence_identity_survives_path_drift() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            occurrence_id = "req-midnight:event:0"
+            core.archive_bytes(
+                b"same oversize event", "text/plain",
+                "hermes/2026/07/12/session-0.txt",
+                ingest_job_id=occurrence_id)
+            core.archive_bytes(
+                b"same oversize event", "text/plain",
+                "hermes/2026/07/13/session-0.txt",
+                ingest_job_id=occurrence_id)
+            entries = [json.loads(line) for line in
+                       (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
+            assert len(entries) == 1
+            assert entries[0]["fonds_path"] == (
+                "hermes/2026/07/12/session-0.txt")
+            second_view = core.CFG.archive / "fonds/hermes/2026/07/13/session-0.txt"
+            assert not os.path.lexists(second_view)
+        finally:
+            core.CFG.home = old_home
+
+
+def test_lost_response_retries_return_committed_mutations() -> None:
+    class Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self):
+            self.requests: dict[str, tuple[str, str, dict]] = {}
+            self.events = 0
+            self.misses = 0
+            self.commits = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql: str, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if "pg_advisory_xact_lock" in normalized:
+                return Result((True,))
+            if normalized.startswith("select endpoint, body_sha256, response"):
+                return Result(self.requests.get(params[0]))
+            if normalized.startswith("insert into api_request_ledger"):
+                request_id, endpoint, digest, response = params
+                self.requests[request_id] = (
+                    endpoint, digest,
+                    json.loads(response) if isinstance(response, str) else response)
+                return Result()
+            if normalized.startswith("insert into miss_signals"):
+                self.misses += 1
+                return Result()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self) -> None:
+            self.commits += 1
+
+    class Pool:
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def connection(self) -> Connection:
+            return self.conn
+
+    def request_for(httpd, path: str, body: dict):
+        return urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+
+    def lose_response(httpd, path: str, body: dict) -> None:
+        real_json = server.Handler._json
+
+        def discard(handler, code: int, obj: dict) -> None:
+            if getattr(handler, "_discard_response", False):
+                raise ConnectionAbortedError("simulated lost response")
+            if (obj.get("request_id") == body["request_id"] and
+                    obj.get("duplicate") is False):
+                handler._discard_response = True
+                raise ConnectionAbortedError("simulated lost response")
+            real_json(handler, code, obj)
+
+        with patch.object(server.Handler, "_json", discard):
+            try:
+                urllib.request.urlopen(
+                    request_for(httpd, path, body), timeout=5)
+            except (http.client.RemoteDisconnected, ConnectionResetError,
+                    urllib.error.URLError):
+                return
+        raise AssertionError("simulated response loss reached the client")
+
+    def post(httpd, path: str, body: dict) -> tuple[int, dict]:
+        with urllib.request.urlopen(
+                request_for(httpd, path, body), timeout=5) as response:
+            return response.status, json.loads(response.read())
+
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        conn = Connection()
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.handle_error = lambda *_args: None
+        thread = threading.Thread(target=httpd.serve_forever)
+
+        def append_event(_conn, **_event):
+            conn.events += 1
+            return f"evt-{conn.events}"
+
+        capture_body = {
+            "request_id": "req-lost-capture", "session_id": "lost",
+            "events": [{"kind": "user_message", "payload": {"text": "once"}}]}
+        miss_body = {
+            "request_id": "req-lost-miss", "session_id": "lost",
+            "signal": "manual"}
+        extract_body = {
+            "request_id": "req-lost-extract", "session_id": "lost"}
+        try:
+            thread.start()
+            with patch.object(server, "pool", return_value=Pool(conn)), \
+                 patch("memoryd.core.append_event", side_effect=append_event):
+                for path, body in (("/capture-events", capture_body),
+                                   ("/miss", miss_body),
+                                   ("/extract", extract_body)):
+                    before_commits = conn.commits
+                    lose_response(httpd, path, body)
+                    assert conn.commits == before_commits + 1
+                    code, duplicate = post(httpd, path, body)
+                    assert code in (200, 202)
+                    assert duplicate["duplicate"] is True
+            assert conn.events == 1
+            assert conn.misses == 1
+            jobs = list((core.CFG.spool / "incoming").glob("*.json"))
+            assert len(jobs) == 1
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -3409,6 +3741,9 @@ if __name__ == "__main__":
     test_capture_persists_snapshot_before_acknowledgement()
     test_daemon_mutations_are_request_idempotent()
     test_extraction_request_identity_is_durable()
+    test_oversize_capture_retry_has_one_archive_occurrence()
+    test_archive_occurrence_identity_survives_path_drift()
+    test_lost_response_retries_return_committed_mutations()
     test_api_request_ledger_migration()
     test_claim_retry_and_dead_letter_preserve_manifest()
     test_spool_state_transitions_sync_directories_and_leases()
@@ -3430,4 +3765,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("34 passed, 0 failed")
+    print("37 passed, 0 failed")

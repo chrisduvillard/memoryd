@@ -23,10 +23,15 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .core import CFG, new_id, pool
+from .core import ArchiveOccurrenceCollision, CFG, new_id, pool
 from .ingest import drain_spool
 from .recall import build_packet
-from .spool import JobIdentityCollision, enqueue_capture, enqueue_extraction
+from .spool import (
+    JobIdentityCollision,
+    enqueue_capture,
+    enqueue_extraction,
+    find_request_identity,
+)
 
 CAPTURE_Q: "queue.Queue[dict]" = queue.Queue()
 ADMIN_POST_ENDPOINTS = {
@@ -47,6 +52,9 @@ class RequestIdentityCollision(ValueError):
     pass
 
 
+_DURABLE_REQUEST_MATCH = object()
+
+
 def _request_identity(body: dict) -> tuple[str, str] | None:
     if "request_id" not in body:
         return None
@@ -62,7 +70,8 @@ def _request_identity(body: dict) -> tuple[str, str] | None:
 
 
 def _start_idempotent_request(conn, *, request_id: str,
-                              endpoint: str, body_sha256: str) -> dict | None:
+                              endpoint: str,
+                              body_sha256: str) -> dict | object | None:
     # Serialize claim/check/mutation/record for one identity. The transaction
     # lock prevents concurrent first calls from both applying their mutation.
     conn.execute(
@@ -71,8 +80,16 @@ def _start_idempotent_request(conn, *, request_id: str,
     row = conn.execute(
         "SELECT endpoint, body_sha256, response FROM api_request_ledger "
         "WHERE request_id=%s", (request_id,)).fetchone()
+    try:
+        durable = find_request_identity(CFG.spool, request_id)
+    except JobIdentityCollision as exc:
+        raise RequestIdentityCollision("request_id collision") from exc
     if row is None:
-        return None
+        if durable is None:
+            return None
+        if durable != (endpoint, body_sha256):
+            raise RequestIdentityCollision("request_id collision")
+        return _DURABLE_REQUEST_MATCH
     if isinstance(row, dict):
         saved_endpoint = row["endpoint"]
         saved_digest = row["body_sha256"]
@@ -80,6 +97,8 @@ def _start_idempotent_request(conn, *, request_id: str,
     else:
         saved_endpoint, saved_digest, response = row
     if saved_endpoint != endpoint or saved_digest != body_sha256:
+        raise RequestIdentityCollision("request_id collision")
+    if durable is not None and durable != (endpoint, body_sha256):
         raise RequestIdentityCollision("request_id collision")
     if isinstance(response, str):
         response = json.loads(response)
@@ -98,7 +117,6 @@ def _record_idempotent_request(conn, *, request_id: str, endpoint: str,
 def _store_capture_events(conn, body: dict) -> int:
     from .adapters import event_to_envelope
     from .core import append_event, archive_bytes
-    from datetime import datetime as _dt, timezone as _tz
 
     allowed = {"user_message", "agent_response", "tool_call", "tool_result",
                "session_start", "session_end", "external_note", "delegation"}
@@ -128,10 +146,13 @@ def _store_capture_events(conn, body: dict) -> int:
         text = payload.get("text", "")
         sha = None
         if isinstance(text, str) and len(text) > 4000:
-            day = _dt.now(_tz.utc)
+            day = datetime.now(timezone.utc)
             sha = archive_bytes(
                 text.encode(), "text/plain",
-                f"{agent}/{day:%Y/%m/%d}/{body['session_id']}-{stored}.txt")
+                f"{agent}/{day:%Y/%m/%d}/{body['session_id']}-{stored}.txt",
+                ingest_job_id=(
+                    f"{body['request_id']}:event:{stored}"
+                    if "request_id" in body else None))
             payload = {**payload, "text": text[:4000], "truncated": True}
         append_event(
             conn, kind=kind, session_id=body["session_id"],
@@ -250,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
                         duplicate = _start_idempotent_request(
                             conn, request_id=request_id,
                             endpoint=self.path, body_sha256=digest)
-                        if duplicate is not None:
+                        if isinstance(duplicate, dict):
                             self._json(200, duplicate)
                             return
                     stored = _store_capture_events(conn, body)
@@ -263,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                             body_sha256=digest, response=response)
                     conn.commit()
                 self._json(200, response)
-            except RequestIdentityCollision:
+            except (RequestIdentityCollision, ArchiveOccurrenceCollision):
                 self._json(409, {"error": "request_id collision"})
             except ValueError as e:
                 self._json(400, {"error": str(e)})
@@ -285,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
                         duplicate = _start_idempotent_request(
                             conn, request_id=request_id,
                             endpoint=self.path, body_sha256=digest)
-                        if duplicate is not None:
+                        if isinstance(duplicate, dict):
                             self._json(202, duplicate)
                             return
                         job = enqueue_extraction(
@@ -322,7 +343,7 @@ class Handler(BaseHTTPRequestHandler):
                         duplicate = _start_idempotent_request(
                             conn, request_id=request_id,
                             endpoint=self.path, body_sha256=digest)
-                        if duplicate is not None:
+                        if isinstance(duplicate, dict):
                             self._json(200, duplicate)
                             return
                     conn.execute(
