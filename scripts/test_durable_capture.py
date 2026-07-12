@@ -1199,6 +1199,118 @@ def test_extraction_claim_precedes_collision_safe_move() -> None:
         assert moved_after_retry == moved
 
 
+def test_extraction_job_directory_durability_precedes_claim() -> None:
+    digest = "5" * 64
+
+    def leave_visible_job_with_false_claim(root: Path, request_id: str) -> None:
+        real_fsync = spool._fsync_directory
+        incoming = root / "incoming"
+        failed = False
+
+        def fail_after_incoming_rename(path: Path) -> None:
+            nonlocal failed
+            if path == incoming and not failed:
+                failed = True
+                raise OSError(errno.EIO, "incoming directory fsync failed")
+            real_fsync(path)
+
+        with patch.object(spool, "_fsync_directory",
+                          side_effect=fail_after_incoming_rename):
+            try:
+                spool.enqueue_extraction(
+                    spool_root=root, session_id="directory-cut",
+                    request_id=request_id, request_endpoint="/extract",
+                    request_body_sha256=digest)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("incoming directory fsync failure suppressed")
+        assert len(list(incoming.glob("*.json"))) == 1
+        claim_path = next((root / "request-claims").glob("*.json"))
+        assert json.loads(claim_path.read_text())["published"] is False
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "failed-refsync"
+        request_id = "req-directory-refsync-fails"
+        leave_visible_job_with_false_claim(root, request_id)
+        incoming = root / "incoming"
+        real_fsync = spool._fsync_directory
+
+        def fail_refsync(path: Path) -> None:
+            if path == incoming:
+                raise OSError(errno.EIO, "incoming re-fsync failed")
+            real_fsync(path)
+
+        with patch.object(spool, "_fsync_directory", side_effect=fail_refsync):
+            try:
+                spool.enqueue_extraction(
+                    spool_root=root, session_id="directory-cut",
+                    request_id=request_id, request_endpoint="/extract",
+                    request_body_sha256=digest)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("retry claimed an un-fsynced visible job")
+        claim_path = next((root / "request-claims").glob("*.json"))
+        assert json.loads(claim_path.read_text())["published"] is False
+
+        next(incoming.glob("*.json")).unlink()  # lost directory entry after crash
+        republished = spool.enqueue_extraction(
+            spool_root=root, session_id="directory-cut",
+            request_id=request_id, request_endpoint="/extract",
+            request_body_sha256=digest)
+        assert republished["duplicate"] is False
+        assert len(list(incoming.glob("*.json"))) == 1
+        assert json.loads(claim_path.read_text())["published"] is True
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "successful-refsync"
+        request_id = "req-directory-refsync-succeeds"
+        leave_visible_job_with_false_claim(root, request_id)
+        incoming = root / "incoming"
+        real_fsync = spool._fsync_directory
+        fsynced: list[Path] = []
+
+        def record_fsync(path: Path) -> None:
+            fsynced.append(path)
+            real_fsync(path)
+
+        with patch.object(spool, "_fsync_directory", side_effect=record_fsync):
+            recovered = spool.enqueue_extraction(
+                spool_root=root, session_id="directory-cut",
+                request_id=request_id, request_endpoint="/extract",
+                request_body_sha256=digest)
+        assert recovered["duplicate"] is True
+        assert incoming in fsynced
+        claim_path = next((root / "request-claims").glob("*.json"))
+        assert json.loads(claim_path.read_text())["published"] is True
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "claim-next-refsync"
+        request_id = "req-claim-next-refsync"
+        leave_visible_job_with_false_claim(root, request_id)
+        incoming = root / "incoming"
+        real_fsync = spool._fsync_directory
+
+        def fail_claim_refsync(path: Path) -> None:
+            if path == incoming:
+                raise OSError(errno.EIO, "claim_next re-fsync failed")
+            real_fsync(path)
+
+        with patch.object(
+                spool, "_fsync_directory", side_effect=fail_claim_refsync):
+            try:
+                spool.claim_next(root)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("claim_next promoted an un-fsynced job")
+        claim_path = next((root / "request-claims").glob("*.json"))
+        assert json.loads(claim_path.read_text())["published"] is False
+        assert len(list(incoming.glob("*.json"))) == 1
+        assert not list((root / "processing").glob("*.json"))
+
+
 def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
     class Result:
         def __init__(self, row=None):
@@ -4097,6 +4209,7 @@ if __name__ == "__main__":
     test_daemon_mutations_are_request_idempotent()
     test_extraction_request_identity_is_durable()
     test_extraction_claim_precedes_collision_safe_move()
+    test_extraction_job_directory_durability_precedes_claim()
     test_oversize_capture_retry_has_one_archive_occurrence()
     test_archive_occurrence_identity_survives_path_drift()
     test_legacy_occurrence_conflicts_are_not_first_match_accepted()
@@ -4125,4 +4238,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("42 passed, 0 failed")
+    print("43 passed, 0 failed")

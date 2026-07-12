@@ -523,10 +523,14 @@ def enqueue_extraction(*, spool_root: Path, session_id: str,
             existing = _find_request_job_unlocked(
                 spool_root, paths, request_id)
             if existing is not None:
-                endpoint, digest, manifest = existing
+                endpoint, digest, manifest, manifest_path = existing
                 if (manifest.get("kind") == "extraction" and
                         endpoint == request_endpoint and
                         digest == request_body_sha256):
+                    # A prior atomic rename may have succeeded before its
+                    # parent-directory fsync failed. Re-establish durability
+                    # before this visible job can make the claim authoritative.
+                    _fsync_directory(manifest_path.parent)
                     _ensure_request_claim_unlocked(
                         paths, request_id, request_endpoint,
                         request_body_sha256, published=True)
@@ -593,7 +597,7 @@ def _ensure_request_claim_unlocked(
 
 def _find_request_job_unlocked(
         spool_root: Path, paths: dict[str, Path],
-        request_id: str) -> tuple[str, str, dict] | None:
+        request_id: str) -> tuple[str, str, dict, Path] | None:
     filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
     candidates = [spool_root / filename]
     candidates.extend(
@@ -615,7 +619,7 @@ def _find_request_job_unlocked(
         digest = manifest.get("request_body_sha256")
         if not isinstance(endpoint, str) or not isinstance(digest, str):
             raise JobIdentityCollision("request_id collision")
-        identity = (endpoint, digest, manifest)
+        identity = (endpoint, digest, manifest, candidate)
         if found is not None and found[:2] != identity[:2]:
             raise JobIdentityCollision("request_id collision")
         found = identity
@@ -696,6 +700,7 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
                     isinstance(job.get("job_id"), str)):
                 # The incoming manifest is already durable. Publish its stable
                 # identity before a collision-safe move can change its name.
+                _fsync_directory(source.parent)
                 _ensure_request_claim_unlocked(
                     paths, job["job_id"], job["request_endpoint"],
                     job["request_body_sha256"], published=True)
