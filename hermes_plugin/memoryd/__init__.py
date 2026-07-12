@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -30,6 +31,15 @@ SCHEMA_VERSION = 1
 STALE_PROCESSING_SECONDS = 900
 MAX_BACKOFF_SECONDS = 300
 MUTATION_ENDPOINTS = frozenset({"/capture-events", "/extract", "/miss"})
+JOB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+JOB_FILE_RE = re.compile(
+    r"(?P<order>[0-9]{20})-(?P<job_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})\.json\Z")
+JOB_BASE_KEYS = frozenset({
+    "schema_version", "job_id", "endpoint", "body", "body_sha256",
+    "created_at", "attempts", "next_attempt_at", "last_error",
+})
+JOB_CLAIM_KEYS = frozenset({"claimed_at"})
+JOB_DEAD_KEYS = frozenset({"dead_letter_reason", "dead_lettered_at"})
 logger = logging.getLogger(__name__)
 
 
@@ -196,16 +206,33 @@ class DurableSpool:
             raise ValueError(f"invalid spool job: {path}")
         return value
 
-    @staticmethod
-    def _validate_job(job: dict) -> None:
-        if job.get("schema_version") != SCHEMA_VERSION:
+    def _validate_job(self, job: dict, path: Path, state: str) -> None:
+        if state not in self._STATE_DIR or path.parent != self._dir(state):
+            raise ValueError("invalid job state directory")
+        keys = frozenset(job)
+        missing = JOB_BASE_KEYS - keys
+        if missing:
+            raise ValueError(f"invalid job missing keys: {sorted(missing)}")
+        allowed = JOB_BASE_KEYS
+        if state == "processing":
+            allowed |= JOB_CLAIM_KEYS | JOB_DEAD_KEYS
+        elif state == "dead_letter":
+            allowed |= JOB_DEAD_KEYS
+        unknown = keys - allowed
+        if unknown:
+            raise ValueError(f"invalid job unknown keys: {sorted(unknown)}")
+        schema = job.get("schema_version")
+        if type(schema) is not int or schema != SCHEMA_VERSION:
             raise ValueError("invalid job schema_version")
         job_id = job.get("job_id")
         endpoint = job.get("endpoint")
         body = job.get("body")
-        if not isinstance(job_id, str) or not job_id:
+        if not isinstance(job_id, str) or JOB_ID_RE.fullmatch(job_id) is None:
             raise ValueError("invalid job job_id")
-        if endpoint not in MUTATION_ENDPOINTS:
+        filename = JOB_FILE_RE.fullmatch(path.name)
+        if filename is None or filename.group("job_id") != job_id:
+            raise ValueError("invalid job filename binding")
+        if not isinstance(endpoint, str) or endpoint not in MUTATION_ENDPOINTS:
             raise ValueError("invalid job endpoint")
         if not isinstance(body, dict):
             raise ValueError("invalid job body")
@@ -220,20 +247,58 @@ class DurableSpool:
         for field in ("created_at", "next_attempt_at"):
             value = job.get(field)
             if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-                    not math.isfinite(value)):
+                    not math.isfinite(value) or value < 0):
                 raise ValueError(f"invalid job {field}")
+        if job["next_attempt_at"] < job["created_at"]:
+            raise ValueError("invalid job next_attempt_at before created_at")
         if "claimed_at" in job:
             claimed = job["claimed_at"]
             if (isinstance(claimed, bool) or
-                    not isinstance(claimed, (int, float)) or not math.isfinite(claimed)):
+                    not isinstance(claimed, (int, float)) or
+                    not math.isfinite(claimed) or claimed < job["created_at"]):
                 raise ValueError("invalid job claimed_at")
         if job.get("last_error") is not None and not isinstance(job["last_error"], str):
             raise ValueError("invalid job last_error")
 
+        has_reason = "dead_letter_reason" in job
+        reason = job.get("dead_letter_reason")
+        has_dead_at = "dead_lettered_at" in job
+        dead_at = job.get("dead_lettered_at")
+        if has_reason and (not isinstance(reason, str) or not reason.strip()):
+            raise ValueError("invalid job dead_letter_reason")
+        if has_dead_at and (
+                isinstance(dead_at, bool) or not isinstance(dead_at, (int, float)) or
+                not math.isfinite(dead_at) or dead_at < job["created_at"]):
+            raise ValueError("invalid job dead_lettered_at")
+        if state == "incoming":
+            if keys != JOB_BASE_KEYS:
+                raise ValueError("invalid job incoming state")
+        elif state == "processing":
+            if has_reason != has_dead_at:
+                raise ValueError("invalid job processing dead-letter state")
+            if has_reason:
+                if keys != JOB_BASE_KEYS | JOB_DEAD_KEYS:
+                    raise ValueError("invalid job processing dead-letter transition")
+            elif keys not in (JOB_BASE_KEYS, JOB_BASE_KEYS | JOB_CLAIM_KEYS):
+                raise ValueError("invalid job processing state")
+        elif state == "dead_letter":
+            if keys != JOB_BASE_KEYS | JOB_DEAD_KEYS:
+                raise ValueError("invalid job dead-letter state")
+        else:
+            raise ValueError(f"invalid spool state: {state}")
+
     def _quarantine_unlocked(self, source: Path, error: Exception,
                              job: dict | None = None) -> None:
         reason = f"invalid job: {error}"
-        destination = self._dir("dead_letter") / source.name
+        destination_name = source.name
+        if isinstance(job, dict):
+            job_id = job.get("job_id")
+            if isinstance(job_id, str) and JOB_ID_RE.fullmatch(job_id):
+                match = JOB_FILE_RE.fullmatch(source.name)
+                order = (match.group("order") if match else
+                         f"{max(0, int(self.clock() * 1_000_000_000)):020d}")
+                destination_name = f"{order}-{job_id}.json"
+        destination = self._dir("dead_letter") / destination_name
         if isinstance(job, dict):
             evidence = dict(job)
             evidence["last_error"] = reason
@@ -256,7 +321,7 @@ class DurableSpool:
         if not isinstance(body, dict):
             raise TypeError("mutation body must be an object")
         job_id = job_id or uuid.uuid4().hex
-        if not job_id or any(ch in job_id for ch in "/\\"):
+        if not isinstance(job_id, str) or JOB_ID_RE.fullmatch(job_id) is None:
             raise ValueError("invalid job_id")
         now = self.clock()
         canonical_body = dict(body)
@@ -275,7 +340,8 @@ class DurableSpool:
         with self._lock():
             existing_paths = list(self._all_paths_unlocked())
             for existing in existing_paths:
-                if existing.name.endswith(f"-{job_id}.json"):
+                filename = JOB_FILE_RE.fullmatch(existing.name)
+                if filename and filename.group("job_id") == job_id:
                     raise JobCollision(f"durable job collision: {job_id}")
                 try:
                     if self._read(existing).get("job_id") == job_id:
@@ -304,6 +370,20 @@ class DurableSpool:
         return {state: sum(1 for _ in self._dir(state).glob("*.json"))
                 for state in self._STATE_DIR}
 
+    def audit_dead_letters(self) -> list[str]:
+        """Read-only validation of terminal evidence; never deletes or rewrites it."""
+        directory = self._dir("dead_letter")
+        if not directory.exists():
+            return []
+        findings = []
+        for path in sorted(directory.glob("*.json"), key=lambda item: item.name):
+            try:
+                job = self._read(path)
+                self._validate_job(job, path, "dead_letter")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                findings.append(f"{path.name}: {exc}")
+        return findings
+
     def _move_unlocked(self, source: Path, destination: Path) -> Path:
         if destination.exists():
             raise JobCollision(f"move collision: {destination.name}")
@@ -320,7 +400,7 @@ class DurableSpool:
             job = None
             try:
                 job = self._read(source)
-                self._validate_job(job)
+                self._validate_job(job, source, "processing")
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 self._quarantine_unlocked(source, exc, job)
                 recovered += 1
@@ -329,7 +409,11 @@ class DurableSpool:
             if now - claimed < STALE_PROCESSING_SECONDS:
                 continue
             destination_state = (
-                "dead_letter" if job.get("dead_letter_reason") else "incoming")
+                "dead_letter" if "dead_letter_reason" in job else "incoming")
+            if destination_state == "incoming" and "claimed_at" in job:
+                job = dict(job)
+                job.pop("claimed_at", None)
+                _atomic_json(source, job, replace=True)
             destination = self._dir(destination_state) / source.name
             self._move_unlocked(source, destination)
             recovered += 1
@@ -353,7 +437,7 @@ class DurableSpool:
             job = None
             try:
                 job = self._read(source)
-                self._validate_job(job)
+                self._validate_job(job, source, "incoming")
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 self._quarantine_unlocked(source, exc, job)
                 return None
@@ -369,7 +453,9 @@ class DurableSpool:
         with self._lock():
             if not path.exists():
                 raise FileNotFoundError(path)
-            updated = dict(job)
+            current = self._read(path)
+            self._validate_job(current, path, "processing")
+            updated = dict(current)
             attempts = int(updated.get("attempts", 0)) + 1
             updated["attempts"] = attempts
             updated["last_error"] = error
@@ -380,10 +466,14 @@ class DurableSpool:
             self._move_unlocked(path, self._dir("incoming") / path.name)
 
     def dead_letter(self, path: Path, job: dict, reason: str) -> None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("dead-letter reason must be a nonempty string")
         with self._lock():
             if not path.exists():
                 raise FileNotFoundError(path)
-            updated = dict(job)
+            current = self._read(path)
+            self._validate_job(current, path, "processing")
+            updated = dict(current)
             updated["attempts"] = int(updated.get("attempts", 0)) + 1
             updated["last_error"] = reason
             updated["dead_letter_reason"] = reason
@@ -394,6 +484,8 @@ class DurableSpool:
 
     def complete(self, path: Path) -> None:
         with self._lock():
+            current = self._read(path)
+            self._validate_job(current, path, "processing")
             path.unlink()
             _fsync_dir(path.parent)
 
@@ -428,7 +520,8 @@ class MemorydProvider(MemoryProvider):
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._warned_down = False
-        self._delivery_commit_lock = threading.Lock()
+        self._lifecycle_mutation_lock = threading.RLock()
+        self._shutdown_requested = threading.Event()
         self._durability_fault: Optional[str] = None
         self._durability_notice_pending = False
 
@@ -473,6 +566,11 @@ class MemorydProvider(MemoryProvider):
                 self._durability_notice_pending = True
             if self._spool_store.counts()["dead_letter"]:
                 self._durability_notice_pending = True
+            invalid_dead = self._spool_store.audit_dead_letters()
+            if invalid_dead:
+                self._durability_fault = (
+                    f"invalid dead-letter evidence ({len(invalid_dead)} files)")
+                self._durability_notice_pending = True
             self._start_worker()
             self._persist_mutation(
                 "/capture-events",
@@ -490,23 +588,17 @@ class MemorydProvider(MemoryProvider):
             self._worker.start()
 
     def shutdown(self) -> None:
-        if not self._primary or self._worker is None:
+        if not self._primary:
             return
-        deadline = time.monotonic() + 3.0
-        self._wake.set()
-        while time.monotonic() < deadline:
-            try:
-                if self._spool_store is None or not any(
-                        self._spool_store.counts()[name]
-                        for name in ("incoming", "processing")):
-                    break
-            except OSError:
-                break
-            time.sleep(0.05)
-        with self._delivery_commit_lock:
+        self._shutdown_requested.set()
+        with self._lifecycle_mutation_lock:
             self._stop.set()
         self._wake.set()
-        self._worker.join(timeout=1.0)
+        if self._worker is None:
+            return
+        self._worker.join(timeout=6.0)
+        if self._worker.is_alive():
+            raise RuntimeError("memoryd worker did not stop after bounded HTTP timeout")
 
     def _consume_durability_notice(self) -> str:
         if not self._durability_notice_pending:
@@ -695,16 +787,22 @@ class MemorydProvider(MemoryProvider):
     def _persist_mutation(self, endpoint: str, body: dict) -> Optional[str]:
         if not self._primary:
             return None
-        if self._spool_store is None:
-            self._record_durability_fault("durable spool is unavailable")
-            return None
-        try:
-            job_id = self._spool_store.persist(endpoint, body)
-        except (OSError, ValueError, TypeError, JobCollision) as exc:
-            self._record_durability_fault(f"could not persist {endpoint}: {exc}")
-            return None
-        self._wake.set()
-        return job_id
+        with self._lifecycle_mutation_lock:
+            if self._shutdown_requested.is_set() or self._stop.is_set():
+                self._durability_fault = "provider is shut down; mutation was not queued"
+                self._durability_notice_pending = True
+                logger.warning("memoryd mutation rejected after shutdown: %s", endpoint)
+                return None
+            if self._spool_store is None:
+                self._record_durability_fault("durable spool is unavailable")
+                return None
+            try:
+                job_id = self._spool_store.persist(endpoint, body)
+            except (OSError, ValueError, TypeError, JobCollision) as exc:
+                self._record_durability_fault(f"could not persist {endpoint}: {exc}")
+                return None
+            self._wake.set()
+            return job_id
 
     def _recall(self, prompt: str, session_id: str, timeout: float) -> Optional[str]:
         result = self._request_json(
@@ -753,17 +851,23 @@ class MemorydProvider(MemoryProvider):
         if self._spool_store is None:
             return False
         try:
-            claimed = self._spool_store.claim_oldest()
-            if claimed is None:
-                fault = self._spool_store.fault()
-                if fault and fault != self._durability_fault:
-                    self._durability_fault = fault
-                    self._durability_notice_pending = True
-                return False
+            with self._lifecycle_mutation_lock:
+                if self._shutdown_requested.is_set() or self._stop.is_set():
+                    return False
+                claimed = self._spool_store.claim_oldest()
+                if claimed is None:
+                    fault = self._spool_store.fault()
+                    if fault and fault != self._durability_fault:
+                        self._durability_fault = fault
+                        self._durability_notice_pending = True
+                    return False
             path, job = claimed
+            with self._lifecycle_mutation_lock:
+                if self._shutdown_requested.is_set() or self._stop.is_set():
+                    return True
             result = self._send_mutation(job)
-            with self._delivery_commit_lock:
-                if self._stop.is_set():
+            with self._lifecycle_mutation_lock:
+                if self._shutdown_requested.is_set() or self._stop.is_set():
                     # Shutdown owns a bounded handoff. Leave claimed evidence for
                     # stale recovery rather than mutating it after shutdown returns.
                     return True
@@ -778,8 +882,14 @@ class MemorydProvider(MemoryProvider):
                     self._spool_store.retry(path, job, result.error)
             return True
         except (OSError, ValueError, json.JSONDecodeError, JobCollision) as exc:
-            self._record_durability_fault(f"spool worker failure: {exc}")
+            self._record_worker_fault(f"spool worker failure: {exc}")
             return False
+
+    def _record_worker_fault(self, message: str) -> None:
+        with self._lifecycle_mutation_lock:
+            if self._shutdown_requested.is_set() or self._stop.is_set():
+                return
+            self._record_durability_fault(message)
 
     def _drain(self) -> None:
         while not self._stop.is_set():
@@ -787,7 +897,7 @@ class MemorydProvider(MemoryProvider):
                 if self._process_one():
                     continue
             except Exception as exc:  # noqa: BLE001 - worker must never die silently
-                self._record_durability_fault(f"unexpected spool worker failure: {exc}")
+                self._record_worker_fault(f"unexpected spool worker failure: {exc}")
             self._wake.wait(0.25)
             self._wake.clear()
 

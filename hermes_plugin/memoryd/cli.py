@@ -56,6 +56,13 @@ def _spool_status(home: Path) -> dict:
             result["fault"] = value.get("durability_fault")
         except (OSError, ValueError, json.JSONDecodeError):
             result["fault"] = "unreadable spool state"
+    try:
+        invalid_dead = _durable_spool_class()(Path(home)).audit_dead_letters()
+    except Exception as exc:  # noqa: BLE001 - status must report, never crash
+        invalid_dead = [f"audit failed: {exc}"]
+    if invalid_dead:
+        detail = f"invalid dead-letter evidence ({len(invalid_dead)} files)"
+        result["fault"] = f"{result['fault']}; {detail}" if result["fault"] else detail
     result["healthy"] = not result["dead_letter"] and not result["fault"]
     return result
 

@@ -261,6 +261,232 @@ class DurableSpoolTests(unittest.TestCase):
         dead = self.spool.list_jobs("dead_letter")[0][1]
         self.assertIn("request_id", dead["dead_letter_reason"])
 
+    def test_schema_types_ranges_and_incoming_state_are_strict(self) -> None:
+        mutations = {
+            "schema bool": lambda job: job.__setitem__("schema_version", True),
+            "schema float": lambda job: job.__setitem__("schema_version", 1.0),
+            "unsafe job id": lambda job: (
+                job.__setitem__("job_id", "../escape"),
+                job["body"].__setitem__("request_id", "../escape"),
+                job.__setitem__("body_sha256", plugin.hashlib.sha256(
+                    plugin._canonical_json(job["body"])).hexdigest())),
+            "attempts float": lambda job: job.__setitem__("attempts", 1.0),
+            "created bool": lambda job: job.__setitem__("created_at", True),
+            "created negative": lambda job: job.__setitem__("created_at", -1),
+            "next before created": lambda job: job.__setitem__("next_attempt_at", 999.0),
+            "last error int": lambda job: job.__setitem__("last_error", 7),
+            "missing last error": lambda job: job.pop("last_error"),
+            "unknown key": lambda job: job.__setitem__("unexpected", "value"),
+            "endpoint list": lambda job: job.__setitem__("endpoint", ["/miss"]),
+            "incoming dead reason": lambda job: job.__setitem__(
+                "dead_letter_reason", "HTTP 400"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                spool = plugin.DurableSpool(Path(tmp), clock=MutableClock())
+                spool.persist("/miss", {"session_id": "s"}, job_id="strict-job")
+                path, job = spool.list_jobs("incoming")[0]
+                mutate(job)
+                plugin._atomic_json(path, job, replace=True)
+                self.assertIsNone(spool.claim_oldest())
+                self.assertEqual(spool.counts()["dead_letter"], 1)
+
+    def test_filename_must_bind_to_job_id(self) -> None:
+        self._persist(job_id="bound-job")
+        path, _ = self.spool.list_jobs("incoming")[0]
+        wrong = path.with_name("00000000000000000001-other-job.json")
+        path.rename(wrong)
+        self.assertIsNone(self.spool.claim_oldest())
+        dead_path, dead = self.spool.list_jobs("dead_letter")[0]
+        self.assertTrue(dead_path.name.endswith("-bound-job.json"))
+        self.assertIn("filename", dead["dead_letter_reason"])
+
+    def test_validation_binds_state_to_its_directory(self) -> None:
+        self._persist(job_id="directory-bound")
+        path, job = self.spool.list_jobs("incoming")[0]
+        with self.assertRaisesRegex(ValueError, "directory"):
+            self.spool._validate_job(job, path, "processing")
+
+    def test_dead_letter_audit_rejects_claimed_and_malformed_evidence(self) -> None:
+        self._persist(job_id="dead-audit")
+        path, job = self.spool.claim_oldest()
+        self.spool.dead_letter(path, job, "HTTP 400")
+        self.assertEqual(self.spool.audit_dead_letters(), [])
+        dead_path, dead = self.spool.list_jobs("dead_letter")[0]
+        dead["claimed_at"] = dead["dead_lettered_at"]
+        plugin._atomic_json(dead_path, dead, replace=True)
+        findings = self.spool.audit_dead_letters()
+        self.assertEqual(len(findings), 1)
+        self.assertIn("claimed_at", findings[0])
+
+    def test_processing_dead_letter_reason_is_not_routed_by_truthiness(self) -> None:
+        self._persist(job_id="bad-dead-state")
+        path, job = self.spool.claim_oldest()
+        job.pop("claimed_at", None)
+        job["dead_letter_reason"] = True
+        job["dead_lettered_at"] = self.clock.value
+        plugin._atomic_json(path, job, replace=True)
+        os.utime(path, (self.clock.value, self.clock.value))
+        self.clock.value += plugin.STALE_PROCESSING_SECONDS + 1
+        self.assertEqual(self.spool.recover_stale(), 1)
+        dead = self.spool.list_jobs("dead_letter")[0][1]
+        self.assertIsInstance(dead["dead_letter_reason"], str)
+        self.assertIn("invalid", dead["dead_letter_reason"])
+
+    def test_processing_claim_timestamp_cannot_precede_creation(self) -> None:
+        self._persist(job_id="bad-claim-time")
+        path, job = self.spool.claim_oldest()
+        job["claimed_at"] = job["created_at"] - 1
+        plugin._atomic_json(path, job, replace=True)
+        self.assertEqual(self.spool.recover_stale(), 1)
+        dead = self.spool.list_jobs("dead_letter")[0][1]
+        self.assertIn("claimed_at", dead["dead_letter_reason"])
+
+    def test_claim_move_fsync_failures_recover_without_loss(self) -> None:
+        for failed_state in ("incoming", "processing"):
+            with self.subTest(failed_state=failed_state), \
+                    tempfile.TemporaryDirectory() as tmp:
+                clock = MutableClock()
+                spool = plugin.DurableSpool(Path(tmp), clock=clock)
+                spool.persist("/miss", {"session_id": "s"}, job_id="claim-crash")
+                failed_dir = spool._dir(failed_state)
+
+                def fail_transition(path):
+                    if path == failed_dir:
+                        raise OSError(f"{failed_state} fsync failed")
+
+                with mock.patch.object(plugin, "_fsync_dir", side_effect=fail_transition):
+                    with self.assertRaises(OSError):
+                        spool.claim_oldest()
+                processing = list(spool._dir("processing").glob("*.json"))
+                self.assertEqual(len(processing), 1)
+                os.utime(processing[0], (clock.value, clock.value))
+                clock.value += plugin.STALE_PROCESSING_SECONDS + 1
+                restarted = plugin.DurableSpool(Path(tmp), clock=clock)
+                self.assertEqual(restarted.recover_stale(), 1)
+                claimed = restarted.claim_oldest()
+                self.assertEqual(claimed[1]["job_id"], "claim-crash")
+
+    def test_claim_replace_failure_leaves_original_incoming_evidence(self) -> None:
+        self._persist(job_id="claim-replace")
+        with mock.patch.object(plugin, "_replace", side_effect=OSError("rename failed")):
+            with self.assertRaises(OSError):
+                self.spool.claim_oldest()
+        incoming = self.spool.list_jobs("incoming")
+        self.assertEqual(len(incoming), 1)
+        self.assertEqual(incoming[0][1]["job_id"], "claim-replace")
+        self.assertEqual(self.spool.counts()["processing"], 0)
+
+    def test_retry_rewrite_and_move_failures_converge(self) -> None:
+        for phase in ("rewrite", "move"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                clock = MutableClock()
+                spool = plugin.DurableSpool(Path(tmp), clock=clock)
+                spool.persist("/miss", {"session_id": "s"}, job_id="retry-crash")
+                path, job = spool.claim_oldest()
+                failed_dir = (spool._dir("processing") if phase == "rewrite"
+                              else spool._dir("incoming"))
+
+                def fail_transition(directory):
+                    if directory == failed_dir:
+                        raise OSError(f"retry {phase} fsync failed")
+
+                with mock.patch.object(plugin, "_fsync_dir", side_effect=fail_transition):
+                    with self.assertRaises(OSError):
+                        spool.retry(path, job, "network down")
+                processing = list(spool._dir("processing").glob("*.json"))
+                if processing:
+                    os.utime(processing[0], (clock.value, clock.value))
+                    clock.value += plugin.STALE_PROCESSING_SECONDS + 1
+                    spool = plugin.DurableSpool(Path(tmp), clock=clock)
+                    spool.recover_stale()
+                incoming = spool.list_jobs("incoming")
+                self.assertEqual(len(incoming), 1)
+                self.assertEqual(incoming[0][1]["attempts"], 1)
+                clock.value = max(clock.value, incoming[0][1]["next_attempt_at"])
+                self.assertEqual(spool.claim_oldest()[1]["job_id"], "retry-crash")
+
+    def test_dead_letter_rewrite_and_move_failures_converge(self) -> None:
+        for phase in ("rewrite", "move"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                clock = MutableClock()
+                spool = plugin.DurableSpool(Path(tmp), clock=clock)
+                spool.persist("/miss", {"session_id": "s"}, job_id="dead-crash")
+                path, job = spool.claim_oldest()
+                failed_dir = (spool._dir("processing") if phase == "rewrite"
+                              else spool._dir("dead_letter"))
+
+                def fail_transition(directory):
+                    if directory == failed_dir:
+                        raise OSError(f"dead-letter {phase} fsync failed")
+
+                with mock.patch.object(plugin, "_fsync_dir", side_effect=fail_transition):
+                    with self.assertRaises(OSError):
+                        spool.dead_letter(path, job, "HTTP 400")
+                processing = list(spool._dir("processing").glob("*.json"))
+                if processing:
+                    os.utime(processing[0], (clock.value, clock.value))
+                    clock.value += plugin.STALE_PROCESSING_SECONDS + 1
+                    spool = plugin.DurableSpool(Path(tmp), clock=clock)
+                    spool.recover_stale()
+                dead = spool.list_jobs("dead_letter")
+                self.assertEqual(len(dead), 1)
+                self.assertEqual(dead[0][1]["dead_letter_reason"], "HTTP 400")
+
+    def test_quarantine_reason_failure_preserves_raw_dead_evidence(self) -> None:
+        self.spool._ensure()
+        bad = self.spool._dir("incoming") / "000-corrupt.json"
+        bad.write_text("not JSON")
+        self._persist(job_id="after-bad-reason")
+        atomic_json = plugin._atomic_json
+
+        def fail_reason(path, value, *, replace):
+            if path.suffix == ".reason":
+                raise OSError("reason fsync failed")
+            return atomic_json(path, value, replace=replace)
+
+        with mock.patch.object(plugin, "_atomic_json", side_effect=fail_reason):
+            with self.assertRaises(OSError):
+                self.spool.claim_oldest()
+        self.assertEqual(self.spool.counts()["dead_letter"], 1)
+        self.assertEqual(self.spool.claim_oldest()[1]["job_id"], "after-bad-reason")
+
+    def test_completion_parent_fsync_failure_is_visible_after_confirmed_success(self) -> None:
+        self._persist(job_id="complete-crash")
+        provider = plugin.MemorydProvider()
+        provider._spool_store = self.spool
+        processing_dir = self.spool._dir("processing")
+
+        def fail_after_unlink(directory):
+            if directory == processing_dir and not list(processing_dir.glob("*.json")):
+                raise OSError("completion parent fsync failed")
+
+        with mock.patch.object(provider, "_send_mutation", return_value=plugin.HttpResult(
+                "success", {"ok": True}, "")), \
+                mock.patch.object(plugin, "_fsync_dir", side_effect=fail_after_unlink):
+            self.assertFalse(provider._process_one())
+        self.assertEqual(self.spool.counts(), {"incoming": 0, "processing": 0,
+                                               "dead_letter": 0})
+        self.assertIn("completion parent fsync failed", self.spool.fault())
+
+    def test_completion_unlink_failure_preserves_processing_evidence(self) -> None:
+        self._persist(job_id="unlink-crash")
+        path, _ = self.spool.claim_oldest()
+        real_unlink = Path.unlink
+
+        def fail_job_unlink(target, *args, **kwargs):
+            if target == path:
+                raise OSError("unlink failed")
+            return real_unlink(target, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", autospec=True,
+                               side_effect=fail_job_unlink):
+            with self.assertRaises(OSError):
+                self.spool.complete(path)
+        processing = self.spool.list_jobs("processing")
+        self.assertEqual(len(processing), 1)
+        self.assertEqual(processing[0][1]["job_id"], "unlink-crash")
+
     @unittest.skipIf(os.name == "nt", "POSIX permissions")
     def test_posix_permissions_are_private(self) -> None:
         self._persist()
@@ -394,12 +620,80 @@ class ProviderDurabilityTests(unittest.TestCase):
             provider._worker = worker
             worker.start()
             self.assertTrue(entered.wait(2))
+            releaser = threading.Thread(
+                target=lambda: (provider._shutdown_requested.wait(2), release.set()),
+                daemon=True)
+            releaser.start()
             provider.shutdown()
             self.assertEqual(provider._spool_store.counts()["processing"], 1)
-            release.set()
             worker.join(2)
             self.assertFalse(worker.is_alive())
             self.assertEqual(provider._spool_store.counts()["processing"], 1)
+
+    def test_shutdown_linearizes_before_worker_blocked_on_mutation_gate(self) -> None:
+        provider = self._provider()
+        provider._spool_store.persist("/miss", {"session_id": "s"},
+                                      job_id="shutdown-gate")
+        gate = provider._lifecycle_mutation_lock
+        gate.acquire()
+        try:
+            before = provider._spool_store.counts()
+            worker = threading.Thread(target=provider._process_one, daemon=True)
+            provider._worker = worker
+            worker.start()
+            shutdown = threading.Thread(target=provider.shutdown, daemon=True)
+            shutdown.start()
+            self.assertTrue(provider._shutdown_requested.wait(2))
+        finally:
+            gate.release()
+        shutdown.join(8)
+        worker.join(2)
+        self.assertFalse(shutdown.is_alive())
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(provider._spool_store.counts(), before)
+
+    def test_hook_publication_cannot_cross_shutdown_linearization(self) -> None:
+        provider = self._provider()
+        gate = provider._lifecycle_mutation_lock
+        gate.acquire()
+        miss_results = []
+        hooks = [
+            threading.Thread(target=lambda: provider.sync_turn("late", "write"),
+                             daemon=True),
+            threading.Thread(target=lambda: miss_results.append(json.loads(
+                provider.handle_tool_call(
+                    "memoryd_report_miss", {"detail": "concurrent"}))), daemon=True),
+            threading.Thread(target=lambda: provider.on_session_end([]), daemon=True),
+        ]
+        for hook in hooks:
+            hook.start()
+        stopped_worker = threading.Thread(target=lambda: None)
+        stopped_worker.start()
+        stopped_worker.join()
+        provider._worker = stopped_worker
+        shutdown = threading.Thread(target=provider.shutdown, daemon=True)
+        shutdown.start()
+        self.assertTrue(provider._shutdown_requested.wait(2))
+        before = provider._spool_store.counts()
+        gate.release()
+        shutdown.join(8)
+        for hook in hooks:
+            hook.join(2)
+        self.assertFalse(shutdown.is_alive())
+        self.assertFalse(any(hook.is_alive() for hook in hooks))
+        self.assertEqual(provider._spool_store.counts(), before)
+        self.assertFalse(miss_results[0]["queued"])
+        result = json.loads(provider.handle_tool_call(
+            "memoryd_report_miss", {"detail": "after shutdown"}))
+        self.assertFalse(result["queued"])
+
+    def test_shutdown_without_worker_still_blocks_later_hooks(self) -> None:
+        provider = self._provider()
+        self.assertIsNone(provider._worker)
+        before = provider._spool_store.counts()
+        provider.shutdown()
+        provider.sync_turn("late", "write")
+        self.assertEqual(provider._spool_store.counts(), before)
 
     def test_empty_2xx_is_not_a_confirmed_json_response(self) -> None:
         provider = self._provider()
@@ -449,6 +743,19 @@ class CliStatusTests(unittest.TestCase):
             status = cli._spool_status(Path(tmp))
             self.assertEqual(status["fault"], "unreadable spool state")
             self.assertFalse(status["healthy"])
+
+    def test_malformed_dead_letter_is_reported_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = plugin.DurableSpool(Path(tmp), clock=MutableClock())
+            spool.persist("/miss", {"session_id": "s"}, job_id="bad-dead-audit")
+            path, job = spool.claim_oldest()
+            spool.dead_letter(path, job, "HTTP 400")
+            dead_path, dead = spool.list_jobs("dead_letter")[0]
+            dead["claimed_at"] = dead["dead_lettered_at"]
+            plugin._atomic_json(dead_path, dead, replace=True)
+            status = cli._spool_status(Path(tmp))
+            self.assertFalse(status["healthy"])
+            self.assertIn("invalid dead-letter", status["fault"])
 
     def test_manual_miss_is_durably_queued(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
