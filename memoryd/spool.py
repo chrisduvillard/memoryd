@@ -28,6 +28,10 @@ class PermanentSpoolError(SpoolError):
     pass
 
 
+class JobIdentityCollision(PermanentSpoolError):
+    pass
+
+
 def _require_nonempty_string(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise PermanentSpoolError(f"invalid {field}: expected nonempty string")
@@ -76,6 +80,18 @@ def validate_job(value: object) -> dict:
         if "blob_bytes" not in value:
             raise PermanentSpoolError("missing manifest field: blob_bytes")
         _require_nonnegative_int(value["blob_bytes"], "blob_bytes")
+    request_endpoint = value.get("request_endpoint")
+    request_digest = value.get("request_body_sha256")
+    if (request_endpoint is None) != (request_digest is None):
+        raise PermanentSpoolError(
+            "request_endpoint and request_body_sha256 must appear together")
+    if request_endpoint is not None:
+        _require_nonempty_string(request_endpoint, "request_endpoint")
+        _require_nonempty_string(request_digest, "request_body_sha256")
+        if (len(request_digest) != 64 or
+                any(c not in "0123456789abcdef" for c in request_digest)):
+            raise PermanentSpoolError(
+                "invalid request_body_sha256: expected lowercase SHA-256")
     return value
 
 
@@ -96,7 +112,8 @@ def validate_legacy_job(value: object) -> dict:
 
 def ensure_layout(spool_root: Path) -> dict[str, Path]:
     paths = {name: spool_root / name for name in
-             ("blobs", "incoming", "processing", "dead-letter")}
+             ("blobs", "incoming", "processing", "dead-letter",
+              "request-identities")}
     _mkdir_durable(spool_root)
     _require_plain_directory(spool_root)
     for path in paths.values():
@@ -455,10 +472,25 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
             tmp_blob.unlink(missing_ok=True)
 
 
-def enqueue_extraction(*, spool_root: Path, session_id: str) -> dict:
+def enqueue_extraction(*, spool_root: Path, session_id: str,
+                       request_id: str | None = None,
+                       request_endpoint: str | None = None,
+                       request_body_sha256: str | None = None) -> dict:
     _require_nonempty_string(session_id, "session_id")
     paths = ensure_layout(spool_root)
-    job_id = _job_id()
+    if request_id is not None:
+        _require_nonempty_string(request_id, "request_id")
+        _require_nonempty_string(request_endpoint, "request_endpoint")
+        _require_nonempty_string(request_body_sha256, "request_body_sha256")
+        if (len(request_body_sha256) != 64 or
+                any(c not in "0123456789abcdef"
+                    for c in request_body_sha256)):
+            raise PermanentSpoolError(
+                "invalid request_body_sha256: expected lowercase SHA-256")
+    elif request_endpoint is not None or request_body_sha256 is not None:
+        raise PermanentSpoolError(
+            "request metadata requires request_id")
+    job_id = request_id or _job_id()
     job = {
         "schema_version": SCHEMA_VERSION,
         "job_id": job_id,
@@ -469,10 +501,38 @@ def enqueue_extraction(*, spool_root: Path, session_id: str) -> dict:
         "last_error": None,
         "next_attempt_at": None,
     }
+    if request_id is not None:
+        job["request_endpoint"] = request_endpoint
+        job["request_body_sha256"] = request_body_sha256
     validate_job(job)
     with _state_lock(spool_root):
-        _atomic_json(paths["incoming"] / f"{job_id}.json", job)
-    return job
+        if request_id is not None:
+            candidates = [*spool_root.glob("*.json")]
+            for state in (
+                    "incoming", "processing", "dead-letter",
+                    "request-identities"):
+                candidates.extend(paths[state].glob("*.json"))
+            for candidate in candidates:
+                try:
+                    existing = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if (not isinstance(existing, dict) or
+                        existing.get("job_id") != request_id):
+                    continue
+                if (existing.get("kind") == "extraction" and
+                        existing.get("request_endpoint") == request_endpoint and
+                        existing.get("request_body_sha256") == request_body_sha256):
+                    return {**existing, "duplicate": True}
+                raise JobIdentityCollision("request_id collision")
+            filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
+            target = paths["incoming"] / filename
+            if os.path.lexists(target):
+                raise JobIdentityCollision("request_id collision")
+        else:
+            target = paths["incoming"] / f"{job_id}.json"
+        _atomic_json(target, job)
+    return {**job, "duplicate": False}
 
 
 def load_job(path: Path) -> dict:
@@ -610,7 +670,15 @@ def dead_letter(spool_root: Path, job_path: Path, reason: str) -> Path:
 
 def complete_job(job_path: Path) -> None:
     with _state_lock(job_path.parent.parent):
-        _durable_unlink(job_path)
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        if (isinstance(job, dict) and
+                job.get("request_endpoint") is not None and
+                job.get("request_body_sha256") is not None):
+            completed = ensure_layout(job_path.parent.parent)[
+                "request-identities"] / job_path.name
+            _durable_replace(job_path, completed)
+        else:
+            _durable_unlink(job_path)
 
 
 def requeue_stale(spool_root: Path, *, stale_after_s: int = 900) -> int:

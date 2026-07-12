@@ -830,6 +830,265 @@ def test_capture_persists_snapshot_before_acknowledgement() -> None:
             core.CFG.home = old_home
 
 
+def test_daemon_mutations_are_request_idempotent() -> None:
+    class Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self):
+            self.requests: dict[str, tuple[str, str, dict]] = {}
+            self.misses = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql: str, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if "pg_advisory_xact_lock" in normalized:
+                return Result((True,))
+            if normalized.startswith("select endpoint, body_sha256, response"):
+                return Result(self.requests.get(params[0]))
+            if normalized.startswith("insert into api_request_ledger"):
+                request_id, endpoint, digest, response = params
+                self.requests[request_id] = (
+                    endpoint, digest,
+                    json.loads(response) if isinstance(response, str) else response)
+                return Result()
+            if normalized.startswith("insert into miss_signals"):
+                self.misses += 1
+                return Result()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self) -> None:
+            pass
+
+    class Pool:
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def connection(self) -> Connection:
+            return self.conn
+
+    def post(httpd, path: str, body: dict) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    conn = Connection()
+    httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+    thread = threading.Thread(target=httpd.serve_forever)
+    captured: list[dict] = []
+
+    def append_event(_conn, **event):
+        captured.append(event)
+        return f"evt-{len(captured)}"
+
+    try:
+        thread.start()
+        capture_body = {
+            "request_id": "req-capture-1",
+            "session_id": "idem-session",
+            "agent": "hermes",
+            "events": [{"kind": "user_message", "payload": {"text": "hello"}}],
+        }
+        with patch.object(server, "pool", return_value=Pool(conn)), \
+             patch("memoryd.core.append_event", side_effect=append_event):
+            code, first = post(httpd, "/capture-events", capture_body)
+            assert code == 200
+            assert first == {
+                "ok": True, "stored": 1, "request_id": "req-capture-1",
+                "duplicate": False}
+
+            # Reordered keys prove stable canonical JSON; request_id itself is
+            # excluded from the digest used for retry identity.
+            retry_body = {
+                "events": capture_body["events"],
+                "agent": "hermes",
+                "request_id": "req-capture-1",
+                "session_id": "idem-session",
+            }
+            code, duplicate = post(httpd, "/capture-events", retry_body)
+            assert code == 200
+            assert duplicate == {**first, "duplicate": True}
+            assert len(captured) == 1
+
+            changed = {**capture_body, "events": [
+                {"kind": "user_message", "payload": {"text": "changed"}}]}
+            code, collision = post(httpd, "/capture-events", changed)
+            assert code == 409
+            assert collision["error"] == "request_id collision"
+            assert len(captured) == 1
+
+            miss_body = {
+                "request_id": "req-miss-1", "session_id": "idem-session",
+                "signal": "manual", "detail": {"note": "forgot"}}
+            code, first_miss = post(httpd, "/miss", miss_body)
+            assert code == 200
+            assert first_miss == {
+                "ok": True, "request_id": "req-miss-1", "duplicate": False}
+            code, duplicate_miss = post(httpd, "/miss", miss_body)
+            assert code == 200
+            assert duplicate_miss == {**first_miss, "duplicate": True}
+            assert conn.misses == 1
+
+            cross_endpoint = {**miss_body, "request_id": "req-capture-1"}
+            code, collision = post(httpd, "/miss", cross_endpoint)
+            assert code == 409
+            assert collision["error"] == "request_id collision"
+            assert conn.misses == 1
+
+            # Legacy clients remain accepted and retain the exact old shape.
+            code, legacy_miss = post(httpd, "/miss", {
+                "session_id": "legacy", "signal": "manual"})
+            assert code == 200 and legacy_miss == {"ok": True}
+            code, legacy_capture = post(httpd, "/capture-events", {
+                "session_id": "legacy", "events": []})
+            assert code == 200 and legacy_capture == {"ok": True, "stored": 0}
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_extraction_request_identity_is_durable() -> None:
+    class Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self):
+            self.requests: dict[str, tuple[str, str, dict]] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql: str, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if "pg_advisory_xact_lock" in normalized:
+                return Result((True,))
+            if normalized.startswith("select endpoint, body_sha256, response"):
+                return Result(self.requests.get(params[0]))
+            if normalized.startswith("insert into api_request_ledger"):
+                request_id, endpoint, digest, response = params
+                self.requests[request_id] = (
+                    endpoint, digest,
+                    json.loads(response) if isinstance(response, str) else response)
+                return Result()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self) -> None:
+            pass
+
+    class Pool:
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def connection(self) -> Connection:
+            return self.conn
+
+    def post(httpd, body: dict) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}/extract",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        conn = Connection()
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever)
+        try:
+            thread.start()
+            with patch.object(server, "pool", return_value=Pool(conn)):
+                code, first = post(httpd, {
+                    "session_id": "extract-idem", "request_id": "req-extract-1"})
+                assert code == 202
+                assert first == {
+                    "queued": True, "request_id": "req-extract-1",
+                    "duplicate": False}
+
+                code, duplicate = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "extract-idem"})
+                assert code == 202
+                assert duplicate == {**first, "duplicate": True}
+                jobs = [json.loads(path.read_text(encoding="utf-8")) for path in
+                        (core.CFG.spool / "incoming").glob("*.json")]
+                assert len(jobs) == 1
+                assert jobs[0]["job_id"] == "req-extract-1"
+
+                # Simulate a drain that completes before the API transaction
+                # commits, followed by loss of that transaction. The durable
+                # spool identity must still prevent a second publication.
+                processing = spool.claim_next(core.CFG.spool)
+                assert processing is not None
+                spool.complete_job(processing)
+                conn.requests.clear()
+                code, duplicate = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "extract-idem"})
+                assert code == 202
+                assert duplicate == {**first, "duplicate": True}
+                assert not list((core.CFG.spool / "incoming").glob("*.json"))
+
+                conn.requests.clear()
+                code, collision = post(httpd, {
+                    "session_id": "different", "request_id": "req-extract-1"})
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert not list((core.CFG.spool / "incoming").glob("*.json"))
+
+                code, legacy = post(httpd, {"session_id": "legacy-extract"})
+                assert code == 202 and legacy == {"queued": True}
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            core.CFG.home = old_home
+            while True:
+                try:
+                    server.CAPTURE_Q.get_nowait()
+                except server.queue.Empty:
+                    break
+                else:
+                    server.CAPTURE_Q.task_done()
+
+
+def test_api_request_ledger_migration() -> None:
+    migration = (Path(__file__).resolve().parents[1] /
+                 "migrations" / "007_api_request_ledger.sql")
+    sql = migration.read_text(encoding="utf-8").lower()
+    assert "create table if not exists api_request_ledger" in sql
+    assert "request_id" in sql and "primary key" in sql
+    assert "endpoint" in sql
+    assert "body_sha256" in sql
+    assert "response" in sql and "jsonb" in sql
+    assert "committed_at" in sql and "timestamptz" in sql
+
+
 def test_claim_retry_and_dead_letter_preserve_manifest() -> None:
     with tempfile.TemporaryDirectory() as td:
         gc_root = Path(td) / "gc-spool"
@@ -3148,6 +3407,9 @@ if __name__ == "__main__":
     test_hook_spools_bytes_when_daemon_is_down()
     test_hook_warns_when_delivery_and_spooling_fail()
     test_capture_persists_snapshot_before_acknowledgement()
+    test_daemon_mutations_are_request_idempotent()
+    test_extraction_request_identity_is_durable()
+    test_api_request_ledger_migration()
     test_claim_retry_and_dead_letter_preserve_manifest()
     test_spool_state_transitions_sync_directories_and_leases()
     test_legacy_missing_source_is_preserved()
@@ -3168,4 +3430,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("31 passed, 0 failed")
+    print("34 passed, 0 failed")

@@ -14,6 +14,7 @@ auditable, and installable anywhere. Endpoints (spec §2):
 from __future__ import annotations
 
 import json
+import hashlib
 import queue
 import re
 import threading
@@ -25,7 +26,7 @@ from pathlib import Path
 from .core import CFG, new_id, pool
 from .ingest import drain_spool
 from .recall import build_packet
-from .spool import enqueue_capture, enqueue_extraction
+from .spool import JobIdentityCollision, enqueue_capture, enqueue_extraction
 
 CAPTURE_Q: "queue.Queue[dict]" = queue.Queue()
 ADMIN_POST_ENDPOINTS = {
@@ -40,6 +41,103 @@ ADMIN_POST_ENDPOINTS = {
 
 def _nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+class RequestIdentityCollision(ValueError):
+    pass
+
+
+def _request_identity(body: dict) -> tuple[str, str] | None:
+    if "request_id" not in body:
+        return None
+    request_id = body["request_id"]
+    if not _nonempty_string(request_id):
+        raise ValueError("request_id must be a nonempty string")
+    canonical = {key: value for key, value in body.items()
+                 if key != "request_id"}
+    encoded = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode()
+    return request_id, hashlib.sha256(encoded).hexdigest()
+
+
+def _start_idempotent_request(conn, *, request_id: str,
+                              endpoint: str, body_sha256: str) -> dict | None:
+    # Serialize claim/check/mutation/record for one identity. The transaction
+    # lock prevents concurrent first calls from both applying their mutation.
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (request_id,))
+    row = conn.execute(
+        "SELECT endpoint, body_sha256, response FROM api_request_ledger "
+        "WHERE request_id=%s", (request_id,)).fetchone()
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        saved_endpoint = row["endpoint"]
+        saved_digest = row["body_sha256"]
+        response = row["response"]
+    else:
+        saved_endpoint, saved_digest, response = row
+    if saved_endpoint != endpoint or saved_digest != body_sha256:
+        raise RequestIdentityCollision("request_id collision")
+    if isinstance(response, str):
+        response = json.loads(response)
+    return {**response, "duplicate": True}
+
+
+def _record_idempotent_request(conn, *, request_id: str, endpoint: str,
+                               body_sha256: str, response: dict) -> None:
+    conn.execute(
+        "INSERT INTO api_request_ledger "
+        "(request_id, endpoint, body_sha256, response) VALUES (%s,%s,%s,%s::jsonb)",
+        (request_id, endpoint, body_sha256,
+         json.dumps(response, sort_keys=True, separators=(",", ":"))))
+
+
+def _store_capture_events(conn, body: dict) -> int:
+    from .adapters import event_to_envelope
+    from .core import append_event, archive_bytes
+    from datetime import datetime as _dt, timezone as _tz
+
+    allowed = {"user_message", "agent_response", "tool_call", "tool_result",
+               "session_start", "session_end", "external_note", "delegation"}
+    agent = body.get("agent", "unknown")
+    project = body.get("project")
+    stored = 0
+    for ev in body["events"][:200]:
+        envelope = event_to_envelope({
+            **ev,
+            "session_id": body["session_id"],
+            "agent": agent,
+            "project": project,
+        }, runtime=agent)
+        kind = envelope["event_type"]
+        if (kind not in allowed and
+                not re.match(r"^[a-z][a-z0-9_]{1,63}$", str(kind))):
+            continue
+        payload = ev.get("payload") or {}
+        payload = {
+            **payload,
+            "_adapter": {
+                "runtime": envelope["runtime"],
+                "parent_session_id": envelope["parent_session_id"],
+                "content_ref": envelope["content_ref"],
+            },
+        }
+        text = payload.get("text", "")
+        sha = None
+        if isinstance(text, str) and len(text) > 4000:
+            day = _dt.now(_tz.utc)
+            sha = archive_bytes(
+                text.encode(), "text/plain",
+                f"{agent}/{day:%Y/%m/%d}/{body['session_id']}-{stored}.txt")
+            payload = {**payload, "text": text[:4000], "truncated": True}
+        append_event(
+            conn, kind=kind, session_id=body["session_id"],
+            agent=agent, project=project, raw_sha256=sha, payload=payload)
+        stored += 1
+    return stored
 
 
 def _capture_worker() -> None:
@@ -144,51 +242,31 @@ class Handler(BaseHTTPRequestHandler):
             if not required <= body.keys():
                 self._json(400, {"error": f"missing fields: {required - body.keys()}"})
                 return
-            allowed = {"user_message", "agent_response", "tool_call", "tool_result",
-                       "session_start", "session_end", "external_note", "delegation"}
-            agent = body.get("agent", "unknown")
-            project = body.get("project")
-            stored = 0
             try:
-                from .adapters import event_to_envelope
-                from .core import archive_bytes
-                from datetime import datetime as _dt, timezone as _tz
+                identity = _request_identity(body)
                 with pool().connection() as conn:
-                    for ev in body["events"][:200]:
-                        envelope = event_to_envelope({
-                            **ev,
-                            "session_id": body["session_id"],
-                            "agent": agent,
-                            "project": project,
-                        }, runtime=agent)
-                        kind = envelope["event_type"]
-                        if kind not in allowed and not re.match(r"^[a-z][a-z0-9_]{1,63}$", str(kind)):
-                            continue
-                        payload = ev.get("payload") or {}
-                        payload = {
-                            **payload,
-                            "_adapter": {
-                                "runtime": envelope["runtime"],
-                                "parent_session_id": envelope["parent_session_id"],
-                                "content_ref": envelope["content_ref"],
-                            },
-                        }
-                        text = payload.get("text", "")
-                        sha = None
-                        if isinstance(text, str) and len(text) > 4000:
-                            day = _dt.now(_tz.utc)
-                            sha = archive_bytes(
-                                text.encode(), "text/plain",
-                                f"{agent}/{day:%Y/%m/%d}/{body['session_id']}-{stored}.txt")
-                            payload = {**payload, "text": text[:4000],
-                                       "truncated": True}
-                        from .core import append_event as _ae
-                        _ae(conn, kind=kind, session_id=body["session_id"],
-                            agent=agent, project=project, raw_sha256=sha,
-                            payload=payload)
-                        stored += 1
+                    if identity is not None:
+                        request_id, digest = identity
+                        duplicate = _start_idempotent_request(
+                            conn, request_id=request_id,
+                            endpoint=self.path, body_sha256=digest)
+                        if duplicate is not None:
+                            self._json(200, duplicate)
+                            return
+                    stored = _store_capture_events(conn, body)
+                    response = {"ok": True, "stored": stored}
+                    if identity is not None:
+                        response.update({
+                            "request_id": request_id, "duplicate": False})
+                        _record_idempotent_request(
+                            conn, request_id=request_id, endpoint=self.path,
+                            body_sha256=digest, response=response)
                     conn.commit()
-                self._json(200, {"ok": True, "stored": stored})
+                self._json(200, response)
+            except RequestIdentityCollision:
+                self._json(409, {"error": "request_id collision"})
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"error": str(e)})
         elif self.path == "/extract":
@@ -197,21 +275,74 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "session_id required"})
                 return
             try:
-                enqueue_extraction(spool_root=CFG.spool, session_id=sid)
+                identity = _request_identity(body)
+                if identity is None:
+                    enqueue_extraction(spool_root=CFG.spool, session_id=sid)
+                    response = {"queued": True}
+                else:
+                    request_id, digest = identity
+                    with pool().connection() as conn:
+                        duplicate = _start_idempotent_request(
+                            conn, request_id=request_id,
+                            endpoint=self.path, body_sha256=digest)
+                        if duplicate is not None:
+                            self._json(202, duplicate)
+                            return
+                        job = enqueue_extraction(
+                            spool_root=CFG.spool, session_id=sid,
+                            request_id=request_id, request_endpoint=self.path,
+                            request_body_sha256=digest)
+                        response = {
+                            "queued": True, "request_id": request_id,
+                            "duplicate": False}
+                        _record_idempotent_request(
+                            conn, request_id=request_id, endpoint=self.path,
+                            body_sha256=digest, response=response)
+                        conn.commit()
+                    if job["duplicate"]:
+                        response["duplicate"] = True
+            except (RequestIdentityCollision, JobIdentityCollision):
+                self._json(409, {"error": "request_id collision"})
+                return
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
             except Exception as exc:  # noqa: BLE001 — report persistence failure
                 self._json(
                     500, {"error": f"extraction could not be persisted: {exc}"})
                 return
             CAPTURE_Q.put({"drain_spool": True})
-            self._json(202, {"queued": True})
+            self._json(202, response)
         elif self.path == "/miss":
-            with pool().connection() as conn:
-                conn.execute(
-                    "INSERT INTO miss_signals (session_id, signal, detail) VALUES (%s,%s,%s)",
-                    (body.get("session_id"), body.get("signal", "manual"),
-                     json.dumps(body.get("detail", {}))))
-                conn.commit()
-            self._json(200, {"ok": True})
+            try:
+                identity = _request_identity(body)
+                with pool().connection() as conn:
+                    if identity is not None:
+                        request_id, digest = identity
+                        duplicate = _start_idempotent_request(
+                            conn, request_id=request_id,
+                            endpoint=self.path, body_sha256=digest)
+                        if duplicate is not None:
+                            self._json(200, duplicate)
+                            return
+                    conn.execute(
+                        "INSERT INTO miss_signals (session_id, signal, detail) "
+                        "VALUES (%s,%s,%s)",
+                        (body.get("session_id"), body.get("signal", "manual"),
+                         json.dumps(body.get("detail", {}))))
+                    response = {"ok": True}
+                    if identity is not None:
+                        response.update({
+                            "request_id": request_id, "duplicate": False})
+                        _record_idempotent_request(
+                            conn, request_id=request_id, endpoint=self.path,
+                            body_sha256=digest, response=response)
+                    conn.commit()
+                self._json(200, response)
+            except RequestIdentityCollision:
+                self._json(409, {"error": "request_id collision"})
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
         elif self.path == "/admin/model-profiles":
             from .model_gateway import get_model_profile, list_model_profiles
             profiles = [get_model_profile(name).to_dict() for name in list_model_profiles()]
