@@ -9,6 +9,10 @@
                        apply conservative, evidence-preserving repairs
   memoryd review ...   human review CLI (delegates to memoryd.review)
   memoryd microsleep   nightly consolidation (normally runs on a schedule)
+  memoryd backup create [--output PATH] [--retain 14]
+  memoryd backup list [--output PATH]
+  memoryd backup verify SNAPSHOT
+  memoryd backup restore SNAPSHOT --dsn TARGET_DSN --home TARGET_HOME
   memoryd uninstall    remove hooks/autostart; data is never touched
 
 Everything is idempotent: re-running `install` adopts what exists.
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -29,7 +34,7 @@ from pathlib import Path
 CONTAINER = "memoryd-pgvector"
 VOLUME = "memoryd_pgdata"
 IMAGE = "pgvector/pgvector:pg16"
-PG_PASSWORD = "memoryd"  # container binds 127.0.0.1 only; see README security note
+LEGACY_PG_PASSWORD = "memoryd"
 HOOK_SENTINEL = "-m memoryd.hook"
 HOOK_EVENTS = {
     "UserPromptSubmit": ("recall", 5),
@@ -154,40 +159,41 @@ def ensure_container() -> str:
     if exists == 0:
         _docker("start", CONTAINER)
         port = _container_port() or "5432"
-        admin = f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres"
+        admin = (f"postgresql://postgres:{LEGACY_PG_PASSWORD}"
+                 f"@127.0.0.1:{port}/postgres")
         if not _pg_ready(admin, 30):
             raise SystemExit(
                 f"container {CONTAINER} exists but postgres is not reachable on "
-                f"port {port} with the expected credentials. Remove it "
-                f"(docker rm -f {CONTAINER}) or set MEMORYD_DSN, then re-run.")
+                f"port {port} with the legacy credentials. Its credentials are "
+                "unknown and it has not been removed. Restore a working dsn in "
+                f"{_home() / 'config.json'} or set MEMORYD_DSN, then re-run.")
         with psycopg.connect(admin, autocommit=True) as c:
             has_db = c.execute(
                 "SELECT 1 FROM pg_database WHERE datname='memoryd'").fetchone()
-        if has_db:
-            # real data lives here — adopt it, just make it survive reboots
-            _docker("update", "--restart", "unless-stopped", CONTAINER)
-            return f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{port}/memoryd"
-        # no memoryd DB inside -> holds no memoryd data; recreate properly
-        # (127.0.0.1 bind, named volume, restart policy)
-        print(f"  container  recreating {CONTAINER}: no memoryd database inside; "
-              "rebinding to 127.0.0.1 with a persistent volume")
-        _docker("rm", "-f", CONTAINER)
+            if not has_db:
+                c.execute("CREATE DATABASE memoryd")
+        # Existing containers are never destroyed: the volume may contain data
+        # outside memoryd that the installer cannot safely classify.
+        _docker("update", "--restart", "unless-stopped", CONTAINER)
+        return (f"postgresql://postgres:{LEGACY_PG_PASSWORD}"
+                f"@127.0.0.1:{port}/memoryd")
 
     port_n = _free_port()
+    password = secrets.token_urlsafe(32)
     code, out = _docker(
         "run", "-d", "--name", CONTAINER, "--restart", "unless-stopped",
         "-v", f"{VOLUME}:/var/lib/postgresql/data",
-        "-e", f"POSTGRES_PASSWORD={PG_PASSWORD}", "-e", "POSTGRES_DB=memoryd",
+        "-e", f"POSTGRES_PASSWORD={password}", "-e", "POSTGRES_DB=memoryd",
         "-p", f"127.0.0.1:{port_n}:5432", IMAGE)
     if code != 0:
-        raise SystemExit(f"docker run failed: {out}")
-    admin = f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{port_n}/postgres"
+        raise SystemExit(f"docker run failed: {out.replace(password, '***')}")
+    admin = f"postgresql://postgres:{password}@127.0.0.1:{port_n}/postgres"
     if not _pg_ready(admin, 90):
         raise SystemExit("postgres container did not become ready within 90s")
     with psycopg.connect(admin, autocommit=True) as c:
         if not c.execute("SELECT 1 FROM pg_database WHERE datname='memoryd'").fetchone():
             c.execute("CREATE DATABASE memoryd")  # pre-existing volume without it
-    return f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{port_n}/memoryd"
+    return f"postgresql://postgres:{password}@127.0.0.1:{port_n}/memoryd"
 
 
 def apply_migrations(dsn: str) -> list[str]:
@@ -324,6 +330,27 @@ Persistent=true
 WantedBy=timers.target
 """
 
+_SYSTEMD_BACKUP_SERVICE = """[Unit]
+Description=memoryd daily verified backup
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/systemctl --user stop memoryd.service
+ExecStart={python} -m memoryd backup create --retain 14
+ExecStopPost=/usr/bin/systemctl --user start memoryd.service
+"""
+
+_SYSTEMD_BACKUP_TIMER = """[Unit]
+Description=memoryd daily verified backup
+
+[Timer]
+OnCalendar=*-*-* 02:35:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
 _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -366,9 +393,15 @@ def install_autostart() -> None:
             _SYSTEMD_SLEEP_SERVICE.format(python=sys.executable), encoding="utf-8")
         (unit_dir / "memoryd-microsleep.timer").write_text(
             _SYSTEMD_SLEEP_TIMER, encoding="utf-8")
+        (unit_dir / "memoryd-backup.service").write_text(
+            _SYSTEMD_BACKUP_SERVICE.format(python=sys.executable),
+            encoding="utf-8")
+        (unit_dir / "memoryd-backup.timer").write_text(
+            _SYSTEMD_BACKUP_TIMER, encoding="utf-8")
         _run(["systemctl", "--user", "daemon-reload"])
         code, out = _run(["systemctl", "--user", "enable", "--now",
-                          "memoryd.service", "memoryd-microsleep.timer"])
+                          "memoryd.service", "memoryd-microsleep.timer",
+                          "memoryd-backup.timer"])
         print("  autostart  systemd user units enabled"
               + (" (headless box? run: loginctl enable-linger $USER)" if code == 0
                  else f" FAILED: {out}"))
@@ -597,10 +630,12 @@ def uninstall() -> None:
         shim.unlink(missing_ok=True)
     elif sys.platform.startswith("linux"):
         _run(["systemctl", "--user", "disable", "--now",
-              "memoryd.service", "memoryd-microsleep.timer"])
+              "memoryd.service", "memoryd-microsleep.timer",
+              "memoryd-backup.timer"])
         unit_dir = Path("~/.config/systemd/user").expanduser()
         for n in ("memoryd.service", "memoryd-microsleep.service",
-                  "memoryd-microsleep.timer"):
+                  "memoryd-microsleep.timer", "memoryd-backup.service",
+                  "memoryd-backup.timer"):
             (unit_dir / n).unlink(missing_ok=True)
         _run(["systemctl", "--user", "daemon-reload"])
     elif sys.platform == "darwin":
@@ -645,6 +680,9 @@ def main() -> None:
     elif cmd == "microsleep":
         from .microsleep import main as microsleep_main
         microsleep_main()
+    elif cmd == "backup":
+        from .backup import main as backup_main
+        sys.exit(backup_main(sys.argv[2:]))
     elif cmd == "uninstall":
         uninstall()
     else:

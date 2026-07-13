@@ -1,0 +1,730 @@
+"""Offline, verified backups for memoryd's database and durable files."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from . import __version__
+
+SCHEMA_VERSION = 1
+SNAPSHOT_RE = re.compile(r"^\d{8}T\d{6}Z-v1$")
+SNAPSHOT_FILES = {
+    "database.dump", "memory.tar.gz", "config.sanitized.json",
+    "manifest.json",
+}
+PAYLOAD_FILES = SNAPSHOT_FILES - {"manifest.json"}
+MANIFEST_FIELDS = {
+    "schema_version", "created_at", "memoryd_version", "db_migrations",
+    "required_secret_env_names", "files",
+}
+KNOWN_SECRET_ENV_NAMES = {
+    "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY",
+    "VOYAGE_API_KEY",
+}
+SECRET_KEY_RE = re.compile(
+    r"(?:api[_-]?key|password|passwd|secret|token|credential|dsn)$", re.I)
+SECRET_ENV_RE = re.compile(
+    r"(?:^|_)(?:API_KEY|PASSWORD|PASSWD|SECRET|TOKEN|CREDENTIALS?)(?:$|_)",
+    re.I)
+
+
+class BackupError(RuntimeError):
+    """An operator-actionable backup or restore refusal."""
+
+
+@dataclass(frozen=True)
+class Verification:
+    ok: bool
+    reason: str = "ok"
+
+
+@dataclass(frozen=True)
+class BackupListing:
+    timestamp: str
+    path: Path
+    ok: bool
+    reason: str
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _default_output() -> Path:
+    return Path("~/memory/backups").expanduser()
+
+
+def _default_home() -> Path:
+    return Path(os.environ.get("MEMORYD_HOME", "~/memory")).expanduser()
+
+
+def _chmod(path: Path, mode: int) -> None:
+    if os.name != "nt":
+        try:
+            os.chmod(path, mode, follow_symlinks=False)
+        except OSError:
+            pass
+
+
+def _ensure_owner_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    _chmod(path, 0o700)
+
+
+def _atomic_rename(source: Path, destination: Path) -> None:
+    """Publish atomically, tolerating short-lived Windows scanner handles."""
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if os.name != "nt" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _daemon_health() -> dict | None:
+    from .cli import _health
+    return _health()
+
+
+def _doctor_findings(home: Path) -> list[Any]:
+    from .doctor import inspect_archive, inspect_spool
+    return [*inspect_spool(home / "spool"),
+            *inspect_archive(home / "archive")]
+
+
+def _finding_value(finding: Any, name: str, default: str = "") -> str:
+    if isinstance(finding, dict):
+        return str(finding.get(name, default))
+    return str(getattr(finding, name, default))
+
+
+def _read_config(home: Path) -> dict[str, Any]:
+    path = home / "config.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise BackupError(f"cannot read memoryd config {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise BackupError(f"memoryd config is not an object: {path}")
+    return value
+
+
+def _is_secret_key(key: str) -> bool:
+    return bool(SECRET_KEY_RE.search(key))
+
+
+def _is_secret_env(key: str) -> bool:
+    return bool(SECRET_ENV_RE.search(key))
+
+
+def _sanitize_config(value: dict[str, Any]) -> tuple[dict[str, Any], list[str], set[str]]:
+    required: set[str] = set()
+    removed_values: set[str] = set()
+
+    def clean(item: Any, *, parent: str = "") -> Any:
+        if isinstance(item, dict):
+            result: dict[str, Any] = {}
+            for raw_key, child in item.items():
+                key = str(raw_key)
+                secret = _is_secret_key(key) or (parent == "env" and _is_secret_env(key))
+                if secret:
+                    if parent == "env":
+                        required.add(key)
+                    if isinstance(child, str) and child:
+                        removed_values.add(child)
+                    continue
+                result[key] = clean(child, parent=key)
+            return result
+        if isinstance(item, list):
+            return [clean(child, parent=parent) for child in item]
+        return item
+
+    return clean(value), sorted(required), removed_values
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_entry(path: Path) -> dict[str, Any]:
+    return {"sha256": _sha256(path), "bytes": path.stat().st_size}
+
+
+def _safe_source_tree(root: Path) -> None:
+    if not root.exists():
+        return
+    trusted = root.resolve()
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if entry.is_symlink():
+                    target = path.resolve(strict=True)
+                    try:
+                        target.relative_to(trusted)
+                    except ValueError as exc:
+                        raise BackupError(
+                            f"refusing external link in backup source: {path}") from exc
+                    if not target.is_file():
+                        raise BackupError(
+                            f"refusing non-file link in backup source: {path}")
+                elif entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                elif not entry.is_file(follow_symlinks=False):
+                    raise BackupError(
+                        f"refusing special file in backup source: {path}")
+
+
+def _tar_filter(member: tarfile.TarInfo) -> tarfile.TarInfo:
+    member.uid = member.gid = 0
+    member.uname = member.gname = ""
+    member.mode = 0o700 if member.isdir() else 0o600
+    return member
+
+
+def _create_memory_tar(home: Path, destination: Path) -> None:
+    for name in ("archive", "spool"):
+        _safe_source_tree(home / name)
+    with tarfile.open(destination, "w:gz", dereference=True) as archive:
+        for name in ("archive", "spool"):
+            source = home / name
+            if source.is_dir():
+                archive.add(source, arcname=name, recursive=True,
+                            filter=_tar_filter)
+            else:
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.DIRTYPE
+                archive.addfile(_tar_filter(member))
+
+
+def _safe_conninfo(dsn: str) -> tuple[str, dict[str, str], dict[str, str]]:
+    try:
+        from psycopg.conninfo import conninfo_to_dict, make_conninfo
+        values = conninfo_to_dict(dsn)
+    except Exception as exc:  # noqa: BLE001
+        raise BackupError(f"invalid PostgreSQL DSN: {exc}") from exc
+    password = values.pop("password", None)
+    env = os.environ.copy()
+    if password:
+        env["PGPASSWORD"] = password
+    try:
+        safe = make_conninfo(**values)
+    except Exception as exc:  # noqa: BLE001
+        raise BackupError(f"invalid PostgreSQL DSN: {exc}") from exc
+    return safe, env, values
+
+
+def _run_tool(command: list[str], *, env: dict[str, str]) -> None:
+    try:
+        result = subprocess.run(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, shell=False, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BackupError(f"database tool failed: {exc}") from exc
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        password = env.get("PGPASSWORD")
+        if password:
+            detail = detail.replace(password, "***")
+        raise BackupError(
+            f"database tool exited {result.returncode}: {detail or 'no diagnostic'}")
+
+
+def _docker_available() -> bool:
+    from .cli import CONTAINER, _docker
+    return _docker("inspect", CONTAINER)[0] == 0
+
+
+def _docker_tool(arguments: list[str]) -> None:
+    from .cli import CONTAINER, _docker
+    code, detail = _docker("exec", CONTAINER, *arguments)
+    if code:
+        raise BackupError(f"database tool in Docker failed: {detail}")
+
+
+def _container_connection(values: dict[str, str]) -> tuple[str, str] | None:
+    from .cli import _container_port
+    host = values.get("host", "")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return None
+    if values.get("port", "5432") != (_container_port() or ""):
+        return None
+    return values.get("user", "postgres"), values.get("dbname", "memoryd")
+
+
+def _dump_database(dsn: str, destination: Path) -> None:
+    safe_dsn, env, values = _safe_conninfo(dsn)
+    tool = shutil.which("pg_dump")
+    if tool:
+        _run_tool([tool, "--format=custom", "--file", str(destination),
+                   "--dbname", safe_dsn], env=env)
+        return
+    connection = _container_connection(values)
+    if not connection or not _docker_available():
+        raise BackupError(
+            "pg_dump is unavailable; install PostgreSQL client tools or use "
+            "the installer-managed memoryd-pgvector container")
+    from .cli import CONTAINER, _docker
+    user, database = connection
+    remote = "/tmp/memoryd-backup.dump"
+    try:
+        _docker_tool(["pg_dump", "-U", user, "-d", database,
+                      "--format=custom", "--file", remote])
+        code, detail = _docker("cp", f"{CONTAINER}:{remote}", str(destination))
+        if code:
+            raise BackupError(f"copying database dump from Docker failed: {detail}")
+    finally:
+        _docker("exec", CONTAINER, "rm", "-f", remote)
+
+
+def _restore_database(dump: Path, dsn: str) -> None:
+    safe_dsn, env, values = _safe_conninfo(dsn)
+    tool = shutil.which("pg_restore")
+    if tool:
+        _run_tool([tool, "--exit-on-error", "--no-owner", "--dbname",
+                   safe_dsn, str(dump)], env=env)
+        return
+    connection = _container_connection(values)
+    if not connection or not _docker_available():
+        raise BackupError(
+            "pg_restore is unavailable; install PostgreSQL client tools or use "
+            "the installer-managed memoryd-pgvector container")
+    from .cli import CONTAINER, _docker
+    user, database = connection
+    remote = "/tmp/memoryd-restore.dump"
+    code, detail = _docker("cp", str(dump), f"{CONTAINER}:{remote}")
+    if code:
+        raise BackupError(f"copying database dump into Docker failed: {detail}")
+    try:
+        _docker_tool(["pg_restore", "--exit-on-error", "--no-owner",
+                      "-U", user, "-d", database, remote])
+    finally:
+        _docker("exec", CONTAINER, "rm", "-f", remote)
+
+
+def _migration_filenames() -> list[str]:
+    from .cli import _resource_dir
+    return sorted(path.name for path in _resource_dir("migrations").glob("*.sql"))
+
+
+def _snapshot_name(created: datetime) -> str:
+    return created.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ-v1")
+
+
+def create_backup(*, output: Path | str | None = None,
+                  retain: int = 14, home: Path | str | None = None) -> Path:
+    """Create, verify, atomically publish, then safely retain snapshots."""
+    if retain < 1:
+        raise BackupError("--retain must be at least 1")
+    if _daemon_health() is not None:
+        raise BackupError("stop the memoryd daemon before creating a backup")
+    config_home = Path(home) if home is not None else _default_home()
+    config = _read_config(config_home)
+    configured_home = config.get("home")
+    if (not os.environ.get("MEMORYD_HOME") and
+            isinstance(configured_home, str) and configured_home):
+        source_home = Path(configured_home).expanduser()
+    else:
+        source_home = config_home
+    findings = [finding for finding in _doctor_findings(source_home)
+                if _finding_value(finding, "severity") == "error"]
+    if findings:
+        codes = ", ".join(_finding_value(item, "code", "integrity_error")
+                          for item in findings)
+        raise BackupError(f"doctor found integrity errors: {codes}")
+    dsn = os.environ.get("MEMORYD_DSN") or config.get("dsn")
+    if not isinstance(dsn, str) or not dsn:
+        raise BackupError("no PostgreSQL DSN configured")
+    sanitized, required, removed_values = _sanitize_config(config)
+    environment_secrets = {
+        name: os.environ[name] for name in KNOWN_SECRET_ENV_NAMES
+        if os.environ.get(name)
+    }
+    required = sorted(set(required) | set(environment_secrets))
+    removed_values.update(environment_secrets.values())
+
+    root = Path(output) if output is not None else _default_output()
+    if os.path.lexists(root) and root.is_symlink():
+        raise BackupError(f"backup output must not be a symlink: {root}")
+    _ensure_owner_dir(root)
+    created = _utc_now()
+    final = root / _snapshot_name(created)
+    if os.path.lexists(final):
+        raise BackupError(f"snapshot already exists: {final}")
+    staging = Path(tempfile.mkdtemp(prefix=".memoryd-backup-", dir=root))
+    _chmod(staging, 0o700)
+    try:
+        dump = staging / "database.dump"
+        memory_tar = staging / "memory.tar.gz"
+        sanitized_path = staging / "config.sanitized.json"
+        _dump_database(dsn, dump)
+        _create_memory_tar(source_home, memory_tar)
+        sanitized_path.write_text(
+            json.dumps(sanitized, indent=2, sort_keys=True), encoding="utf-8")
+        for path in (dump, memory_tar, sanitized_path):
+            _chmod(path, 0o600)
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "created_at": created.astimezone(timezone.utc).isoformat().replace(
+                "+00:00", "Z"),
+            "memoryd_version": __version__,
+            "db_migrations": _migration_filenames(),
+            "required_secret_env_names": required,
+            "files": {name: _file_entry(staging / name)
+                      for name in sorted(PAYLOAD_FILES)},
+        }
+        manifest_text = json.dumps(manifest, indent=2, sort_keys=True)
+        config_text = sanitized_path.read_text(encoding="utf-8")
+        if any(secret and secret in manifest_text + config_text
+               for secret in removed_values):
+            raise BackupError("sanitized backup metadata still contains a secret")
+        manifest_path = staging / "manifest.json"
+        manifest_path.write_text(manifest_text, encoding="utf-8")
+        _chmod(manifest_path, 0o600)
+        result = verify_snapshot(staging, require_generated_name=False)
+        if not result.ok:
+            raise BackupError(f"created snapshot failed verification: {result.reason}")
+        _atomic_rename(staging, final)
+        staging = None
+        _apply_retention(root, retain)
+        return final
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise BackupError(f"backup creation failed: {exc}") from exc
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _load_manifest(snapshot: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise BackupError(f"manifest is unreadable: {exc}") from exc
+    if not isinstance(value, dict):
+        raise BackupError("manifest is not an object")
+    return value
+
+
+def _validate_config_secrets(value: Any, *, parent: str = "") -> None:
+    if isinstance(value, dict):
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            if _is_secret_key(key) or (parent == "env" and _is_secret_env(key)):
+                raise BackupError(f"sanitized config contains secret field: {key}")
+            _validate_config_secrets(child, parent=key)
+    elif isinstance(value, list):
+        for child in value:
+            _validate_config_secrets(child, parent=parent)
+    elif isinstance(value, str):
+        if re.search(r"://[^\s:/@]+:[^\s@]+@", value):
+            raise BackupError("sanitized config contains a password-bearing DSN")
+
+
+def _validate_tar(path: Path) -> None:
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            seen: set[str] = set()
+            roots: set[str] = set()
+            for member in archive:
+                name = member.name
+                pure = PurePosixPath(name)
+                if (not name or not pure.parts or "\\" in name or pure.is_absolute() or
+                        ".." in pure.parts or pure.parts[0] not in {"archive", "spool"}):
+                    raise BackupError(f"unsafe tar member path: {name!r}")
+                if name in seen:
+                    raise BackupError(f"duplicate tar member: {name}")
+                seen.add(name)
+                if not (member.isdir() or member.isreg()):
+                    raise BackupError(f"unsafe tar member type: {name}")
+                if len(pure.parts) == 1 and member.isdir():
+                    roots.add(name)
+                if member.isreg():
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise BackupError(f"unreadable tar member: {name}")
+                    with source:
+                        while source.read(1024 * 1024):
+                            pass
+            missing = {"archive", "spool"} - roots
+            if missing:
+                raise BackupError(
+                    f"memory tar is missing required roots: {sorted(missing)!r}")
+    except BackupError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        raise BackupError(f"memory tar is unreadable: {exc}") from exc
+
+
+def verify_snapshot(snapshot: Path | str, *,
+                    require_generated_name: bool = True) -> Verification:
+    path = Path(snapshot)
+    try:
+        if require_generated_name and not SNAPSHOT_RE.fullmatch(path.name):
+            raise BackupError("snapshot name is not a generated v1 name")
+        if path.is_symlink() or not path.is_dir():
+            raise BackupError("snapshot must be a real directory")
+        actual = {child.name for child in path.iterdir()}
+        if actual != SNAPSHOT_FILES:
+            raise BackupError(
+                f"snapshot file allowlist mismatch: {sorted(actual)!r}")
+        for child in path.iterdir():
+            mode = child.stat(follow_symlinks=False).st_mode
+            if child.is_symlink() or not stat.S_ISREG(mode):
+                raise BackupError(f"snapshot entry is not a regular file: {child.name}")
+        manifest = _load_manifest(path)
+        if set(manifest) != MANIFEST_FIELDS:
+            raise BackupError("manifest field allowlist mismatch")
+        if manifest.get("schema_version") != SCHEMA_VERSION:
+            raise BackupError("unsupported manifest schema_version")
+        created_at = manifest.get("created_at")
+        if not isinstance(created_at, str) or not created_at.endswith("Z"):
+            raise BackupError("invalid manifest created_at")
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise BackupError("invalid manifest created_at") from exc
+        if created.utcoffset() != timezone.utc.utcoffset(created):
+            raise BackupError("manifest created_at is not UTC")
+        if require_generated_name and _snapshot_name(created) != path.name:
+            raise BackupError("snapshot name does not match manifest created_at")
+        version = manifest.get("memoryd_version")
+        if not isinstance(version, str) or not version:
+            raise BackupError("invalid manifest memoryd_version")
+        files = manifest.get("files")
+        if not isinstance(files, dict) or set(files) != PAYLOAD_FILES:
+            raise BackupError("manifest file allowlist mismatch")
+        for name in sorted(PAYLOAD_FILES):
+            entry = files.get(name)
+            if (not isinstance(entry, dict) or set(entry) != {"sha256", "bytes"} or
+                    not isinstance(entry.get("sha256"), str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) or
+                    type(entry.get("bytes")) is not int or entry["bytes"] < 0):
+                raise BackupError(f"invalid manifest entry for {name}")
+            target = path / name
+            if target.stat().st_size != entry["bytes"]:
+                raise BackupError(f"size mismatch for {name}")
+            if _sha256(target) != entry["sha256"]:
+                raise BackupError(f"checksum mismatch for {name}")
+        required = manifest.get("required_secret_env_names")
+        if (not isinstance(required, list) or
+                any(not isinstance(name, str) or not _is_secret_env(name)
+                    for name in required) or
+                required != sorted(set(required))):
+            raise BackupError("invalid required_secret_env_names")
+        migrations = manifest.get("db_migrations")
+        if (not isinstance(migrations, list) or
+                any(not isinstance(name, str) or Path(name).name != name
+                    for name in migrations)):
+            raise BackupError("invalid db_migrations")
+        try:
+            config = json.loads(
+                (path / "config.sanitized.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise BackupError(f"sanitized config is unreadable: {exc}") from exc
+        if not isinstance(config, dict):
+            raise BackupError("sanitized config is not an object")
+        _validate_config_secrets(config)
+        serialized = json.dumps({"manifest": manifest, "config": config})
+        for key, value in os.environ.items():
+            if (_is_secret_env(key) and len(value) >= 8 and
+                    value in serialized):
+                raise BackupError(f"snapshot metadata contains secret value from {key}")
+        with (path / "database.dump").open("rb") as handle:
+            if handle.read(5) != b"PGDMP":
+                raise BackupError("database.dump is not PostgreSQL custom format")
+        _validate_tar(path / "memory.tar.gz")
+        return Verification(True)
+    except BackupError as exc:
+        return Verification(False, str(exc))
+    except OSError as exc:
+        return Verification(False, f"snapshot is unreadable: {exc}")
+
+
+def list_backups(output: Path | str | None = None) -> list[BackupListing]:
+    root = Path(output) if output is not None else _default_output()
+    try:
+        candidates = sorted(
+            (path for path in root.iterdir() if SNAPSHOT_RE.fullmatch(path.name)),
+            key=lambda path: path.name)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise BackupError(f"cannot list backup output {root}: {exc}") from exc
+    rows: list[BackupListing] = []
+    for path in candidates:
+        result = verify_snapshot(path)
+        rows.append(BackupListing(path.name.removesuffix("-v1"), path,
+                                  result.ok, result.reason))
+    return rows
+
+
+def _apply_retention(output: Path, retain: int) -> None:
+    valid: list[Path] = []
+    for row in list_backups(output):
+        if row.ok and not row.path.is_symlink() and row.path.is_dir():
+            valid.append(row.path)
+    for old in valid[:-retain]:
+        shutil.rmtree(old)
+
+
+def _target_db_has_tables(dsn: str) -> bool:
+    import psycopg
+    with psycopg.connect(dsn, connect_timeout=5) as connection:
+        row = connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_type='BASE TABLE' AND table_schema NOT IN "
+            "('pg_catalog', 'information_schema'))").fetchone()
+    return bool(row[0])
+
+
+def _extract_memory_tar(path: Path, destination: Path) -> None:
+    _validate_tar(path)
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive:
+            target = destination.joinpath(*PurePosixPath(member.name).parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                _chmod(target, 0o700)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            if source is None:
+                raise BackupError(f"unreadable tar member: {member.name}")
+            with source, target.open("xb") as handle:
+                shutil.copyfileobj(source, handle)
+            _chmod(target, 0o600)
+
+
+def restore_backup(snapshot: Path | str, *, target_dsn: str,
+                   target_home: Path | str) -> Path:
+    source = Path(snapshot)
+    result = verify_snapshot(source)
+    if not result.ok:
+        raise BackupError(f"snapshot verification failed: {result.reason}")
+    if _daemon_health() is not None:
+        raise BackupError("stop the memoryd daemon before restoring a backup")
+    home = Path(target_home)
+    if os.path.lexists(home):
+        if home.is_symlink():
+            raise BackupError(f"target home must not be a symlink: {home}")
+        if not home.is_dir():
+            raise BackupError(f"target home is not a directory: {home}")
+        try:
+            next(home.iterdir())
+        except StopIteration:
+            pass
+        else:
+            raise BackupError(f"target home is not empty: {home}")
+    try:
+        if _target_db_has_tables(target_dsn):
+            raise BackupError("target database already has user tables")
+    except BackupError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise BackupError(f"cannot validate target database: {exc}") from exc
+
+    home.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(
+        prefix=f".{home.name}.restore-", dir=home.parent))
+    _chmod(staging, 0o700)
+    database_risk = False
+    try:
+        _extract_memory_tar(source / "memory.tar.gz", staging)
+        config = json.loads(
+            (source / "config.sanitized.json").read_text(encoding="utf-8"))
+        config["dsn"] = target_dsn
+        config["home"] = str(home)
+        config_path = staging / "config.json"
+        config_path.write_text(
+            json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+        _chmod(config_path, 0o600)
+        database_risk = True
+        _restore_database(source / "database.dump", target_dsn)
+        if home.exists():
+            home.rmdir()
+        _atomic_rename(staging, home)
+        staging = None
+        return home
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, BackupError):
+            detail = str(exc)
+        else:
+            detail = str(exc)
+        suffix = ("; partial empty-target DB risk: pg_restore may have "
+                  "created objects; inspect or recreate that target database"
+                  if database_risk else "")
+        raise BackupError(f"restore failed: {detail}{suffix}") from exc
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="memoryd backup")
+    commands = parser.add_subparsers(dest="command", required=True)
+    create = commands.add_parser("create")
+    create.add_argument("--output", type=Path)
+    create.add_argument("--retain", type=int, default=14)
+    listing = commands.add_parser("list")
+    listing.add_argument("--output", type=Path)
+    verify = commands.add_parser("verify")
+    verify.add_argument("snapshot", type=Path)
+    restore = commands.add_parser("restore")
+    restore.add_argument("snapshot", type=Path)
+    restore.add_argument("--dsn", required=True)
+    restore.add_argument("--home", required=True, type=Path)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.command == "create":
+            snapshot = create_backup(output=args.output, retain=args.retain)
+            print(f"created {snapshot}")
+            return 0
+        if args.command == "list":
+            for row in list_backups(args.output):
+                status = "ok" if row.ok else f"CORRUPT: {row.reason}"
+                print(f"{row.timestamp}  {row.path}  {status}")
+            return 0
+        if args.command == "verify":
+            result = verify_snapshot(args.snapshot)
+            print(f"{args.snapshot}: {'ok' if result.ok else result.reason}")
+            return 0 if result.ok else 1
+        restore_backup(args.snapshot, target_dsn=args.dsn,
+                       target_home=args.home)
+        print(f"restored {args.snapshot} -> {args.home}")
+        return 0
+    except BackupError as exc:
+        print(f"memoryd backup: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

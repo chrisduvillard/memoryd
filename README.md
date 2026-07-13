@@ -80,11 +80,11 @@ memoryd status                     # everything green? you're done.
 
 `memoryd install` does the rest, idempotently (safe to re-run any time):
 
-- starts a **PostgreSQL 16 + pgvector container** (`memoryd-pgvector`, localhost-only, persistent volume, restarts with Docker) and applies all migrations
+- starts a **PostgreSQL 16 + pgvector container** (`memoryd-pgvector`, localhost-only, persistent volume, restarts with Docker) with a fresh random database password and applies all migrations
 - writes `~/memory/config.json` so the daemon finds its database even when autostarted
 - registers the **Claude Code hooks** in `~/.claude/settings.json` (recall before every prompt, capture after every turn)
 - installs the **Hermes plugin** if `~/.hermes` exists (otherwise: re-run install after you install Hermes)
-- sets up **autostart**: the daemon at logon and the nightly consolidation at 03:05 (Task Scheduler on Windows, systemd user units on Linux, launchd on macOS) — then starts the daemon right away
+- sets up **autostart**: the daemon at logon and the nightly consolidation at 03:05 (Task Scheduler on Windows, systemd user units on Linux, launchd on macOS) — then starts the daemon right away. Linux also gets a verified daily backup timer at 02:35; other platforms leave backup scheduling to the operator.
 
 ### 🔑 Why the API key?
 
@@ -134,6 +134,38 @@ memoryd review approve 3
 cat ~/memory/digest/$(date +%F).md # daily health report (written nightly)
 ```
 
+### Back up and restore
+
+Backups are local snapshots under `~/memory/backups` by default. They include a
+PostgreSQL custom-format dump plus `archive/` and `spool/`; they do not upload
+or copy data off the machine. Stop the daemon first so the database and files
+describe one offline point in time:
+
+```bash
+memoryd backup create --retain 14
+memoryd backup list
+memoryd backup verify ~/memory/backups/20260713T023500Z-v1
+```
+
+Snapshot metadata is sanitized: database passwords and API-key values are not
+included. The manifest lists the secret environment-variable names you must
+re-enter on the restored installation.
+
+Practice the restore into an **empty database and empty/new home**, never over
+the live installation:
+
+```bash
+# Stop every memoryd daemon that could use the source or target first.
+memoryd backup restore ~/memory/backups/20260713T023500Z-v1 \
+  --dsn 'postgresql://restore-user@localhost/memoryd_restore' \
+  --home ~/memory-restore-drill
+MEMORYD_HOME=~/memory-restore-drill memoryd doctor
+```
+
+Restore refuses a running daemon, a nonempty/symlink target home, or a target
+database that already has user tables. Re-enter required API keys after the
+drill rather than copying them into a snapshot.
+
 ---
 
 ## ✅ Verify your install
@@ -182,7 +214,10 @@ memoryd install
 
 To run everything by hand instead: `memoryd serve` in the foreground, `memoryd microsleep` nightly via cron, and merge `hooks/settings.snippet.json` into `~/.claude/settings.json` (replace `<PYTHON>` with your interpreter).
 
-**Security note:** the Docker container uses the password `memoryd` and binds `127.0.0.1` only. If you expose Postgres beyond localhost, change the password and the DSN in `~/memory/config.json`.
+**Security note:** each fresh Docker install generates a high-entropy database
+password, stores its DSN in owner-only `~/memory/config.json` on POSIX, and
+binds PostgreSQL to `127.0.0.1` only. Existing legacy containers using the old
+`memoryd` password remain adoptable without rotating or deleting their data.
 
 </details>
 

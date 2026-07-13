@@ -33,6 +33,12 @@ memoryd status      # verify
 python scripts/smoke_test.py    # expects daemon running; 19/19 must pass
 ```
 
+Fresh installer-managed Docker databases use a random high-entropy password.
+The password-bearing DSN is persisted to the config file (mode `0600` on
+POSIX) and is masked in command output. A working existing DSN is adopted;
+legacy `memoryd-pgvector` containers using password `memoryd` remain
+adoptable without data deletion.
+
 Manual path (bring your own Postgres 16 + pgvector; no Docker):
 
 ```bash
@@ -73,11 +79,50 @@ memoryd/semantic_policies.py semantic validation + promotion policies
 memoryd/policies.py       versioned recall policies + packet compilers
 memoryd/source_pack.py    deterministic source packing for extraction/replay
 memoryd/evaluator.py      static eval core used by admin + microsleep
-memoryd/cli.py            memoryd install|status|serve|review|microsleep|uninstall
+memoryd/cli.py            install|status|serve|review|microsleep|backup|uninstall
+memoryd/backup.py         offline create/list/verify/restore snapshots
 memoryd/doctor.py         read-only integrity inspection + conservative repair
 scripts/init_db.sh        role + db + ALL migrations (manual/psql path)
 scripts/smoke_test.py     the DB-backed verification suite
 ```
+
+## Offline backup and restore
+
+```text
+memoryd backup create [--output PATH] [--retain 14]
+memoryd backup list [--output PATH]
+memoryd backup verify SNAPSHOT
+memoryd backup restore SNAPSHOT --dsn TARGET_DSN --home TARGET_HOME
+```
+
+The default output is `~/memory/backups`; generated snapshot directories are
+named `<UTC compact>-v1`. `create` refuses while the daemon answers its health
+endpoint and runs the read-only spool/archive doctor checks before writing.
+Each owner-only snapshot contains `database.dump` (PostgreSQL custom format),
+`memory.tar.gz` (`archive/` and `spool/` only), `config.sanitized.json`, and a
+checksummed v1 manifest. API keys and password-bearing DSNs are excluded. The
+manifest records the secret environment-variable names that must be re-entered.
+
+`verify` checks the exact file allowlist, sizes and SHA-256 checksums, database
+dump signature, JSON schema, and every tar member. Absolute/traversal paths,
+links, devices, and other special tar entries are rejected. `list` performs the
+same checks without mutation. Retention runs only after a newly created
+snapshot verifies and removes only older valid generated snapshot directories;
+it never follows symlinks or removes unrecognized/corrupt paths.
+
+Restore is deliberately out-of-place. Stop the daemon and provide an empty
+target PostgreSQL database plus a new or empty, nonsymlink target home. The
+command verifies first, stages safe extraction beside the target, restores with
+`pg_restore --exit-on-error --no-owner`, writes a config containing the target
+DSN/home and no API keys, then atomically publishes the home. If `pg_restore`
+fails, the snapshot remains intact and the error warns that the otherwise empty
+target database may now be partially populated. A restore drill should finish
+with `MEMORYD_HOME=<target> memoryd doctor`; re-enter API keys separately.
+
+Backups are local-only: memoryd does not upload snapshots. Linux installs a
+02:35 persistent systemd user timer that stops `memoryd.service`, creates and
+verifies a retained snapshot, and restarts the daemon even after failure.
+Windows and macOS do not schedule backups automatically.
 
 ## Durable capture and recovery
 
