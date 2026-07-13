@@ -83,7 +83,7 @@ pipx install --python python3.13 \
 memoryd install --hermes
 ```
 
-This guided path requires Docker, `pipx`, a working systemd user manager, and
+This guided path requires Docker, Git, `pipx`, a working systemd user manager, and
 Hermes Agent exactly `0.16.0`. It resolves `$HERMES_HOME` and `active_profile`,
 validates the installed Hermes contract through Hermes's own Python, and stops
 before mutation when the profile, version, permissions, or memory home is

@@ -779,10 +779,12 @@ def _prepare_guided_activation(
 ) -> GuidedSignalBoundary:
     credentials = hermes.ProviderCredentials("openrouter-key", "voyage-key")
     monkeypatch.setattr(hermes, "require_guided_environment", lambda: None)
-    monkeypatch.setattr(hermes, "resolve_hermes_target", lambda: target)
+    monkeypatch.setattr(hermes, "resolve_guided_hermes_target", lambda: target)
     monkeypatch.setattr(hermes, "validate_hermes_compatibility", lambda *_args: None)
     monkeypatch.setattr(hermes.cli, "_resource_dir", lambda _name: target.home)
-    monkeypatch.setattr(hermes.cli, "_home", lambda: artifact.parent)
+    monkeypatch.setattr(
+        hermes, "resolve_guided_memory_home", lambda: artifact.parent,
+    )
     monkeypatch.setattr(hermes, "classify_memory_home", lambda _home: "managed")
     monkeypatch.setattr(hermes, "confirm_operator", lambda: None)
     monkeypatch.setattr(

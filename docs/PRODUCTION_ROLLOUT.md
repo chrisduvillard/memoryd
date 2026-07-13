@@ -32,6 +32,7 @@ The laptop needs:
 
 - Linux with a working systemd user manager
 - Docker with permission to start a localhost container
+- `git` (required by the immutable `pipx` Git URL)
 - `pipx` and Python 3.13 (Python 3.11 is supported if 3.13 is unavailable)
 - Hermes Agent already installed and available as `hermes`
 - OpenRouter and Voyage API keys

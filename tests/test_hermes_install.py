@@ -21,8 +21,8 @@ import memoryd.hermes_install as hermes
 
 KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
 AFFECTED_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *KEY_NAMES)
-INSTALL_ENV = ("HERMES_HOME", "OPENROUTER_API_KEY", "VOYAGE_API_KEY",
-               "MEMORYD_LLM", "MEMORYD_EMBED")
+INSTALL_ENV = ("HERMES_HOME", "MEMORYD_HOME", "OPENROUTER_API_KEY",
+               "VOYAGE_API_KEY", "MEMORYD_LLM", "MEMORYD_EMBED")
 
 
 def _tty(value: bool = True) -> SimpleNamespace:
@@ -39,7 +39,7 @@ def _safe_config(path: Path, payload: dict[str, object]) -> Path:
 
 def _managed_payload(home: Path, *, include_env: bool = True) -> dict[str, object]:
     payload: dict[str, object] = {
-        "dsn": "postgresql://memoryd@localhost/memoryd",
+        "dsn": "postgresql://postgres:test@127.0.0.1:5432/memoryd",
         "port": 7437,
         "home": str(home.resolve()),
     }
@@ -49,6 +49,136 @@ def _managed_payload(home: Path, *, include_env: bool = True) -> dict[str, objec
             "VOYAGE_API_KEY": "config-voyage",
         }
     return payload
+
+
+def _operator_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    operator = tmp_path / "operator"
+    operator.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        hermes, "_operator_home_from_passwd", lambda: operator, raising=False,
+    )
+    return operator
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MEMORYD_HOME", "/tmp/redirected-memory-SENSITIVE"),
+        (
+            "MEMORYD_DSN",
+            "postgresql://operator:SENSITIVE@remote.invalid/unrelated",
+        ),
+    ],
+)
+def test_guided_memory_home_rejects_ambient_redirects_without_echo(
+    monkeypatch, tmp_path, name, value,
+):
+    _operator_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("MEMORYD_HOME", raising=False)
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(hermes.HermesInstallError) as caught:
+        hermes.resolve_guided_memory_home()
+
+    assert name in str(caught.value)
+    assert value not in str(caught.value)
+    assert "SENSITIVE" not in str(caught.value)
+
+
+def test_guided_memory_home_is_resolved_operator_memory_and_accepts_exact_override(
+    monkeypatch, tmp_path,
+):
+    operator = _operator_home(monkeypatch, tmp_path)
+    expected = operator.resolve() / "memory"
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    monkeypatch.setenv("MEMORYD_HOME", str(expected))
+
+    assert hermes.resolve_guided_memory_home() == expected
+
+
+def test_guided_hermes_target_ignores_ambient_home_without_explicit_hermes_home(
+    monkeypatch, tmp_path,
+):
+    operator = _operator_home(monkeypatch, tmp_path)
+    redirected = tmp_path / "redirected"
+    redirected.mkdir(mode=0o700)
+    marker = redirected / ".hermes" / "active_profile"
+    marker.parent.mkdir(mode=0o700)
+    marker.write_text("do-not-read", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(redirected))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    sentinel = object()
+    captured: dict[str, str] = {}
+
+    def resolve(environ):
+        captured.update(environ)
+        return sentinel
+
+    monkeypatch.setattr(hermes, "resolve_hermes_target", resolve)
+
+    assert hermes.resolve_guided_hermes_target() is sentinel
+    assert captured["HERMES_HOME"] == str(operator.resolve() / ".hermes")
+    assert captured["HOME"] == str(redirected)
+    assert marker.read_text(encoding="utf-8") == "do-not-read"
+
+
+def test_guided_hermes_target_preserves_explicit_hermes_home(monkeypatch, tmp_path):
+    _operator_home(monkeypatch, tmp_path)
+    configured = tmp_path / "selected-hermes"
+    monkeypatch.setenv("HOME", str(tmp_path / "ignored-home"))
+    monkeypatch.setenv("HERMES_HOME", str(configured))
+    captured: dict[str, str] = {}
+
+    def resolve(environ):
+        captured.update(environ)
+        return object()
+
+    monkeypatch.setattr(hermes, "resolve_hermes_target", resolve)
+
+    hermes.resolve_guided_hermes_target()
+
+    assert captured["HERMES_HOME"] == str(configured)
+
+
+def test_guided_memory_home_ignores_ambient_home_override_without_mutation(
+    monkeypatch, tmp_path,
+):
+    operator = _operator_home(monkeypatch, tmp_path)
+    redirected = tmp_path / "redirected-home-SENSITIVE"
+    redirected.mkdir()
+    marker = redirected / "marker"
+    marker.write_bytes(b"unchanged")
+    monkeypatch.setenv("HOME", str(redirected))
+    monkeypatch.delenv("MEMORYD_HOME", raising=False)
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+
+    assert hermes.resolve_guided_memory_home() == operator.resolve() / "memory"
+    assert marker.read_bytes() == b"unchanged"
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://postgres:secret@remote.invalid:5432/memoryd",
+        "postgresql://postgres:secret@127.0.0.1:5432/other",
+        "postgresql://other:secret@127.0.0.1:5432/memoryd",
+        "postgresql://postgres@127.0.0.1:5432/memoryd",
+        "postgresql:///memoryd?host=/var/run/postgresql",
+    ],
+)
+def test_managed_home_rejects_non_docker_dsn_without_echo(tmp_path, dsn):
+    home = tmp_path / "memory"
+    payload = _managed_payload(home)
+    payload["dsn"] = dsn
+    _safe_config(home / "config.json", payload)
+
+    with pytest.raises(hermes.HermesInstallError) as caught:
+        hermes.classify_memory_home(home)
+
+    assert "dsn" in str(caught.value).lower()
+    assert dsn not in str(caught.value)
+    assert "secret" not in str(caught.value)
 
 
 def _provider_http(
@@ -627,6 +757,158 @@ def _hermes_target(tmp_path: Path) -> HermesTarget:
     )
 
 
+def _plugin_source(tmp_path: Path, version: str = "one") -> Path:
+    source = tmp_path / "wheel-plugin"
+    source.mkdir(exist_ok=True)
+    (source / "__init__.py").write_text(f"VERSION = {version!r}\n", encoding="utf-8")
+    (source / "plugin.yaml").write_text(
+        f"name: memoryd\nversion: {version}\n", encoding="utf-8",
+    )
+    (source / "spool.py").write_text("QUEUE = True\n", encoding="utf-8")
+    nested = source / "nested"
+    nested.mkdir(exist_ok=True)
+    (nested / "resource.txt").write_text(f"resource-{version}\n", encoding="utf-8")
+    return source
+
+
+def _file_manifest(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def test_guided_plugin_publication_is_exact_private_and_removes_stale_files(
+    monkeypatch, tmp_path,
+):
+    target = _hermes_target(tmp_path)
+    source = _plugin_source(tmp_path)
+    monkeypatch.setattr(cli, "_resource_dir", lambda name: source)
+
+    hermes.publish_guided_plugin(target)
+    destination = target.home / "plugins" / "memoryd"
+    assert _file_manifest(destination) == _file_manifest(source)
+
+    (destination / "stale-injected.py").write_text("stale\n", encoding="utf-8")
+    (destination / "__init__.py").write_text("tampered\n", encoding="utf-8")
+    hermes.publish_guided_plugin(target)
+
+    assert _file_manifest(destination) == _file_manifest(source)
+    assert not (destination / "stale-injected.py").exists()
+    assert json.loads((target.home / "memoryd.json").read_text(encoding="utf-8")) == {
+        "url": "http://127.0.0.1:7437",
+    }
+    if os.name != "nt":
+        assert stat.S_IMODE((target.home / "plugins").stat().st_mode) == 0o700
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+        assert all(
+            stat.S_IMODE(path.stat().st_mode) == (0o700 if path.is_dir() else 0o600)
+            for path in destination.rglob("*")
+        )
+        assert stat.S_IMODE((target.home / "memoryd.json").stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="guided mode is Linux-only")
+@pytest.mark.parametrize("topology", ["plugins", "destination"])
+def test_guided_plugin_publication_rejects_destination_symlink_topology(
+    monkeypatch, tmp_path, topology,
+):
+    target = _hermes_target(tmp_path)
+    source = _plugin_source(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "marker"
+    marker.write_bytes(b"unchanged")
+    plugins = target.home / "plugins"
+    if topology == "plugins":
+        plugins.symlink_to(external, target_is_directory=True)
+    else:
+        plugins.mkdir(mode=0o700)
+        (plugins / "memoryd").symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(cli, "_resource_dir", lambda name: source)
+
+    with pytest.raises(hermes.HermesInstallError, match="plugin|symlink|topology"):
+        hermes.publish_guided_plugin(target)
+
+    assert marker.read_bytes() == b"unchanged"
+    assert not list(target.home.glob(".memoryd*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="guided mode is Linux-only")
+def test_guided_plugin_publication_rejects_source_symlink_and_preserves_prior(
+    monkeypatch, tmp_path,
+):
+    target = _hermes_target(tmp_path)
+    source = _plugin_source(tmp_path)
+    monkeypatch.setattr(cli, "_resource_dir", lambda name: source)
+    hermes.publish_guided_plugin(target)
+    destination = target.home / "plugins" / "memoryd"
+    before = _file_manifest(destination)
+    external = tmp_path / "external-secret"
+    external.write_bytes(b"must-not-copy")
+    (source / "unsafe-link").symlink_to(external)
+
+    with pytest.raises(hermes.HermesInstallError, match="source|symlink|plugin"):
+        hermes.publish_guided_plugin(target)
+
+    assert _file_manifest(destination) == before
+    assert external.read_bytes() == b"must-not-copy"
+
+
+def test_guided_plugin_interrupted_swap_restores_prior_without_partial_mix(
+    monkeypatch, tmp_path,
+):
+    target = _hermes_target(tmp_path)
+    source = _plugin_source(tmp_path, "one")
+    monkeypatch.setattr(cli, "_resource_dir", lambda name: source)
+    hermes.publish_guided_plugin(target)
+    destination = target.home / "plugins" / "memoryd"
+    before = _file_manifest(destination)
+    (source / "__init__.py").write_text("VERSION = 'two'\n", encoding="utf-8")
+    real_replace = hermes.os.replace
+
+    def interrupt_stage(source_path, destination_path):
+        source_value = Path(source_path)
+        destination_value = Path(destination_path)
+        if source_value.name.startswith(".memoryd-stage-") and destination_value == destination:
+            raise KeyboardInterrupt
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(hermes.os, "replace", interrupt_stage)
+
+    with pytest.raises(KeyboardInterrupt):
+        hermes.publish_guided_plugin(target)
+
+    assert _file_manifest(destination) == before
+    assert not list((target.home / "plugins").glob(".memoryd-*-*"))
+
+
+def test_guided_plugin_staging_manifest_mismatch_preserves_prior(
+    monkeypatch, tmp_path,
+):
+    target = _hermes_target(tmp_path)
+    source = _plugin_source(tmp_path, "one")
+    monkeypatch.setattr(cli, "_resource_dir", lambda name: source)
+    hermes.publish_guided_plugin(target)
+    destination = target.home / "plugins" / "memoryd"
+    before = _file_manifest(destination)
+    (source / "__init__.py").write_text("VERSION = 'two'\n", encoding="utf-8")
+    real_copy = hermes._copy_guided_plugin_tree
+
+    def tamper_after_copy(source_root: Path, stage_root: Path):
+        real_copy(source_root, stage_root)
+        (stage_root / "__init__.py").write_text("tampered\n", encoding="utf-8")
+
+    monkeypatch.setattr(hermes, "_copy_guided_plugin_tree", tamper_after_copy)
+
+    with pytest.raises(hermes.HermesInstallError, match="manifest|verify"):
+        hermes.publish_guided_plugin(target)
+
+    assert _file_manifest(destination) == before
+    assert not list((target.home / "plugins").glob(".memoryd-*-*"))
+
+
 def _backup_row(path: Path, *, ok: bool = True) -> backup.BackupListing:
     return backup.BackupListing(
         timestamp=path.name.removesuffix("-v1"),
@@ -643,6 +925,10 @@ def _prepare_core(
     memory_home = tmp_path / "memory"
     monkeypatch.setenv("HERMES_HOME", str(target.root))
     monkeypatch.setattr(cli, "_home", lambda: memory_home)
+    monkeypatch.setattr(
+        hermes, "resolve_guided_memory_home", lambda: memory_home, raising=False,
+    )
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
     credentials = hermes.ProviderCredentials("new-openrouter", "new-voyage")
     return target, memory_home, credentials
 
@@ -668,14 +954,20 @@ def test_core_install_orders_revalidation_install_backup_verification_and_restar
     def install(options):
         events.append("core-install")
         assert options.hermes_home == target.home
+        assert options.publish_hermes_plugin is False
         assert {name: os.environ[name] for name in INSTALL_ENV} == {
             "HERMES_HOME": str(target.home),
+            "MEMORYD_HOME": str(memory_home),
             "OPENROUTER_API_KEY": credentials.openrouter_key,
             "VOYAGE_API_KEY": credentials.voyage_key,
             "MEMORYD_LLM": "openrouter",
             "MEMORYD_EMBED": "voyage",
         }
         return 0
+
+    def publish(actual_target):
+        assert actual_target == target
+        events.append("plugin-publication")
 
     def list_backups():
         events.append("list-before" if "backup-service" not in events else "list-after")
@@ -689,9 +981,12 @@ def test_core_install_orders_revalidation_install_backup_verification_and_restar
         assert timeout >= 600
         return 0, ""
 
-    monkeypatch.setattr(hermes, "resolve_hermes_home", resolve_home, raising=False)
+    monkeypatch.setattr(
+        hermes, "resolve_guided_hermes_home", resolve_home, raising=False,
+    )
     monkeypatch.setattr(hermes, "classify_memory_home", classify)
     monkeypatch.setattr(cli, "install", install)
+    monkeypatch.setattr(hermes, "publish_guided_plugin", publish, raising=False)
     monkeypatch.setattr(backup, "list_backups", list_backups)
     monkeypatch.setattr(cli, "_run", run)
     monkeypatch.setattr(
@@ -708,6 +1003,7 @@ def test_core_install_orders_revalidation_install_backup_verification_and_restar
         "profile-revalidation",
         "memory-home-revalidation",
         "core-install",
+        "plugin-publication",
         "list-before",
         "backup-service",
         "list-after",
@@ -724,10 +1020,11 @@ def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_r
     plugin_source.mkdir()
     (plugin_source / "__init__.py").write_text("VERSION = 1\n", encoding="utf-8")
     (plugin_source / "plugin.yaml").write_text("name: memoryd\n", encoding="utf-8")
+    (plugin_source / "spool.py").write_text("QUEUE = True\n", encoding="utf-8")
     migrations = tmp_path / "migrations"
     migrations.mkdir()
     (migrations / "001_base.sql").write_text("SELECT 1;\n", encoding="utf-8")
-    monkeypatch.setenv("MEMORYD_DSN", "postgresql:///memoryd")
+    _safe_config(memory_home / "config.json", _managed_payload(memory_home))
     monkeypatch.setenv("OPENROUTER_API_KEY", "caller-openrouter")
     monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
     monkeypatch.setenv("MEMORYD_LLM", "caller-llm")
@@ -812,7 +1109,13 @@ def test_core_install_sanitizes_core_or_migration_failure_and_restores_environme
     monkeypatch, tmp_path, failure,
 ):
     target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
-    for name, value in zip(INSTALL_ENV, (str(target.root), "old-open", "old-voyage", "old-llm", "old-embed")):
+    for name, value in zip(
+        INSTALL_ENV,
+        (
+            str(target.root), str(tmp_path / "old-memory"), "old-open",
+            "old-voyage", "old-llm", "old-embed",
+        ),
+    ):
         monkeypatch.setenv(name, value)
     before = dict(os.environ)
     monkeypatch.setattr(cli, "install", lambda _options: (_ for _ in ()).throw(failure))
@@ -827,11 +1130,44 @@ def test_core_install_sanitizes_core_or_migration_failure_and_restores_environme
     assert "SECRET-SENTINEL" not in rendered
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MEMORYD_HOME", "/tmp/late-home-SENSITIVE"),
+        (
+            "MEMORYD_DSN",
+            "postgresql://postgres:SENSITIVE@remote.invalid/unrelated",
+        ),
+    ],
+)
+def test_core_revalidation_rejects_late_memory_redirect_before_mutation(
+    monkeypatch, tmp_path, name, value,
+):
+    target = _hermes_target(tmp_path)
+    operator = _operator_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(target.root))
+    monkeypatch.delenv("MEMORYD_HOME", raising=False)
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        cli, "install", lambda _options: pytest.fail("target mutation must not start"),
+    )
+
+    with pytest.raises(hermes.HermesInstallError) as caught:
+        hermes.install_hermes_core(
+            target, hermes.ProviderCredentials("openrouter", "voyage"),
+        )
+
+    assert operator.exists()
+    assert value not in str(caught.value)
+    assert "SENSITIVE" not in str(caught.value)
+
+
 def test_managed_rerun_adopts_config_dsn_before_migration_failure_and_preserves_evidence(
     monkeypatch, tmp_path,
 ):
     target, memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
-    dsn = "postgresql://memoryd:password@127.0.0.1:5432/memoryd"
+    dsn = "postgresql://postgres:password@127.0.0.1:5432/memoryd"
     payload = _managed_payload(memory_home)
     payload["dsn"] = dsn
     config = _safe_config(memory_home / "config.json", payload)
@@ -840,7 +1176,6 @@ def test_managed_rerun_adopts_config_dsn_before_migration_failure_and_preserves_
         memory_home / "archive" / "memory.jsonl": b"archive evidence",
         memory_home / "spool" / "incoming" / "job.json": b"spool evidence",
         memory_home / "backups" / "existing" / "manifest.json": b"backup evidence",
-        target.home / "plugins" / "memoryd" / "operator-note": b"plugin evidence",
         tmp_path / "database-volume.marker": b"database evidence",
     }
     for path, contents in evidence.items():
@@ -897,9 +1232,11 @@ def test_core_install_requires_successful_systemd_backup_and_preserves_evidence(
         memory_home / "spool" / "incoming" / "job.json": b"spool evidence",
         memory_home / "logs" / "daemon.log": b"log evidence",
         memory_home / "backups" / "20260712T010203Z-v1" / "manifest.json": b"backup evidence",
-        target.home / "plugins" / "memoryd" / "operator-note": b"plugin evidence",
         tmp_path / "database-volume.marker": b"database evidence",
     }
+    stale_plugin = target.home / "plugins" / "memoryd" / "operator-note"
+    stale_plugin.parent.mkdir(parents=True, exist_ok=True)
+    stale_plugin.write_bytes(b"stale plugin injection")
     for path, payload in evidence.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
@@ -914,6 +1251,7 @@ def test_core_install_requires_successful_systemd_backup_and_preserves_evidence(
 
     assert "SECRET service detail" not in str(caught.value)
     assert {path: path.read_bytes() for path in evidence} == before
+    assert not stale_plugin.exists()
 
 
 @pytest.mark.parametrize("new_count", [0, 2])

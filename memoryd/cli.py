@@ -768,6 +768,7 @@ def _wait_for_healthy_daemon() -> bool:
 @dataclass(frozen=True)
 class _InstallOptions:
     hermes_home: Path
+    publish_hermes_plugin: bool = True
 
 
 def install(options: _InstallOptions | None = None) -> int:
@@ -802,7 +803,8 @@ def install(options: _InstallOptions | None = None) -> int:
         install_hermes_plugin()
         install_autostart()
     else:
-        install_hermes_plugin(options.hermes_home, show_activation_hint=False)
+        if options.publish_hermes_plugin:
+            install_hermes_plugin(options.hermes_home, show_activation_hint=False)
         install_autostart(_hermes_mode=True)
     _start_daemon_now()
     healthy = _wait_for_healthy_daemon()

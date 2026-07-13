@@ -95,12 +95,14 @@ def _workflow(
         yield
 
     monkeypatch.setattr(hermes, "require_guided_environment", require_environment)
-    monkeypatch.setattr(hermes, "resolve_hermes_target", resolve_target, raising=False)
+    monkeypatch.setattr(
+        hermes, "resolve_guided_hermes_target", resolve_target, raising=False,
+    )
     monkeypatch.setattr(hermes.cli, "_resource_dir", resource_dir)
     monkeypatch.setattr(
         hermes, "validate_hermes_compatibility", validate_compatibility, raising=False,
     )
-    monkeypatch.setattr(hermes.cli, "_home", home)
+    monkeypatch.setattr(hermes, "resolve_guided_memory_home", home, raising=False)
     monkeypatch.setattr(hermes, "classify_memory_home", classify)
     monkeypatch.setattr(hermes, "confirm_operator", confirm)
     monkeypatch.setattr(hermes, "collect_provider_credentials", collect)
@@ -131,6 +133,53 @@ def _workflow(
     return events, target, snapshot, previous, current
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MEMORYD_HOME", "/tmp/orchestration-home-SENSITIVE"),
+        (
+            "MEMORYD_DSN",
+            "postgresql://user:SENSITIVE@remote.invalid/unrelated",
+        ),
+    ],
+)
+def test_ambient_memory_redirect_stops_before_target_or_plugin_mutation(
+    monkeypatch, tmp_path, capsys, name, value,
+):
+    operator = tmp_path / "operator"
+    operator.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        hermes, "_operator_home_from_passwd", lambda: operator, raising=False,
+    )
+    monkeypatch.delenv("MEMORYD_HOME", raising=False)
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(hermes, "require_guided_environment", lambda: None)
+    monkeypatch.setattr(
+        hermes,
+        "resolve_guided_hermes_target",
+        lambda: pytest.fail("Hermes target inspection must not start"),
+    )
+    monkeypatch.setattr(
+        hermes.cli,
+        "_resource_dir",
+        lambda _name: pytest.fail("plugin inspection must not start"),
+    )
+    monkeypatch.setattr(
+        hermes,
+        "install_hermes_core",
+        lambda *_args: pytest.fail("target mutation must not start"),
+    )
+
+    assert hermes.guided_hermes_install() == 1
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert name in output.err
+    assert value not in output.err
+    assert "SENSITIVE" not in output.err
+
+
 @pytest.mark.parametrize("classification", ["fresh", "managed"])
 def test_guided_install_composes_exact_order_and_reports_success_without_secrets(
     monkeypatch, tmp_path, capsys, classification,
@@ -144,10 +193,10 @@ def test_guided_install_composes_exact_order_and_reports_success_without_secrets
     assert result == 0
     assert events == [
         "environment",
+        "home",
         "target",
         "plugin",
         "compatibility",
-        "home",
         "classify",
         "confirm",
         "credentials",

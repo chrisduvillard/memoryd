@@ -19,6 +19,8 @@ def test_rollout_makes_guided_install_primary_and_profile_selection_explicit():
     assert "does not invent a missing selected profile" in ROLLOUT
     assert "Manual commands" in ROLLOUT
     assert "not a second installation recipe" in ROLLOUT
+    prerequisites = ROLLOUT.split("## 1. Prerequisites", 1)[1].split("## 2.", 1)[0]
+    assert "`git`" in prerequisites
 
 
 def test_rollout_documents_transactional_rollback_and_evidence_preservation():
