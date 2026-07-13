@@ -26,7 +26,18 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "scripts" / "_stubs"))   # verbatim upstream ABC
+HERMES_SOURCE_ROOT = os.environ.get("HERMES_SOURCE_ROOT")
+if HERMES_SOURCE_ROOT:
+    contract = Path(HERMES_SOURCE_ROOT) / "agent" / "memory_provider.py"
+    if not contract.is_file():
+        raise SystemExit(
+            f"HERMES_SOURCE_ROOT has no agent/memory_provider.py: "
+            f"{HERMES_SOURCE_ROOT}")
+    sys.path.insert(0, HERMES_SOURCE_ROOT)
+else:
+    # Local development fallback. Blocking CI supplies the exact pinned
+    # official Hermes checkout and therefore never uses this snapshot.
+    sys.path.insert(0, str(REPO / "scripts" / "_stubs"))
 sys.path.insert(0, str(REPO / "hermes_plugin"))        # the plugin package
 sys.path.insert(0, str(REPO))
 sys.stdout.reconfigure(encoding="utf-8")  # ✓/✗ on cp1252 Windows consoles

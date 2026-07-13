@@ -100,7 +100,7 @@ jobs:
 
   test:
     if: github.event_name == 'push' || github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -124,49 +124,134 @@ jobs:
 
     env:
       MEMORYD_DSN: postgresql://postgres:memoryd@localhost:5432/memoryd
-      MEMORYD_LLM: mock                       # deterministic extractor, no API key
-      MEMORYD_LLM_MOCK_FILE: /tmp/mock_llm.json
+      MEMORYD_HOME: ${{ runner.temp }}/memoryd-home
+      MEMORYD_LLM: mock
+      MEMORYD_LLM_MOCK_FILE: ${{ runner.temp }}/mock_llm.json
+      HERMES_SOURCE_ROOT: ${{ github.workspace }}/_hermes-agent
       # embedder defaults to the offline hash embedder — no external calls
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Check out exact pinned Hermes runtime
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: v2026.6.5
+          path: _hermes-agent
+
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install package
-        run: pip install .            # also validates the wheel builds/installs
-
-      - name: Run DB-free durable-capture checks
+      - name: Verify pinned Hermes commit and PostgreSQL client
         run: |
+          test "$(git -C _hermes-agent rev-parse HEAD)" = \
+            "3c231eb3979ab9c57d5cd6d02f1d577a3b718b43"
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client-16
+          pg_dump --version | grep -E ' 16\.'
+
+      - name: Build wheel in an isolated environment
+        run: |
+          python -m venv .venv-build
+          .venv-build/bin/python -m pip install --disable-pip-version-check build
+          .venv-build/bin/python -m build --wheel --outdir dist
+
+      - name: Install the exact wheel in a clean test environment
+        run: |
+          python -m venv "$RUNNER_TEMP/venv-test"
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl')
+          test "${#wheels[@]}" -eq 1
+          "$RUNNER_TEMP/venv-test/bin/python" -m pip install --disable-pip-version-check \
+            "${wheels[0]}" pytest
+          echo "$RUNNER_TEMP/venv-test/bin" >> "$GITHUB_PATH"
+          echo "MEMORYD_WHEEL=$GITHUB_WORKSPACE/${wheels[0]}" >> "$GITHUB_ENV"
+
+      - name: assert-installed-wheel is isolated from the checkout
+        run: |
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv-test/bin/python" -I - <<'PY'
+          from pathlib import Path
+          import memoryd
+          installed = Path(memoryd.__file__).resolve()
+          checkout = Path(__import__('os').environ['GITHUB_WORKSPACE']).resolve()
+          assert checkout not in installed.parents, installed
+          assert 'venv-test' in installed.parts, installed
+          print(f"testing installed wheel at {installed}")
+          PY
+
+      - name: Compile and run all unit and fault-injection suites
+        run: |
+          python -m compileall -q memoryd hermes_plugin scripts tests
+          python -m pytest -q tests
           python scripts/test_durable_capture.py
           python scripts/test_hermes_spool.py
           python scripts/test_bitter_lesson.py
+          python scripts/test_hermes_contract.py
 
-      - name: Compile check
-        run: python -m compileall memoryd scripts
-
-      - name: Apply migrations
-        run: python -c "import os; from memoryd.cli import apply_migrations; print('applied:', apply_migrations(os.environ['MEMORYD_DSN']))"
-
-      - name: Run DB-backed integration suites
+      - name: Apply packaged migrations 001 through 007
         run: |
           set -euo pipefail
-          echo "[]" > /tmp/mock_llm.json            # valid fixture for the daemon's extractor
-          python -m memoryd.server > memoryd.out 2>&1 &
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv-test/bin/python" -I - <<'PY'
+          import os
+          import psycopg
+          from memoryd.cli import apply_migrations
+          expected = [
+              '001_init.sql',
+              '002_extraction.sql',
+              '003_multi_agent.sql',
+              '004_quarantine_event.sql',
+              '005_bitter_lesson.sql',
+              '006_durable_capture.sql',
+              '007_api_request_ledger.sql',
+          ]
+          applied = apply_migrations(os.environ['MEMORYD_DSN'])
+          with psycopg.connect(os.environ['MEMORYD_DSN']) as connection:
+              actual = [row[0] for row in connection.execute(
+                  'SELECT filename FROM schema_migrations ORDER BY filename')]
+          assert applied == expected, applied
+          assert actual == expected, actual
+          print(f"applied packaged migrations: {actual}")
+          PY
+
+      - name: Run daemon, policy, recall, extraction, vector, doctor and Hermes lifecycle matrix
+        run: |
+          set -euo pipefail
+          echo "[]" > "$MEMORYD_LLM_MOCK_FILE"
+          (cd "$RUNNER_TEMP" && \
+            "$RUNNER_TEMP/venv-test/bin/python" -I -m memoryd.server) \
+            > "$RUNNER_TEMP/memoryd.out" 2>&1 &
           daemon=$!
+          cleanup() {
+            kill "$daemon" 2>/dev/null || true
+            wait "$daemon" 2>/dev/null || true
+          }
+          trap cleanup EXIT
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:7437/health >/dev/null 2>&1; then ok=1; break; fi
             sleep 1
           done
-          if [ "${ok:-}" != "1" ]; then echo "daemon did not become healthy"; cat memoryd.out; exit 1; fi
+          if [ "${ok:-}" != "1" ]; then
+            echo "daemon did not become healthy"
+            cat "$RUNNER_TEMP/memoryd.out"
+            exit 1
+          fi
+          PYTHONPATH="$HERMES_SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+            python scripts/check_hermes_contract.py --require-pinned-bytes
           python scripts/smoke_test.py
           python scripts/test_extract.py
           python scripts/test_vector.py
           python scripts/test_hermes.py
-          kill "$daemon" 2>/dev/null || true
+          python scripts/test_postgres_recovery.py idempotency
+          memoryd doctor
+          cleanup
+          trap - EXIT
+
+      - name: Run real offline backup, verification and disposable restore
+        run: python scripts/test_postgres_recovery.py backup-restore
 
       - name: Daemon log on failure
         if: failure()
-        run: cat memoryd.out || true
+        run: cat "$RUNNER_TEMP/memoryd.out" || true
