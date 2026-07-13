@@ -142,10 +142,11 @@ re-enter API keys separately.
 Local `pg_dump`/`pg_restore` calls receive connection secrets through a private,
 per-operation libpq service file under owner-only
 `$MEMORYD_HOME/.pg-service/` and use only `service=memoryd` on argv. Cleanup is
-fsynced and retried; a later operation safely reclaims validated residue from a
-prior interrupted cleanup. Docker fallback transfers use an unpredictable
-remote path per operation and remove only that operation's path, including
-after a partial copy failure.
+fsynced and retried. An owner-only durable OS lock serializes the stale sweep,
+service-file lifetime, database tool, and cleanup across processes; a crash
+releases the lock so a later operation can safely reclaim validated residue.
+Docker fallback transfers use an unpredictable remote path per operation and
+remove only that operation's path, including after a partial copy failure.
 
 Backups are local-only: memoryd does not upload snapshots. Linux installs a
 02:35 persistent systemd user timer that stops `memoryd.service`, creates and

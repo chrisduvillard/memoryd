@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -46,9 +47,11 @@ SECRET_ENV_RE = re.compile(
     r"(?:^|_)(?:API_KEY|PASSWORD|PASSWD|SECRET|TOKEN|CREDENTIALS?)(?:$|_)",
     re.I)
 SERVICE_ROOT_NAME = ".pg-service"
+SERVICE_LOCK_NAME = "state.lock"
 SERVICE_OPERATION_RE = re.compile(r"^op-[0-9a-f]{32}$")
 SERVICE_CLEANUP_RETRY_S = 1.0
 SERVICE_CLEANUP_RETRY_INTERVAL_S = 0.01
+SERVICE_LOCK_TIMEOUT_S = 660.0
 
 
 class BackupError(RuntimeError):
@@ -343,27 +346,115 @@ def _service_root() -> Path:
         _chmod(root, 0o700)
         _fsync_directory(home)
     _require_service_artifact(root, directory=True, mode=0o700)
+    _ensure_service_lock(root)
+    return root
+
+
+def _ensure_service_lock(root: Path) -> Path:
+    lock_file = root / SERVICE_LOCK_NAME
+    flags = (os.O_CREAT | os.O_EXCL | os.O_RDWR |
+             getattr(os, "O_BINARY", 0))
+    created = False
+    try:
+        fd = os.open(lock_file, flags, 0o600)
+        created = True
+    except FileExistsError:
+        _require_service_artifact(lock_file, directory=False, mode=0o600)
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(lock_file, flags)
+        except OSError as exc:
+            raise BackupError(f"cannot open service lock {lock_file}: {exc}") from exc
+    except OSError as exc:
+        raise BackupError(f"cannot create service lock {lock_file}: {exc}") from exc
+    try:
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _chmod(lock_file, 0o600)
+    _require_service_artifact(lock_file, directory=False, mode=0o600)
+    if created:
+        _fsync_directory(root)
+    return lock_file
+
+
+@contextmanager
+def _service_state_lock(root: Path):
+    lock_file = _ensure_service_lock(root)
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_file, flags)
+    except OSError as exc:
+        raise BackupError(f"cannot open service lock {lock_file}: {exc}") from exc
+    acquired = False
+    deadline = time.monotonic() + SERVICE_LOCK_TIMEOUT_S
+    try:
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if time.monotonic() >= deadline:
+                        raise BackupError(
+                            f"timed out acquiring service lock {lock_file}") from exc
+                    time.sleep(SERVICE_CLEANUP_RETRY_INTERVAL_S)
+        else:
+            import fcntl
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise BackupError(
+                            f"cannot acquire service lock {lock_file}: {exc}") from exc
+                    if time.monotonic() >= deadline:
+                        raise BackupError(
+                            f"timed out acquiring service lock {lock_file}") from exc
+                    time.sleep(SERVICE_CLEANUP_RETRY_INTERVAL_S)
+        yield
+    finally:
+        try:
+            if acquired:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _cleanup_stale_service_operations(root: Path) -> None:
     try:
         children = list(root.iterdir())
     except OSError as exc:
         raise BackupError(f"cannot inspect service root {root}: {exc}") from exc
     for operation in children:
+        if operation.name == SERVICE_LOCK_NAME:
+            _require_service_artifact(operation, directory=False, mode=0o600)
+            continue
         if not SERVICE_OPERATION_RE.fullmatch(operation.name):
             raise BackupError(f"unrecognized service artifact: {operation}")
         _cleanup_service_operation(operation)
-    return root
 
 
 @contextmanager
-def _libpq_service(values: dict[str, str]):
+def _service_operation(values: dict[str, str], root: Path):
     operation: Path | None = None
     primary: BaseException | None = None
     try:
-        for value in values.values():
-            if "\n" in value or "\r" in value:
-                raise BackupError(
-                    "PostgreSQL connection values cannot contain newlines")
-        root = _service_root()
         for _attempt in range(3):
             candidate = root / f"op-{secrets.token_hex(16)}"
             try:
@@ -405,6 +496,19 @@ def _libpq_service(values: dict[str, str]):
                 if primary is None:
                     raise
                 primary.add_note(f"service cleanup failed: {cleanup_exc}")
+
+
+@contextmanager
+def _libpq_service(values: dict[str, str]):
+    for value in values.values():
+        if "\n" in value or "\r" in value:
+            raise BackupError(
+                "PostgreSQL connection values cannot contain newlines")
+    root = _service_root()
+    with _service_state_lock(root):
+        _cleanup_stale_service_operations(root)
+        with _service_operation(values, root) as connection:
+            yield connection
 
 
 def _run_tool(

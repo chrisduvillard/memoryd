@@ -1118,6 +1118,95 @@ def test_service_root_rejects_unrecognized_stale_artifact(
     assert unexpected.is_file()
 
 
+def test_service_lock_serializes_active_operations_across_threads(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    observed: list[Path] = []
+    first_survived: list[bool] = []
+    observation_lock = threading.Lock()
+
+    def run(command, **kwargs):
+        service_file = Path(kwargs["env"]["PGSERVICEFILE"])
+        with observation_lock:
+            index = len(observed)
+            observed.append(service_file)
+        if index == 0:
+            first_entered.set()
+            release_first.wait(timeout=5)
+            first_survived.append(service_file.is_file())
+        else:
+            second_entered.set()
+        Path(command[command.index("--file") + 1]).write_bytes(
+            b"PGDMPserialized")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(backup, "_default_home", lambda: home)
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: "/tools/pg_dump")
+    monkeypatch.setattr(backup.subprocess, "run", run)
+    dsn = "postgresql://operator:secret@localhost/memoryd"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(backup._dump_database, dsn, tmp_path / "one.dump")
+        assert first_entered.wait(timeout=5)
+        second = pool.submit(backup._dump_database, dsn, tmp_path / "two.dump")
+        second_was_blocked = not second_entered.wait(timeout=0.2)
+        release_first.set()
+        first_error = first.exception(timeout=5)
+        second_error = second.exception(timeout=5)
+
+    assert second_was_blocked
+    assert first_survived == [True]
+    assert first_error is None and second_error is None
+    assert len(set(observed)) == 2
+    lock_file = home / ".pg-service" / "state.lock"
+    assert lock_file.is_file()
+    if os.name != "nt":
+        assert stat.S_IMODE(lock_file.stat().st_mode) == 0o600
+
+
+def test_crash_releases_service_lock_and_next_operation_cleans_residue(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    child_env = os.environ.copy()
+    child_env["MEMORYD_HOME"] = str(home)
+    script = (
+        "import os\n"
+        "from memoryd.backup import _libpq_service\n"
+        "with _libpq_service({'host': 'localhost', 'dbname': 'memoryd', "
+        "'user': 'operator', 'password': 'secret'}) as (_, env):\n"
+        "    print(env['PGSERVICEFILE'], flush=True)\n"
+        "    os._exit(0)\n")
+    child = backup.subprocess.run(
+        [backup.sys.executable, "-c", script], capture_output=True,
+        text=True, env=child_env, cwd=Path(__file__).resolve().parents[1],
+        timeout=10)
+    assert child.returncode == 0, child.stderr
+    stale = Path(child.stdout.strip())
+    assert stale.is_file()
+    lock_file = home / ".pg-service" / "state.lock"
+    lock_was_durable = lock_file.is_file()
+
+    dump = tmp_path / "dump"
+
+    def run(command, **_kwargs):
+        dump.write_bytes(b"PGDMPafter-crash")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(backup, "_default_home", lambda: home)
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: "/tools/pg_dump")
+    monkeypatch.setattr(backup.subprocess, "run", run)
+    backup._dump_database(
+        "postgresql://operator:secret@localhost/memoryd", dump)
+
+    assert lock_was_durable
+    assert not stale.exists()
+    assert not stale.parent.exists()
+    assert lock_file.is_file()
+
+
 def test_invalid_conninfo_diagnostic_does_not_echo_password_fields():
     dsn = ("host=localhost password=super-secret sslpassword=tls-secret "
            "unterminated='value")
