@@ -1,7 +1,7 @@
 """memoryd CLI — one command to a working install on Windows/macOS/Linux.
 
   memoryd install      DB (Docker pgvector) + migrations + config + Claude Code
-                       hooks + autostart + Hermes plugin (when ~/.hermes exists)
+                       hooks + autostart + Hermes plugin (when HERMES_HOME exists)
   memoryd status       is it actually working? (the antidote to fail-open silence)
   memoryd serve        run the daemon in the foreground
   memoryd doctor       inspect spool and archive integrity (read-only)
@@ -9,6 +9,10 @@
                        apply conservative, evidence-preserving repairs
   memoryd review ...   human review CLI (delegates to memoryd.review)
   memoryd microsleep   nightly consolidation (normally runs on a schedule)
+  memoryd backup create [--output PATH] [--retain 14]
+  memoryd backup list [--output PATH]
+  memoryd backup verify SNAPSHOT
+  memoryd backup restore SNAPSHOT --dsn TARGET_DSN --home TARGET_HOME
   memoryd uninstall    remove hooks/autostart; data is never touched
 
 Everything is idempotent: re-running `install` adopts what exists.
@@ -16,20 +20,27 @@ Heavy imports (psycopg via .core) happen lazily so `--help` stays instant.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
+import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 CONTAINER = "memoryd-pgvector"
 VOLUME = "memoryd_pgdata"
 IMAGE = "pgvector/pgvector:pg16"
-PG_PASSWORD = "memoryd"  # container binds 127.0.0.1 only; see README security note
+LEGACY_PG_PASSWORD = "memoryd"
+MANAGED_CREDENTIALS = ".managed-postgres.json"
+DOCKER_ENV_PREFIX = ".memoryd-docker-env-"
+HERMES_MEMORYD_URL = "http://127.0.0.1:7437"
 HOOK_SENTINEL = "-m memoryd.hook"
 HOOK_EVENTS = {
     "UserPromptSubmit": ("recall", 5),
@@ -66,6 +77,35 @@ def _resource_dir(name: str) -> Path:
 
 def _home() -> Path:
     return Path(os.environ.get("MEMORYD_HOME", "~/memory")).expanduser()
+
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+
+
+def _atomic_owner_json(path: Path, value: dict) -> None:
+    """Publish JSON in one rename without leaving credentials world-readable."""
+    temporary = path.with_name(
+        f".{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = None
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        _fsync_managed_credential_dir(path.parent)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
 
 
 def _mask(dsn: str) -> str:
@@ -127,6 +167,156 @@ def _container_port() -> str | None:
     return out if code == 0 and out else None
 
 
+def _container_definitively_absent(code: int, detail: str) -> bool:
+    if code == 0:
+        return False
+    lowered = detail.lower()
+    return any(marker in lowered for marker in (
+        "no such object", "no such container"))
+
+
+def _volume_definitively_absent(code: int, detail: str) -> bool:
+    return code != 0 and "no such volume" in detail.lower()
+
+
+def _volume_pgdata_initialized() -> bool | None:
+    code, detail = _docker(
+        "run", "--rm", "--network", "none", "--read-only",
+        "--entrypoint", "test",
+        "-v", f"{VOLUME}:/var/lib/postgresql/data:ro", IMAGE,
+        "-s", "/var/lib/postgresql/data/PG_VERSION")
+    if code == 0:
+        return True
+    if code == 1 and not detail.strip():
+        return False
+    return None
+
+
+def _managed_credential_value(port: int, password: str) -> dict:
+    return {
+        "schema_version": 1,
+        "container": CONTAINER,
+        "port": port,
+        "password": password,
+        "dsn": f"postgresql://postgres:{password}@127.0.0.1:{port}/memoryd",
+    }
+
+
+def _managed_credential_path() -> Path:
+    return _home() / MANAGED_CREDENTIALS
+
+
+def _fsync_managed_credential_dir(path: Path) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_managed_credentials(value: dict) -> None:
+    path = _managed_credential_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        _fsync_managed_credential_dir(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_managed_credentials() -> dict | None:
+    path = _managed_credential_path()
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if (os.name != "nt" and
+                stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o600):
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(value, dict) or set(value) != {
+            "schema_version", "container", "port", "password", "dsn"}:
+        return None
+    if (type(value["schema_version"]) is not int or value["schema_version"] != 1 or
+            value["container"] != CONTAINER or
+            type(value["port"]) is not int or not 1 <= value["port"] <= 65535 or
+            not isinstance(value["password"], str) or not value["password"]):
+        return None
+    expected = _managed_credential_value(value["port"], value["password"])
+    return value if value == expected else None
+
+
+def _remove_managed_credentials(value: dict) -> None:
+    path = _managed_credential_path()
+    if _read_managed_credentials() == value:
+        path.unlink(missing_ok=True)
+        _fsync_managed_credential_dir(path.parent)
+
+
+def _cleanup_stale_docker_env_files() -> None:
+    home = _home()
+    removed = False
+    try:
+        candidates = list(home.glob(f"{DOCKER_ENV_PREFIX}*.tmp"))
+    except OSError as exc:
+        raise SystemExit(f"cannot inspect stale Docker env files: {exc}") from exc
+    for path in candidates:
+        try:
+            mode = path.stat(follow_symlinks=False).st_mode
+            if (path.is_symlink() or not stat.S_ISREG(mode) or
+                    (os.name != "nt" and stat.S_IMODE(mode) != 0o600)):
+                continue
+            path.unlink()
+            removed = True
+        except OSError as exc:
+            raise SystemExit(
+                f"cannot remove stale owner-only Docker env file {path}: "
+                f"{exc}") from exc
+    if removed:
+        _fsync_managed_credential_dir(home)
+
+
+@contextmanager
+def _docker_env_file(password: str):
+    if "\n" in password or "\r" in password:
+        raise SystemExit("managed PostgreSQL credential contains a newline")
+    home = _home()
+    home.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(home, 0o700)
+    path = home / f"{DOCKER_ENV_PREFIX}{secrets.token_hex(16)}.tmp"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"POSTGRES_PASSWORD={password}\nPOSTGRES_DB=memoryd\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        yield path
+    finally:
+        existed = os.path.lexists(path)
+        path.unlink(missing_ok=True)
+        if existed:
+            _fsync_managed_credential_dir(home)
+
+
 def _pg_ready(admin_dsn: str, wait_s: int) -> bool:
     import psycopg
     deadline = time.monotonic() + wait_s
@@ -143,6 +333,7 @@ def _pg_ready(admin_dsn: str, wait_s: int) -> bool:
 def ensure_container() -> str:
     """Adopt or (re)create the pgvector container; return the memoryd DSN."""
     import psycopg
+    _cleanup_stale_docker_env_files()
     code, _ = _docker("info")
     if code != 0:
         raise SystemExit(
@@ -150,44 +341,124 @@ def ensure_container() -> str:
             "you sign in'), then re-run: memoryd install\n"
             "Or point MEMORYD_DSN at your own PostgreSQL 16 + pgvector database.")
 
-    exists, _ = _docker("inspect", CONTAINER)
+    exists, inspect_detail = _docker("inspect", CONTAINER)
+    if exists != 0 and not _container_definitively_absent(
+            exists, inspect_detail):
+        raise SystemExit(
+            f"cannot determine whether container {CONTAINER} exists; Docker "
+            "inspect was inconclusive. No container changes were made; check "
+            "Docker and re-run: memoryd install")
     if exists == 0:
         _docker("start", CONTAINER)
         port = _container_port() or "5432"
-        admin = f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres"
-        if not _pg_ready(admin, 30):
+        managed = _read_managed_credentials()
+        passwords: list[str] = []
+        if (managed is not None and managed["container"] == CONTAINER and
+                str(managed["port"]) == port):
+            passwords.append(managed["password"])
+        if LEGACY_PG_PASSWORD not in passwords:
+            passwords.append(LEGACY_PG_PASSWORD)
+        password = next((candidate for candidate in passwords
+                         if _pg_ready(
+                             f"postgresql://postgres:{candidate}"
+                             f"@127.0.0.1:{port}/postgres", 30)), None)
+        if password is None:
             raise SystemExit(
                 f"container {CONTAINER} exists but postgres is not reachable on "
-                f"port {port} with the expected credentials. Remove it "
-                f"(docker rm -f {CONTAINER}) or set MEMORYD_DSN, then re-run.")
+                f"port {port} with managed or legacy credentials. Its credentials are "
+                "unknown and it has not been removed. Restore a working dsn in "
+                f"{_home() / 'config.json'} or set MEMORYD_DSN, then re-run.")
+        admin = (f"postgresql://postgres:{password}"
+                 f"@127.0.0.1:{port}/postgres")
         with psycopg.connect(admin, autocommit=True) as c:
             has_db = c.execute(
                 "SELECT 1 FROM pg_database WHERE datname='memoryd'").fetchone()
-        if has_db:
-            # real data lives here — adopt it, just make it survive reboots
-            _docker("update", "--restart", "unless-stopped", CONTAINER)
-            return f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{port}/memoryd"
-        # no memoryd DB inside -> holds no memoryd data; recreate properly
-        # (127.0.0.1 bind, named volume, restart policy)
-        print(f"  container  recreating {CONTAINER}: no memoryd database inside; "
-              "rebinding to 127.0.0.1 with a persistent volume")
-        _docker("rm", "-f", CONTAINER)
+            if not has_db:
+                c.execute("CREATE DATABASE memoryd")
+        # Existing containers are never destroyed: the volume may contain data
+        # outside memoryd that the installer cannot safely classify.
+        _docker("update", "--restart", "unless-stopped", CONTAINER)
+        return (f"postgresql://postgres:{password}"
+                f"@127.0.0.1:{port}/memoryd")
 
+    volume_code, volume_detail = _docker("volume", "inspect", VOLUME)
+    if volume_code != 0 and not _volume_definitively_absent(
+            volume_code, volume_detail):
+        raise SystemExit(
+            f"cannot determine whether Docker volume {VOLUME} exists. No "
+            "container changes were made; check Docker and re-run: memoryd "
+            "install")
+    prior_managed = _read_managed_credentials()
+    recovering_legacy = False
+    if prior_managed is None and volume_code == 0:
+        initialized = _volume_pgdata_initialized()
+        if initialized is None:
+            raise SystemExit(
+                f"cannot classify PostgreSQL data in Docker volume {VOLUME}; "
+                "the probe was inconclusive. No persistent container or "
+                "credential record was created; check Docker and re-run: "
+                "memoryd install")
+        recovering_legacy = initialized
+    if prior_managed is not None:
+        password = prior_managed["password"]
+    elif recovering_legacy:
+        password = LEGACY_PG_PASSWORD
+    else:
+        password = secrets.token_urlsafe(32)
     port_n = _free_port()
-    code, out = _docker(
-        "run", "-d", "--name", CONTAINER, "--restart", "unless-stopped",
-        "-v", f"{VOLUME}:/var/lib/postgresql/data",
-        "-e", f"POSTGRES_PASSWORD={PG_PASSWORD}", "-e", "POSTGRES_DB=memoryd",
-        "-p", f"127.0.0.1:{port_n}:5432", IMAGE)
+    managed = _managed_credential_value(port_n, password)
+    if not recovering_legacy:
+        _write_managed_credentials(managed)
+    with _docker_env_file(password) as env_path:
+        code, out = _docker(
+            "run", "-d", "--name", CONTAINER, "--restart", "unless-stopped",
+            "-v", f"{VOLUME}:/var/lib/postgresql/data",
+            "--env-file", str(env_path),
+            "-p", f"127.0.0.1:{port_n}:5432", IMAGE)
     if code != 0:
-        raise SystemExit(f"docker run failed: {out}")
-    admin = f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{port_n}/postgres"
+        after_code, after_detail = _docker("inspect", CONTAINER)
+        if _container_definitively_absent(after_code, after_detail):
+            record_removed = False
+            if prior_managed is None and not recovering_legacy:
+                volume_after_code, volume_after_detail = _docker(
+                    "volume", "inspect", VOLUME)
+                if _volume_definitively_absent(
+                        volume_after_code, volume_after_detail):
+                    _remove_managed_credentials(managed)
+                    record_removed = True
+            if recovering_legacy or record_removed:
+                raise SystemExit(
+                    f"docker run failed: {out.replace(password, '***')}")
+            raise SystemExit(
+                "docker run failed after the managed volume may have been "
+                "initialized; managed credentials retained. Check Docker and "
+                "re-run: memoryd install")
+        state = ("the managed container now exists" if after_code == 0 else
+                 "follow-up inspect was inconclusive")
+        if recovering_legacy:
+            raise SystemExit(
+                f"docker run reported failure, but {state}; legacy volume "
+                "credentials remain unproven and no credential record was "
+                "created. Check Docker and re-run: memoryd install")
+        raise SystemExit(
+            f"docker run reported failure, but {state}; managed credentials "
+            "retained; follow-up inspect/recovery may be needed. Start Docker "
+            "if necessary and re-run: memoryd install")
+    admin = f"postgresql://postgres:{password}@127.0.0.1:{port_n}/postgres"
     if not _pg_ready(admin, 90):
+        if recovering_legacy:
+            raise SystemExit(
+                f"Docker volume {VOLUME} is initialized, but its credentials "
+                "are unknown. The volume and container were not removed. "
+                "Restore a working dsn in config.json or set MEMORYD_DSN, "
+                "then re-run.")
         raise SystemExit("postgres container did not become ready within 90s")
+    if recovering_legacy:
+        _write_managed_credentials(managed)
     with psycopg.connect(admin, autocommit=True) as c:
         if not c.execute("SELECT 1 FROM pg_database WHERE datname='memoryd'").fetchone():
             c.execute("CREATE DATABASE memoryd")  # pre-existing volume without it
-    return f"postgresql://postgres:{PG_PASSWORD}@127.0.0.1:{port_n}/memoryd"
+    return managed["dsn"]
 
 
 def apply_migrations(dsn: str) -> list[str]:
@@ -218,11 +489,26 @@ def apply_migrations(dsn: str) -> list[str]:
 
 def write_config(dsn: str) -> Path:
     home = _home()
-    home.mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if home.is_symlink() or not home.is_dir():
+        raise OSError(f"memoryd home must be a real directory: {home}")
+    if os.name != "nt":
+        os.chmod(home, 0o700)
+        mode = stat.S_IMODE(home.stat(follow_symlinks=False).st_mode)
+        if mode != 0o700:
+            raise OSError(
+                f"memoryd home is not owner-only: {home} has mode {mode:04o}")
     p = home / "config.json"
-    try:
+    config_exists = os.path.lexists(p)
+    if config_exists:
+        value = p.stat(follow_symlinks=False)
+        if p.is_symlink() or not stat.S_ISREG(value.st_mode):
+            raise OSError(f"memoryd config is not a regular file: {p}")
+        if os.name != "nt" and stat.S_IMODE(value.st_mode) != 0o600:
+            raise OSError(f"memoryd config is not owner-only: {p}")
+    if config_exists:
         cfg = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    else:
         cfg = {}
     cfg["dsn"] = dsn
     cfg.setdefault("port", 7437)
@@ -245,12 +531,12 @@ def write_config(dsn: str) -> Path:
             env[k] = os.environ[k]  # env wins on install so key rotation takes effect
         print(f"  config     persisted {', '.join(changed)} so scheduled runs "
               "use them; edit config.json's env map to change")
-    p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    if sys.platform != "win32":  # the file holds API keys — keep it owner-only
-        try:
-            os.chmod(p, 0o600)
-        except OSError:
-            pass
+    _atomic_owner_json(p, cfg)
+    value = p.stat(follow_symlinks=False)
+    if p.is_symlink() or not stat.S_ISREG(value.st_mode):
+        raise OSError(f"memoryd config is not a regular file: {p}")
+    if os.name != "nt" and stat.S_IMODE(value.st_mode) != 0o600:
+        raise OSError(f"memoryd config is not owner-only: {p}")
     return p
 
 
@@ -277,18 +563,15 @@ def register_claude_hooks() -> Path:
 
 
 def install_hermes_plugin() -> None:
-    hermes = Path("~/.hermes").expanduser()
+    hermes = _hermes_home()
     if not hermes.is_dir():
-        print("  hermes     not detected - after installing Hermes, re-run: memoryd install")
+        print(f"  hermes     not detected at {hermes} - create/select HERMES_HOME, "
+              "then re-run: memoryd install")
         return
-    dst = hermes / "plugins" / "memory" / "memoryd"
+    dst = hermes / "plugins" / "memoryd"
     shutil.copytree(_resource_dir("hermes_plugin"), dst, dirs_exist_ok=True)
     cfgp = hermes / "memoryd.json"
-    if not cfgp.exists():
-        from .hook import _cfg
-        port, _ = _cfg()
-        cfgp.write_text(json.dumps({"url": f"http://127.0.0.1:{port}"}, indent=2),
-                        encoding="utf-8")
+    _atomic_owner_json(cfgp, {"url": HERMES_MEMORYD_URL})
     print(f"  hermes     plugin installed -> {dst}")
     print("             activate with: hermes config set memory.provider memoryd")
 
@@ -324,6 +607,27 @@ Persistent=true
 WantedBy=timers.target
 """
 
+_SYSTEMD_BACKUP_SERVICE = """[Unit]
+Description=memoryd daily verified backup
+
+[Service]
+Type=oneshot
+ExecStartPre=systemctl --user stop memoryd.service
+ExecStart={python} -m memoryd backup create --retain 14
+ExecStopPost=systemctl --user start memoryd.service
+"""
+
+_SYSTEMD_BACKUP_TIMER = """[Unit]
+Description=memoryd daily verified backup
+
+[Timer]
+OnCalendar=*-*-* 02:35:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
 _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -334,6 +638,11 @@ _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
   {extra}
 </dict></plist>
 """
+
+
+def _systemd_exec_arg(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
 
 
 def install_autostart() -> None:
@@ -360,15 +669,22 @@ def install_autostart() -> None:
     elif sys.platform.startswith("linux"):
         unit_dir = Path("~/.config/systemd/user").expanduser()
         unit_dir.mkdir(parents=True, exist_ok=True)
+        python = _systemd_exec_arg(sys.executable)
         (unit_dir / "memoryd.service").write_text(
-            _SYSTEMD_SERVICE.format(python=sys.executable), encoding="utf-8")
+            _SYSTEMD_SERVICE.format(python=python), encoding="utf-8")
         (unit_dir / "memoryd-microsleep.service").write_text(
-            _SYSTEMD_SLEEP_SERVICE.format(python=sys.executable), encoding="utf-8")
+            _SYSTEMD_SLEEP_SERVICE.format(python=python), encoding="utf-8")
         (unit_dir / "memoryd-microsleep.timer").write_text(
             _SYSTEMD_SLEEP_TIMER, encoding="utf-8")
+        (unit_dir / "memoryd-backup.service").write_text(
+            _SYSTEMD_BACKUP_SERVICE.format(python=python),
+            encoding="utf-8")
+        (unit_dir / "memoryd-backup.timer").write_text(
+            _SYSTEMD_BACKUP_TIMER, encoding="utf-8")
         _run(["systemctl", "--user", "daemon-reload"])
         code, out = _run(["systemctl", "--user", "enable", "--now",
-                          "memoryd.service", "memoryd-microsleep.timer"])
+                          "memoryd.service", "memoryd-microsleep.timer",
+                          "memoryd-backup.timer"])
         print("  autostart  systemd user units enabled"
               + (" (headless box? run: loginctl enable-linger $USER)" if code == 0
                  else f" FAILED: {out}"))
@@ -532,8 +848,8 @@ def status() -> int:
         plist = Path("~/Library/LaunchAgents/io.memoryd.daemon.plist").expanduser()
         print(f"  autostart  launchd agents: {'present' if plist.exists() else 'MISSING'}")
 
-    hp = Path("~/.hermes/plugins/memory/memoryd").expanduser()
-    print(f"  hermes     {'plugin installed' if hp.is_dir() else 'not installed (~/.hermes missing)'}")
+    hp = _hermes_home() / "plugins" / "memoryd"
+    print(f"  hermes     {'plugin installed' if hp.is_dir() else f'not installed ({_hermes_home()} missing)'}")
 
     spool_counts = _spool_counts(home / "spool")
     if spool_counts["dead_letter"]:
@@ -552,24 +868,22 @@ def status() -> int:
 
 
 def serve() -> None:
-    from .core import CFG
-    CFG.ensure_dirs()
-
     def _tty(stream) -> bool:
         try:
             return stream is not None and stream.isatty()
         except Exception:  # noqa: BLE001
             return False
 
-    if not _tty(sys.stdout):
-        # pythonw / scheduled task: print() would vanish and tracebacks with it
-        log = open(CFG.home / "memoryd.log", "a", encoding="utf-8", buffering=1)
-        sys.stdout = sys.stderr = log
     from .server import main as server_main
     try:
-        server_main()
+        # Open the unattended log only after the server owns the home and has
+        # safely created it; scheduled/pythonw output would otherwise vanish.
+        server_main(log_unattended=not _tty(sys.stdout))
     except OSError as e:
-        # bind failed -> another instance is listening; idempotent double-start
+        if (e.errno != errno.EADDRINUSE and
+                getattr(e, "winerror", None) != 10048):
+            raise
+        # An address-in-use bind failure is an idempotent double-start.
         print(f"memoryd: not starting ({e}); another instance is likely running")
         sys.exit(0)
 
@@ -596,11 +910,18 @@ def uninstall() -> None:
                 "Microsoft/Windows/Start Menu/Programs/Startup/memoryd.cmd")
         shim.unlink(missing_ok=True)
     elif sys.platform.startswith("linux"):
+        # Prevent a new timer activation, then stop any in-flight backup. Its
+        # ExecStopPost may start the daemon, so daemon disable/stop comes last
+        # and is the final authority on daemon state during uninstall.
+        _run(["systemctl", "--user", "disable", "--now",
+              "memoryd-backup.timer"])
+        _run(["systemctl", "--user", "stop", "memoryd-backup.service"])
         _run(["systemctl", "--user", "disable", "--now",
               "memoryd.service", "memoryd-microsleep.timer"])
         unit_dir = Path("~/.config/systemd/user").expanduser()
         for n in ("memoryd.service", "memoryd-microsleep.service",
-                  "memoryd-microsleep.timer"):
+                  "memoryd-microsleep.timer", "memoryd-backup.service",
+                  "memoryd-backup.timer"):
             (unit_dir / n).unlink(missing_ok=True)
         _run(["systemctl", "--user", "daemon-reload"])
     elif sys.platform == "darwin":
@@ -609,8 +930,7 @@ def uninstall() -> None:
             _run(["launchctl", "bootout", f"gui/{uid}/{label}"])
             (Path("~/Library/LaunchAgents").expanduser() / f"{label}.plist").unlink(
                 missing_ok=True)
-    shutil.rmtree(Path("~/.hermes/plugins/memory/memoryd").expanduser(),
-                  ignore_errors=True)
+    shutil.rmtree(_hermes_home() / "plugins" / "memoryd", ignore_errors=True)
     print("  autostart  removed")
     print("  kept your data. Full purge:")
     print(f"    docker rm -f {CONTAINER} && docker volume rm {VOLUME}")
@@ -645,6 +965,9 @@ def main() -> None:
     elif cmd == "microsleep":
         from .microsleep import main as microsleep_main
         microsleep_main()
+    elif cmd == "backup":
+        from .backup import main as backup_main
+        sys.exit(backup_main(sys.argv[2:]))
     elif cmd == "uninstall":
         uninstall()
     else:

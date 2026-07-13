@@ -7,7 +7,7 @@
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache_2.0-4c1d95?style=for-the-badge"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-312e81?style=for-the-badge&logo=python&logoColor=white">
   <img alt="Platform: Windows, macOS, Linux" src="https://img.shields.io/badge/platform-Windows_|_macOS_|_Linux-1e1b4b?style=for-the-badge">
-  <img alt="Version 0.2.0" src="https://img.shields.io/badge/version-0.2.0-6d28d9?style=for-the-badge">
+  <img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-6d28d9?style=for-the-badge">
 </p>
 
 [**Install**](#-install-2-minutes) · [**Daily use**](#-daily-use) · [**Docs**](docs/REFERENCE.md) · [**Architecture**](docs/ARCHITECTURE.md)
@@ -80,11 +80,11 @@ memoryd status                     # everything green? you're done.
 
 `memoryd install` does the rest, idempotently (safe to re-run any time):
 
-- starts a **PostgreSQL 16 + pgvector container** (`memoryd-pgvector`, localhost-only, persistent volume, restarts with Docker) and applies all migrations
+- starts a **PostgreSQL 16 + pgvector container** (`memoryd-pgvector`, localhost-only, persistent volume, restarts with Docker) with a fresh random database password and applies all migrations
 - writes `~/memory/config.json` so the daemon finds its database even when autostarted
 - registers the **Claude Code hooks** in `~/.claude/settings.json` (recall before every prompt, capture after every turn)
 - installs the **Hermes plugin** if `~/.hermes` exists (otherwise: re-run install after you install Hermes)
-- sets up **autostart**: the daemon at logon and the nightly consolidation at 03:05 (Task Scheduler on Windows, systemd user units on Linux, launchd on macOS) — then starts the daemon right away
+- sets up **autostart**: the daemon at logon and the nightly consolidation at 03:05 (Task Scheduler on Windows, systemd user units on Linux, launchd on macOS) — then starts the daemon right away. Linux also gets a verified daily backup timer at 02:35; other platforms leave backup scheduling to the operator.
 
 ### 🔑 Why the API key?
 
@@ -110,7 +110,10 @@ Done by `memoryd install` — recall and capture run on every turn. For manual s
 
 ### 🤝 Connect Hermes Agent
 
-If `~/.hermes` existed at install time the plugin is already in place; otherwise re-run `memoryd install`. Then activate it:
+`memoryd install` uses the active `$HERMES_HOME` (default `~/.hermes`) and
+installs the provider at `$HERMES_HOME/plugins/memoryd`. Export the same
+`HERMES_HOME` for memoryd and Hermes; create it and re-run the installer if it
+did not exist initially. Then activate it:
 
 ```bash
 hermes config set memory.provider memoryd
@@ -134,6 +137,44 @@ memoryd review approve 3
 cat ~/memory/digest/$(date +%F).md # daily health report (written nightly)
 ```
 
+### Back up and restore
+
+Backups are local snapshots under `~/memory/backups` by default. They include a
+PostgreSQL custom-format dump plus `archive/` and `spool/`; they do not upload
+or copy data off the machine. Stop the daemon first so the database and files
+describe one offline point in time:
+
+```bash
+memoryd backup create --retain 14
+memoryd backup list
+memoryd backup verify ~/memory/backups/20260713T023500Z-v1
+```
+
+Snapshot metadata is sanitized: database passwords and API-key values are not
+included. The manifest lists the secret environment-variable names you must
+re-enter on the restored installation. On POSIX, backup and restore abort if
+owner-only directory (`0700`) or file (`0600`) modes cannot be enforced;
+Windows applies its available chmod protection on a best-effort basis, so use
+an account-private directory and appropriate NTFS ACLs.
+
+Practice the restore into an **empty database and a new target home**, never
+over the live installation. On POSIX, the target may instead be an existing
+empty directory and is atomically replaced. On Windows, the target directory
+must not exist because replacing a directory is not an atomic operation there:
+
+```bash
+# Stop every memoryd daemon that could use the source or target first.
+memoryd backup restore ~/memory/backups/20260713T023500Z-v1 \
+  --dsn 'postgresql://restore-user@localhost/memoryd_restore' \
+  --home ~/memory-restore-drill
+MEMORYD_HOME=~/memory-restore-drill memoryd doctor
+```
+
+Restore refuses a running daemon, a nonempty/symlink target home, a Windows
+target home that already exists, or a target database that already has user
+tables. Re-enter required API keys after the drill rather than copying them
+into a snapshot.
+
 ---
 
 ## ✅ Verify your install
@@ -148,6 +189,7 @@ memoryd status                     # daemon, DB, hooks, autostart, spool states
 memoryd doctor                     # read-only integrity inspection
 memoryd doctor --repair            # apply only conservative, evidence-preserving repairs
 python scripts/test_durable_capture.py # DB-free durable capture and recovery
+python scripts/test_hermes_spool.py # DB-free Hermes crash-durable queue checks
 python scripts/smoke_test.py       # storage integrity, recall, canaries
 python scripts/test_extract.py     # fact extraction and promotion rules
 python scripts/test_vector.py      # semantic search and index rebuild
@@ -156,8 +198,9 @@ python scripts/test_bitter_lesson.py # DB-free checks: model/policy/eval extensi
 ```
 
 The DB-backed scripts write throwaway `smoketest`/test rows into your live
-database; use a fresh install. `test_durable_capture.py` and
-`test_bitter_lesson.py` are DB-free and need no daemon.
+database; use a fresh install. `test_durable_capture.py`,
+`test_hermes_spool.py`, and `test_bitter_lesson.py` are DB-free and need no
+daemon.
 
 </details>
 
@@ -180,7 +223,22 @@ memoryd install
 
 To run everything by hand instead: `memoryd serve` in the foreground, `memoryd microsleep` nightly via cron, and merge `hooks/settings.snippet.json` into `~/.claude/settings.json` (replace `<PYTHON>` with your interpreter).
 
-**Security note:** the Docker container uses the password `memoryd` and binds `127.0.0.1` only. If you expose Postgres beyond localhost, change the password and the DSN in `~/memory/config.json`.
+**Security note:** each fresh Docker install generates a high-entropy database
+password, stores its DSN in owner-only `~/memory/config.json` on POSIX, and
+binds PostgreSQL to `127.0.0.1` only. Existing legacy containers using the old
+`memoryd` password remain adoptable without rotating or deleting their data.
+Before creating Docker resources, the installer atomically records fresh
+managed credentials in owner-only `~/memory/.managed-postgres.json`; this lets
+a rerun recover safely if installation stops before migrations or config write.
+If the container was removed but its named volume remains, the installer reuses
+that record. Without a record it probes `PG_VERSION` through a read-only,
+networkless ephemeral container: empty data gets a new random credential,
+initialized data gets only the explicit legacy recovery attempt, and an
+inconclusive probe refuses safely. Docker receives credentials through a
+short-lived owner-only env file, not its process arguments. The credential
+record is not included in backups. A failed or timed-out `docker run` removes a
+new record only when follow-up inspection confirms that both the container and
+volume are absent.
 
 </details>
 
@@ -190,6 +248,9 @@ To run everything by hand instead: `memoryd serve` in the foreground, `memoryd m
 
 - [docs/REFERENCE.md](docs/REFERENCE.md) — full feature reference, configuration, embedder options
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the design: why raw evidence is sacred, how promotion works, the threat model, and what's deliberately not built yet
+- [docs/PRODUCTION_ROLLOUT.md](docs/PRODUCTION_ROLLOUT.md) — hardened Linux and Hermes rollout, verification, and rollback
+- [docs/CANARY_SCORECARD.md](docs/CANARY_SCORECARD.md) — the required 14-day, 200-turn production gate
+- [CHANGELOG.md](CHANGELOG.md) — release history
 
 ---
 

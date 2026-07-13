@@ -28,6 +28,10 @@ class PermanentSpoolError(SpoolError):
     pass
 
 
+class JobIdentityCollision(PermanentSpoolError):
+    pass
+
+
 def _require_nonempty_string(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise PermanentSpoolError(f"invalid {field}: expected nonempty string")
@@ -76,6 +80,18 @@ def validate_job(value: object) -> dict:
         if "blob_bytes" not in value:
             raise PermanentSpoolError("missing manifest field: blob_bytes")
         _require_nonnegative_int(value["blob_bytes"], "blob_bytes")
+    request_endpoint = value.get("request_endpoint")
+    request_digest = value.get("request_body_sha256")
+    if (request_endpoint is None) != (request_digest is None):
+        raise PermanentSpoolError(
+            "request_endpoint and request_body_sha256 must appear together")
+    if request_endpoint is not None:
+        _require_nonempty_string(request_endpoint, "request_endpoint")
+        _require_nonempty_string(request_digest, "request_body_sha256")
+        if (len(request_digest) != 64 or
+                any(c not in "0123456789abcdef" for c in request_digest)):
+            raise PermanentSpoolError(
+                "invalid request_body_sha256: expected lowercase SHA-256")
     return value
 
 
@@ -96,7 +112,8 @@ def validate_legacy_job(value: object) -> dict:
 
 def ensure_layout(spool_root: Path) -> dict[str, Path]:
     paths = {name: spool_root / name for name in
-             ("blobs", "incoming", "processing", "dead-letter")}
+             ("blobs", "incoming", "processing", "dead-letter",
+              "request-identities", "request-claims")}
     _mkdir_durable(spool_root)
     _require_plain_directory(spool_root)
     for path in paths.values():
@@ -281,7 +298,15 @@ def _atomic_json(path: Path, value: dict) -> None:
             json.dump(value, handle, ensure_ascii=False, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
         _fsync_directory(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
@@ -455,10 +480,25 @@ def enqueue_capture(*, spool_root: Path, transcript_path: Path,
             tmp_blob.unlink(missing_ok=True)
 
 
-def enqueue_extraction(*, spool_root: Path, session_id: str) -> dict:
+def enqueue_extraction(*, spool_root: Path, session_id: str,
+                       request_id: str | None = None,
+                       request_endpoint: str | None = None,
+                       request_body_sha256: str | None = None) -> dict:
     _require_nonempty_string(session_id, "session_id")
     paths = ensure_layout(spool_root)
-    job_id = _job_id()
+    if request_id is not None:
+        _require_nonempty_string(request_id, "request_id")
+        _require_nonempty_string(request_endpoint, "request_endpoint")
+        _require_nonempty_string(request_body_sha256, "request_body_sha256")
+        if (len(request_body_sha256) != 64 or
+                any(c not in "0123456789abcdef"
+                    for c in request_body_sha256)):
+            raise PermanentSpoolError(
+                "invalid request_body_sha256: expected lowercase SHA-256")
+    elif request_endpoint is not None or request_body_sha256 is not None:
+        raise PermanentSpoolError(
+            "request metadata requires request_id")
+    job_id = request_id or _job_id()
     job = {
         "schema_version": SCHEMA_VERSION,
         "job_id": job_id,
@@ -469,10 +509,135 @@ def enqueue_extraction(*, spool_root: Path, session_id: str) -> dict:
         "last_error": None,
         "next_attempt_at": None,
     }
+    if request_id is not None:
+        job["request_endpoint"] = request_endpoint
+        job["request_body_sha256"] = request_body_sha256
     validate_job(job)
     with _state_lock(spool_root):
-        _atomic_json(paths["incoming"] / f"{job_id}.json", job)
-    return job
+        if request_id is not None:
+            claim = _ensure_request_claim_unlocked(
+                paths, request_id, request_endpoint,
+                request_body_sha256, published=False)
+            if claim["published"]:
+                return {**job, "duplicate": True}
+            existing = _find_request_job_unlocked(
+                spool_root, paths, request_id)
+            if existing is not None:
+                endpoint, digest, manifest, manifest_path = existing
+                if (manifest.get("kind") == "extraction" and
+                        endpoint == request_endpoint and
+                        digest == request_body_sha256):
+                    # A prior atomic rename may have succeeded before its
+                    # parent-directory fsync failed. Re-establish durability
+                    # before this visible job can make the claim authoritative.
+                    _fsync_directory(manifest_path.parent)
+                    _ensure_request_claim_unlocked(
+                        paths, request_id, request_endpoint,
+                        request_body_sha256, published=True)
+                    return {**manifest, "duplicate": True}
+                raise JobIdentityCollision("request_id collision")
+            filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
+            target = paths["incoming"] / filename
+            if os.path.lexists(target):
+                raise JobIdentityCollision("request_id collision")
+        else:
+            target = paths["incoming"] / f"{job_id}.json"
+        _atomic_json(target, job)
+        if request_id is not None:
+            _ensure_request_claim_unlocked(
+                paths, request_id, request_endpoint,
+                request_body_sha256, published=True)
+    return {**job, "duplicate": False}
+
+
+def _request_claim_path(paths: dict[str, Path], request_id: str) -> Path:
+    filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
+    return paths["request-claims"] / filename
+
+
+def _read_request_claim_unlocked(
+        paths: dict[str, Path], request_id: str) -> dict | None:
+    path = _request_claim_path(paths, request_id)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise JobIdentityCollision("request_id collision") from exc
+    if (not isinstance(value, dict) or
+            value.get("request_id") != request_id or
+            not isinstance(value.get("endpoint"), str) or
+            not isinstance(value.get("body_sha256"), str) or
+            type(value.get("published")) is not bool):
+        raise JobIdentityCollision("request_id collision")
+    return value
+
+
+def _ensure_request_claim_unlocked(
+        paths: dict[str, Path], request_id: str,
+        endpoint: str, body_sha256: str, *, published: bool) -> dict:
+    existing = _read_request_claim_unlocked(paths, request_id)
+    if existing is not None:
+        if ((existing["endpoint"], existing["body_sha256"]) !=
+                (endpoint, body_sha256)):
+            raise JobIdentityCollision("request_id collision")
+        if published and not existing["published"]:
+            existing = {**existing, "published": True}
+            _atomic_json(_request_claim_path(paths, request_id), existing)
+        return existing
+    claim = {
+        "request_id": request_id,
+        "endpoint": endpoint,
+        "body_sha256": body_sha256,
+        "published": published,
+    }
+    _atomic_json(_request_claim_path(paths, request_id), claim)
+    return claim
+
+
+def _find_request_job_unlocked(
+        spool_root: Path, paths: dict[str, Path],
+        request_id: str) -> tuple[str, str, dict, Path] | None:
+    filename = hashlib.sha256(request_id.encode()).hexdigest() + ".json"
+    candidates = [spool_root / filename]
+    candidates.extend(
+        paths[state] / filename for state in (
+            "incoming", "processing", "dead-letter",
+            "request-identities"))
+    found = None
+    for candidate in candidates:
+        try:
+            manifest = json.loads(candidate.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise JobIdentityCollision("request_id collision") from exc
+        if (not isinstance(manifest, dict) or
+                manifest.get("job_id") != request_id):
+            continue
+        endpoint = manifest.get("request_endpoint")
+        digest = manifest.get("request_body_sha256")
+        if not isinstance(endpoint, str) or not isinstance(digest, str):
+            raise JobIdentityCollision("request_id collision")
+        identity = (endpoint, digest, manifest, candidate)
+        if found is not None and found[:2] != identity[:2]:
+            raise JobIdentityCollision("request_id collision")
+        found = identity
+    return found
+
+
+def find_request_identity(
+        spool_root: Path, request_id: str) -> tuple[str, str] | None:
+    """Return the durable extraction request identity across every job state."""
+    _require_nonempty_string(request_id, "request_id")
+    with _state_lock(spool_root):
+        paths = ensure_layout(spool_root)
+        claim = _read_request_claim_unlocked(paths, request_id)
+        if claim is not None:
+            return claim["endpoint"], claim["body_sha256"]
+        found = _find_request_job_unlocked(
+            spool_root, paths, request_id)
+        return None if found is None else found[:2]
 
 
 def load_job(path: Path) -> dict:
@@ -529,6 +694,16 @@ def claim_next(spool_root: Path, *, ignore_schedule: bool = False) -> Path | Non
                 job = {}
             if not ignore_schedule and _scheduled(job):
                 continue
+            if (isinstance(job, dict) and
+                    isinstance(job.get("request_endpoint"), str) and
+                    isinstance(job.get("request_body_sha256"), str) and
+                    isinstance(job.get("job_id"), str)):
+                # The incoming manifest is already durable. Publish its stable
+                # identity before a collision-safe move can change its name.
+                _fsync_directory(source.parent)
+                _ensure_request_claim_unlocked(
+                    paths, job["job_id"], job["request_endpoint"],
+                    job["request_body_sha256"], published=True)
             target = _collision_safe_target(paths["processing"], source.name)
             deadline = time.monotonic() + 5
             while True:
@@ -610,7 +785,15 @@ def dead_letter(spool_root: Path, job_path: Path, reason: str) -> Path:
 
 def complete_job(job_path: Path) -> None:
     with _state_lock(job_path.parent.parent):
-        _durable_unlink(job_path)
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        if (isinstance(job, dict) and
+                job.get("request_endpoint") is not None and
+                job.get("request_body_sha256") is not None):
+            completed = ensure_layout(job_path.parent.parent)[
+                "request-identities"] / job_path.name
+            _durable_replace(job_path, completed)
+        else:
+            _durable_unlink(job_path)
 
 
 def requeue_stale(spool_root: Path, *, stale_after_s: int = 900) -> int:

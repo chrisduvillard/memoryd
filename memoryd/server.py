@@ -14,20 +14,40 @@ auditable, and installable anywhere. Endpoints (spec §2):
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import queue
 import re
+import stat
+import sys
 import threading
-import time
+from collections.abc import Callable
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import (
+    BaseHTTPRequestHandler,
+    ThreadingHTTPServer as _ThreadingHTTPServer,
+)
 from pathlib import Path
 
-from .core import CFG, new_id, pool
+from .core import (
+    ArchiveOccurrenceCollision,
+    CFG,
+    find_archive_request_identity,
+    new_id,
+    pool,
+)
 from .ingest import drain_spool
+from .ownership import offline_ownership
 from .recall import build_packet
-from .spool import enqueue_capture, enqueue_extraction
+from .spool import (
+    JobIdentityCollision,
+    enqueue_capture,
+    enqueue_extraction,
+    find_request_identity,
+)
 
-CAPTURE_Q: "queue.Queue[dict]" = queue.Queue()
+CAPTURE_Q: "queue.Queue[dict | object]" = queue.Queue()
+_CAPTURE_STOP = object()
 ADMIN_POST_ENDPOINTS = {
     "/admin/eval",
     "/admin/replay",
@@ -38,14 +58,155 @@ ADMIN_POST_ENDPOINTS = {
 }
 
 
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    """Threaded HTTP server whose close waits for every active handler."""
+
+    daemon_threads = False
+    block_on_close = True
+
+
 def _nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+class RequestIdentityCollision(ValueError):
+    pass
+
+
+_DURABLE_REQUEST_MATCH = object()
+
+
+def _request_identity(body: dict) -> tuple[str, str] | None:
+    if "request_id" not in body:
+        return None
+    request_id = body["request_id"]
+    if not _nonempty_string(request_id):
+        raise ValueError("request_id must be a nonempty string")
+    canonical = {key: value for key, value in body.items()
+                 if key != "request_id"}
+    encoded = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode()
+    return request_id, hashlib.sha256(encoded).hexdigest()
+
+
+def _start_idempotent_request(conn, *, request_id: str,
+                              endpoint: str,
+                              body_sha256: str) -> dict | object | None:
+    # Serialize claim/check/mutation/record for one identity. The transaction
+    # lock prevents concurrent first calls from both applying their mutation.
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (request_id,))
+    row = conn.execute(
+        "SELECT endpoint, body_sha256, response FROM api_request_ledger "
+        "WHERE request_id=%s", (request_id,)).fetchone()
+    try:
+        spool_identity = find_request_identity(CFG.spool, request_id)
+        archive_identity = find_archive_request_identity(
+            CFG.archive, request_id)
+    except (JobIdentityCollision, ArchiveOccurrenceCollision) as exc:
+        raise RequestIdentityCollision("request_id collision") from exc
+    durable_identities = {
+        identity for identity in (spool_identity, archive_identity)
+        if identity is not None}
+    if len(durable_identities) > 1:
+        raise RequestIdentityCollision("request_id collision")
+    durable = next(iter(durable_identities), None)
+    if row is None:
+        if durable is None:
+            return None
+        if durable != (endpoint, body_sha256):
+            raise RequestIdentityCollision("request_id collision")
+        return _DURABLE_REQUEST_MATCH
+    if isinstance(row, dict):
+        saved_endpoint = row["endpoint"]
+        saved_digest = row["body_sha256"]
+        response = row["response"]
+    else:
+        saved_endpoint, saved_digest, response = row
+    if saved_endpoint != endpoint or saved_digest != body_sha256:
+        raise RequestIdentityCollision("request_id collision")
+    if durable is not None and durable != (endpoint, body_sha256):
+        raise RequestIdentityCollision("request_id collision")
+    if isinstance(response, str):
+        response = json.loads(response)
+    return {**response, "duplicate": True}
+
+
+def _record_idempotent_request(conn, *, request_id: str, endpoint: str,
+                               body_sha256: str, response: dict) -> None:
+    conn.execute(
+        "INSERT INTO api_request_ledger "
+        "(request_id, endpoint, body_sha256, response) VALUES (%s,%s,%s,%s::jsonb)",
+        (request_id, endpoint, body_sha256,
+         json.dumps(response, sort_keys=True, separators=(",", ":"))))
+
+
+def _store_capture_events(conn, body: dict) -> int:
+    from .adapters import event_to_envelope
+    from .core import append_event, archive_bytes
+
+    allowed = {"user_message", "agent_response", "tool_call", "tool_result",
+               "session_start", "session_end", "external_note", "delegation"}
+    agent = body.get("agent", "unknown")
+    project = body.get("project")
+    request_identity = _request_identity(body)
+    stored = 0
+    for ev in body["events"][:200]:
+        envelope = event_to_envelope({
+            **ev,
+            "session_id": body["session_id"],
+            "agent": agent,
+            "project": project,
+        }, runtime=agent)
+        kind = envelope["event_type"]
+        if (kind not in allowed and
+                not re.match(r"^[a-z][a-z0-9_]{1,63}$", str(kind))):
+            continue
+        payload = ev.get("payload") or {}
+        payload = {
+            **payload,
+            "_adapter": {
+                "runtime": envelope["runtime"],
+                "parent_session_id": envelope["parent_session_id"],
+                "content_ref": envelope["content_ref"],
+            },
+        }
+        text = payload.get("text", "")
+        sha = None
+        if isinstance(text, str) and len(text) > 4000:
+            day = datetime.now(timezone.utc)
+            sha = archive_bytes(
+                text.encode(), "text/plain",
+                f"{agent}/{day:%Y/%m/%d}/{body['session_id']}-{stored}.txt",
+                ingest_job_id=(
+                    f"{body['request_id']}:event:{stored}"
+                    if request_identity is not None else None),
+                request_id=(
+                    request_identity[0]
+                    if request_identity is not None else None),
+                request_endpoint=(
+                    "/capture-events"
+                    if request_identity is not None else None),
+                request_body_sha256=(
+                    request_identity[1]
+                    if request_identity is not None else None))
+            payload = {**payload, "text": text[:4000], "truncated": True}
+        append_event(
+            conn, kind=kind, session_id=body["session_id"],
+            agent=agent, project=project, raw_sha256=sha, payload=payload)
+        stored += 1
+    return stored
 
 
 def _capture_worker() -> None:
     while True:
         job = CAPTURE_Q.get()
         try:
+            if job is _CAPTURE_STOP:
+                return
+            assert isinstance(job, dict)
             if job.get("drain_spool"):
                 drain_spool()
         except Exception as exc:  # noqa: BLE001 — keep the worker alive
@@ -55,7 +216,7 @@ def _capture_worker() -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "memoryd/0.1"
+    server_version = "memoryd/0.3.0"
 
     def _json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode()
@@ -144,51 +305,31 @@ class Handler(BaseHTTPRequestHandler):
             if not required <= body.keys():
                 self._json(400, {"error": f"missing fields: {required - body.keys()}"})
                 return
-            allowed = {"user_message", "agent_response", "tool_call", "tool_result",
-                       "session_start", "session_end", "external_note", "delegation"}
-            agent = body.get("agent", "unknown")
-            project = body.get("project")
-            stored = 0
             try:
-                from .adapters import event_to_envelope
-                from .core import archive_bytes
-                from datetime import datetime as _dt, timezone as _tz
+                identity = _request_identity(body)
                 with pool().connection() as conn:
-                    for ev in body["events"][:200]:
-                        envelope = event_to_envelope({
-                            **ev,
-                            "session_id": body["session_id"],
-                            "agent": agent,
-                            "project": project,
-                        }, runtime=agent)
-                        kind = envelope["event_type"]
-                        if kind not in allowed and not re.match(r"^[a-z][a-z0-9_]{1,63}$", str(kind)):
-                            continue
-                        payload = ev.get("payload") or {}
-                        payload = {
-                            **payload,
-                            "_adapter": {
-                                "runtime": envelope["runtime"],
-                                "parent_session_id": envelope["parent_session_id"],
-                                "content_ref": envelope["content_ref"],
-                            },
-                        }
-                        text = payload.get("text", "")
-                        sha = None
-                        if isinstance(text, str) and len(text) > 4000:
-                            day = _dt.now(_tz.utc)
-                            sha = archive_bytes(
-                                text.encode(), "text/plain",
-                                f"{agent}/{day:%Y/%m/%d}/{body['session_id']}-{stored}.txt")
-                            payload = {**payload, "text": text[:4000],
-                                       "truncated": True}
-                        from .core import append_event as _ae
-                        _ae(conn, kind=kind, session_id=body["session_id"],
-                            agent=agent, project=project, raw_sha256=sha,
-                            payload=payload)
-                        stored += 1
+                    if identity is not None:
+                        request_id, digest = identity
+                        duplicate = _start_idempotent_request(
+                            conn, request_id=request_id,
+                            endpoint=self.path, body_sha256=digest)
+                        if isinstance(duplicate, dict):
+                            self._json(200, duplicate)
+                            return
+                    stored = _store_capture_events(conn, body)
+                    response = {"ok": True, "stored": stored}
+                    if identity is not None:
+                        response.update({
+                            "request_id": request_id, "duplicate": False})
+                        _record_idempotent_request(
+                            conn, request_id=request_id, endpoint=self.path,
+                            body_sha256=digest, response=response)
                     conn.commit()
-                self._json(200, {"ok": True, "stored": stored})
+                self._json(200, response)
+            except (RequestIdentityCollision, ArchiveOccurrenceCollision):
+                self._json(409, {"error": "request_id collision"})
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"error": str(e)})
         elif self.path == "/extract":
@@ -197,21 +338,74 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "session_id required"})
                 return
             try:
-                enqueue_extraction(spool_root=CFG.spool, session_id=sid)
+                identity = _request_identity(body)
+                if identity is None:
+                    enqueue_extraction(spool_root=CFG.spool, session_id=sid)
+                    response = {"queued": True}
+                else:
+                    request_id, digest = identity
+                    with pool().connection() as conn:
+                        duplicate = _start_idempotent_request(
+                            conn, request_id=request_id,
+                            endpoint=self.path, body_sha256=digest)
+                        if isinstance(duplicate, dict):
+                            self._json(202, duplicate)
+                            return
+                        job = enqueue_extraction(
+                            spool_root=CFG.spool, session_id=sid,
+                            request_id=request_id, request_endpoint=self.path,
+                            request_body_sha256=digest)
+                        response = {
+                            "queued": True, "request_id": request_id,
+                            "duplicate": False}
+                        _record_idempotent_request(
+                            conn, request_id=request_id, endpoint=self.path,
+                            body_sha256=digest, response=response)
+                        conn.commit()
+                    if job["duplicate"]:
+                        response["duplicate"] = True
+            except (RequestIdentityCollision, JobIdentityCollision):
+                self._json(409, {"error": "request_id collision"})
+                return
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
             except Exception as exc:  # noqa: BLE001 — report persistence failure
                 self._json(
                     500, {"error": f"extraction could not be persisted: {exc}"})
                 return
             CAPTURE_Q.put({"drain_spool": True})
-            self._json(202, {"queued": True})
+            self._json(202, response)
         elif self.path == "/miss":
-            with pool().connection() as conn:
-                conn.execute(
-                    "INSERT INTO miss_signals (session_id, signal, detail) VALUES (%s,%s,%s)",
-                    (body.get("session_id"), body.get("signal", "manual"),
-                     json.dumps(body.get("detail", {}))))
-                conn.commit()
-            self._json(200, {"ok": True})
+            try:
+                identity = _request_identity(body)
+                with pool().connection() as conn:
+                    if identity is not None:
+                        request_id, digest = identity
+                        duplicate = _start_idempotent_request(
+                            conn, request_id=request_id,
+                            endpoint=self.path, body_sha256=digest)
+                        if isinstance(duplicate, dict):
+                            self._json(200, duplicate)
+                            return
+                    conn.execute(
+                        "INSERT INTO miss_signals (session_id, signal, detail) "
+                        "VALUES (%s,%s,%s)",
+                        (body.get("session_id"), body.get("signal", "manual"),
+                         json.dumps(body.get("detail", {}))))
+                    response = {"ok": True}
+                    if identity is not None:
+                        response.update({
+                            "request_id": request_id, "duplicate": False})
+                        _record_idempotent_request(
+                            conn, request_id=request_id, endpoint=self.path,
+                            body_sha256=digest, response=response)
+                    conn.commit()
+                self._json(200, response)
+            except RequestIdentityCollision:
+                self._json(409, {"error": "request_id collision"})
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
         elif self.path == "/admin/model-profiles":
             from .model_gateway import get_model_profile, list_model_profiles
             profiles = [get_model_profile(name).to_dict() for name in list_model_profiles()]
@@ -344,18 +538,98 @@ def _drain_spool_bg() -> None:
         print(f"memoryd: spool drain failed: {e}")
 
 
-def main() -> None:
-    CFG.ensure_dirs()
-    threading.Thread(target=_capture_worker, daemon=True).start()
-    # background: with the DB down (Docker still booting at logon), a
-    # synchronous drain would block the socket bind for pool-timeout × N files
-    threading.Thread(target=_drain_spool_bg, daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
-    print(f"memoryd listening on 127.0.0.1:{CFG.port}  home={CFG.home}")
+def _secure_server_home() -> None:
+    home = CFG.home
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    value = home.stat(follow_symlinks=False)
+    if home.is_symlink() or not stat.S_ISDIR(value.st_mode):
+        raise OSError(f"memoryd home must be a real directory: {home}")
+    if os.name != "nt":
+        os.chmod(home, 0o700)
+        value = home.stat(follow_symlinks=False)
+        if stat.S_IMODE(value.st_mode) != 0o700:
+            raise OSError(f"memoryd home is not owner-only: {home}")
+
+
+def _open_unattended_log():
+    path = CFG.home / "memoryd.log"
+    flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT |
+             getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags, 0o600)
     try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        srv.shutdown()
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        value = os.fstat(fd)
+        path_value = path.stat(follow_symlinks=False)
+        if (path.is_symlink() or not stat.S_ISREG(value.st_mode) or
+                not stat.S_ISREG(path_value.st_mode) or
+                (value.st_dev, value.st_ino) !=
+                (path_value.st_dev, path_value.st_ino)):
+            raise OSError(f"memoryd log is not a safe regular file: {path}")
+        if os.name != "nt" and stat.S_IMODE(value.st_mode) != 0o600:
+            raise OSError(f"memoryd log is not owner-only: {path}")
+        handle = os.fdopen(fd, "a", encoding="utf-8", buffering=1)
+        fd = -1
+        return handle
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def main(*, log_unattended: bool = False) -> None:
+    with offline_ownership(CFG.home, CFG.dsn, purpose="server"):
+        _secure_server_home()
+        CFG.ensure_dirs()
+        if log_unattended:
+            log = _open_unattended_log()
+            sys.stdout = sys.stderr = log
+        srv = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
+        capture_thread = threading.Thread(target=_capture_worker, daemon=True)
+        drain_thread = threading.Thread(target=_drain_spool_bg, daemon=True)
+        capture_started = False
+        drain_started = False
+        primary_error: BaseException | None = None
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        try:
+            capture_thread.start()
+            capture_started = True
+            # With the DB down (Docker still booting at logon), a synchronous
+            # drain would block the socket bind for pool-timeout × N files.
+            drain_thread.start()
+            drain_started = True
+            print(
+                f"memoryd listening on 127.0.0.1:{CFG.port}  home={CFG.home}")
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        except BaseException as exc:
+            primary_error = exc
+        finally:
+            cleanup_steps: list[tuple[str, Callable[[], object]]] = [
+                ("close HTTP server", srv.server_close),
+            ]
+            if capture_started:
+                cleanup_steps.extend([
+                    ("finish queued captures", CAPTURE_Q.join),
+                    ("stop capture worker", lambda: CAPTURE_Q.put(_CAPTURE_STOP)),
+                    ("join capture worker", capture_thread.join),
+                ])
+            if drain_started:
+                cleanup_steps.append(("join spool drain", drain_thread.join))
+            for label, cleanup in cleanup_steps:
+                try:
+                    cleanup()
+                except BaseException as exc:  # preserve the serving failure
+                    cleanup_errors.append((label, exc))
+
+        if primary_error is not None:
+            for label, cleanup_error in cleanup_errors:
+                primary_error.add_note(f"{label} failed: {cleanup_error}")
+            raise primary_error.with_traceback(primary_error.__traceback__)
+        if cleanup_errors:
+            label, cleanup_error = cleanup_errors[0]
+            cleanup_error.add_note(f"memoryd shutdown step failed: {label}")
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
 
 
 if __name__ == "__main__":

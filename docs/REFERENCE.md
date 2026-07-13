@@ -33,6 +33,23 @@ memoryd status      # verify
 python scripts/smoke_test.py    # expects daemon running; 19/19 must pass
 ```
 
+Fresh installer-managed Docker databases use a random high-entropy password.
+The password-bearing DSN is persisted to the config file (mode `0600` on
+POSIX) and is masked in command output. A working existing DSN is adopted;
+legacy `memoryd-pgvector` containers using password `memoryd` remain
+adoptable without data deletion. Fresh credentials are atomically persisted to
+owner-only `~/memory/.managed-postgres.json` before Docker creation so a crash
+before migration/config publication remains recoverable. This secret record is
+not part of a backup snapshot. If the container is absent but the named volume
+remains, its recorded credential is reused. Without a record, a read-only,
+networkless ephemeral probe checks whether `PG_VERSION` is nonempty: empty data
+is treated as fresh, initialized data attempts only the legacy `memoryd`
+credential and persists it only after readiness proves it, and an inconclusive
+probe refuses without mutation. Docker receives these values through a
+short-lived owner-only env file, not argv. A failed or timed-out Docker command
+deletes a newly generated record only after follow-up inspection proves that
+both container and volume are absent.
+
 Manual path (bring your own Postgres 16 + pgvector; no Docker):
 
 ```bash
@@ -73,11 +90,68 @@ memoryd/semantic_policies.py semantic validation + promotion policies
 memoryd/policies.py       versioned recall policies + packet compilers
 memoryd/source_pack.py    deterministic source packing for extraction/replay
 memoryd/evaluator.py      static eval core used by admin + microsleep
-memoryd/cli.py            memoryd install|status|serve|review|microsleep|uninstall
+memoryd/cli.py            install|status|serve|review|microsleep|backup|uninstall
+memoryd/backup.py         offline create/list/verify/restore snapshots
 memoryd/doctor.py         read-only integrity inspection + conservative repair
 scripts/init_db.sh        role + db + ALL migrations (manual/psql path)
 scripts/smoke_test.py     the DB-backed verification suite
 ```
+
+## Offline backup and restore
+
+```text
+memoryd backup create [--output PATH] [--retain 14]
+memoryd backup list [--output PATH]
+memoryd backup verify SNAPSHOT
+memoryd backup restore SNAPSHOT --dsn TARGET_DSN --home TARGET_HOME
+```
+
+The default output is `~/memory/backups`; generated snapshot directories are
+named `<UTC compact>-v1`. `create` refuses while the daemon answers its health
+endpoint and runs the read-only spool/archive doctor checks before writing.
+Each owner-only snapshot contains `database.dump` (PostgreSQL custom format),
+`memory.tar.gz` (`archive/` and `spool/` only), `config.sanitized.json`, and a
+checksummed v1 manifest. API keys and password-bearing DSNs are excluded. The
+manifest records the secret environment-variable names that must be re-entered
+and the actual applied filenames queried from the database's
+`schema_migrations` ledger.
+POSIX creation, verification, and restore require snapshot/home directories to
+be mode `0700` and files to be `0600`; permission-setting failures abort.
+Windows chmod protection is best-effort, so operators should also use
+account-private NTFS ACLs.
+
+`verify` checks the exact file allowlist, sizes and SHA-256 checksums, database
+dump signature, JSON schema, and every tar member. Absolute/traversal paths,
+links, devices, and other special tar entries are rejected. `list` performs the
+same checks without mutation. Retention runs only after a newly created
+snapshot verifies and removes only older valid generated snapshot directories;
+it never follows symlinks or removes unrecognized/corrupt paths.
+
+Restore is deliberately out-of-place. Stop the daemon and provide an empty
+target PostgreSQL database plus a new, nonsymlink target home. POSIX also
+accepts an existing empty target directory and atomically replaces it. Windows
+requires the target path to be absent because replacing an existing directory
+is not atomic there. The command verifies first, stages beside the target, then
+restores with `pg_restore` using `--exit-on-error`, `--single-transaction`,
+`--no-owner`, and `--no-privileges`. It writes a config containing the target
+DSN/home and no API keys, then atomically publishes the home. If `pg_restore`
+fails, the snapshot remains intact and the target transaction rolls back. A
+restore drill should finish with `MEMORYD_HOME=<target> memoryd doctor`;
+re-enter API keys separately.
+
+Local `pg_dump`/`pg_restore` calls receive connection secrets through a private,
+per-operation libpq service file under owner-only
+`$MEMORYD_HOME/.pg-service/` and use only `service=memoryd` on argv. Cleanup is
+fsynced and retried. An owner-only durable OS lock serializes the stale sweep,
+service-file lifetime, database tool, and cleanup across processes; a crash
+releases the lock so a later operation can safely reclaim validated residue.
+Docker fallback transfers use an unpredictable remote path per operation and
+remove only that operation's path, including after a partial copy failure.
+
+Backups are local-only: memoryd does not upload snapshots. Linux installs a
+02:35 persistent systemd user timer that stops `memoryd.service`, creates and
+verifies a retained snapshot, and restarts the daemon even after failure.
+Windows and macOS do not schedule backups automatically.
 
 ## Durable capture and recovery
 
@@ -316,8 +390,8 @@ verbatim ABC from the Hermes repo, vendored in scripts/_stubs/):
   with one visible marker.
 - **sync_turn** — every turn to the ledger via `/capture-events` (agent=
   'hermes'); oversize text auto-archived content-addressed + truncated
-  inline; in-memory spool (500) while the daemon is down, flushed on
-  recovery.
+  inline; synchronously fsynced to the profile-scoped disk spool before the
+  hook returns, then retried with persisted backoff while the daemon is down.
 - **on_pre_compress** — snapshot captured BEFORE Hermes compresses context
   (the PreCompact equivalent).
 - **on_memory_write** — built-in MEMORY.md/USER.md writes mirrored to
@@ -328,18 +402,35 @@ verbatim ABC from the Hermes repo, vendored in scripts/_stubs/):
 - Tools exposed to the model: `memoryd_search`, `memoryd_report_miss`.
 - CLI: `hermes memoryd status|config|miss`.
 
-Setup: copy `hermes_plugin/memoryd/` to `<hermes>/plugins/memory/memoryd/`,
-then `hermes config set memory.provider memoryd` (or `hermes memory setup`).
-Requires migrations 001–003. Per-agent scopes via `MEMORYD_VISAS`, e.g.
+Setup: export the authoritative `HERMES_HOME`, then copy
+`hermes_plugin/memoryd/` to `$HERMES_HOME/plugins/memoryd/` (or let
+`memoryd install` do so). Activate with
+`hermes config set memory.provider memoryd` (or `hermes memory setup`).
+Requires migrations 001–007. Per-agent scopes via `MEMORYD_VISAS`, e.g.
 `{"hermes": ["work_private","project_shared","public"]}`. Cross-agent
 sharing is automatic: memories extracted from Claude Code sessions are
 recallable in Hermes (and vice versa) under each agent's visa.
 
-Version note: the plugin targets the MemoryProvider ABC as of hermes-agent
-main, 2026-07. Hermes moves fast (`hermes update`); if activation fails
-after an update, re-diff `agent/memory_provider.py` against
-`scripts/_stubs/agent/memory_provider.py` — divergence there is the first
-thing to check.
+Version note: the plugin targets Hermes Agent tag `v2026.6.5`, resolved commit
+`3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`, source path
+`agent/memory_provider.py`. The vendored pinned contract is
+`scripts/_stubs/agent/memory_provider.py`.
+
+Hermes moves fast (`hermes update`). If plugin activation fails after an
+update, run this exact DB-free compatibility check against the Hermes checkout
+you installed or updated:
+
+```bash
+python scripts/check_hermes_contract.py --source-root /path/to/hermes-agent
+```
+
+Without `--source-root`, the checker validates the actually installed
+`agent.memory_provider.MemoryProvider` source found on `sys.path`. Source
+contracts are parsed statically with Python's AST and are never imported or
+executed; plugin instantiation always uses the trusted vendored snapshot. A
+mismatch report identifies removed methods, abstract-method changes, and
+required signature changes. The pinned CI gate also passes
+`--require-pinned-bytes` to require exact source identity.
 
 ## Next: deploy + trial (M6–M8)
 

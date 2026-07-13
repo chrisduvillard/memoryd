@@ -968,7 +968,8 @@ def repair_archive(archive_root: Path, spool_root: Path) -> list[Finding]:
                 post_append=lambda: _open_identity_matches(
                     obj_handle, obj, obj_stat),
                 skip_if=lambda: _manifest_contains_occurrence(
-                    manifest, job_id, pair, fallback))
+                    manifest, job_id, pair, fallback),
+                invalidate_occurrence_index=True)
         except (OSError, ValueError) as exc:
             actions.append(Finding(
                 "archive_repair_failed", "error", str(manifest), str(exc)))

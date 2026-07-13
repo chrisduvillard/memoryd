@@ -3,10 +3,12 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import http.client
 import io
 import json
 import multiprocessing
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -182,6 +184,10 @@ def _archive_with_synchronized_publication(
 
     def synchronized_publish(real_publish):
         def publish(source: Path, target: Path) -> None:
+            if ("occurrence-identities" in target.parts or
+                    "request-identities" in target.parts):
+                real_publish(source, target)
+                return
             ready.wait(timeout=10)
             if winner:
                 core.time.sleep(0.05)
@@ -828,6 +834,1527 @@ def test_capture_persists_snapshot_before_acknowledgement() -> None:
                 else:
                     server.CAPTURE_Q.task_done()
             core.CFG.home = old_home
+
+
+def test_daemon_mutations_are_request_idempotent() -> None:
+    class Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self):
+            self.requests: dict[str, tuple[str, str, dict]] = {}
+            self.misses = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql: str, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if "pg_advisory_xact_lock" in normalized:
+                return Result((True,))
+            if normalized.startswith("select endpoint, body_sha256, response"):
+                return Result(self.requests.get(params[0]))
+            if normalized.startswith("insert into api_request_ledger"):
+                request_id, endpoint, digest, response = params
+                self.requests[request_id] = (
+                    endpoint, digest,
+                    json.loads(response) if isinstance(response, str) else response)
+                return Result()
+            if normalized.startswith("insert into miss_signals"):
+                self.misses += 1
+                return Result()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self) -> None:
+            pass
+
+    class Pool:
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def connection(self) -> Connection:
+            return self.conn
+
+    def post(httpd, path: str, body: dict) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    conn = Connection()
+    httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+    thread = threading.Thread(target=httpd.serve_forever)
+    captured: list[dict] = []
+
+    def append_event(_conn, **event):
+        captured.append(event)
+        return f"evt-{len(captured)}"
+
+    try:
+        thread.start()
+        capture_body = {
+            "request_id": "req-capture-1",
+            "session_id": "idem-session",
+            "agent": "hermes",
+            "events": [{"kind": "user_message", "payload": {"text": "hello"}}],
+        }
+        with patch.object(server, "pool", return_value=Pool(conn)), \
+             patch("memoryd.core.append_event", side_effect=append_event):
+            code, first = post(httpd, "/capture-events", capture_body)
+            assert code == 200
+            assert first == {
+                "ok": True, "stored": 1, "request_id": "req-capture-1",
+                "duplicate": False}
+
+            # Reordered keys prove stable canonical JSON; request_id itself is
+            # excluded from the digest used for retry identity.
+            retry_body = {
+                "events": capture_body["events"],
+                "agent": "hermes",
+                "request_id": "req-capture-1",
+                "session_id": "idem-session",
+            }
+            code, duplicate = post(httpd, "/capture-events", retry_body)
+            assert code == 200
+            assert duplicate == {**first, "duplicate": True}
+            assert len(captured) == 1
+
+            changed = {**capture_body, "events": [
+                {"kind": "user_message", "payload": {"text": "changed"}}]}
+            code, collision = post(httpd, "/capture-events", changed)
+            assert code == 409
+            assert collision["error"] == "request_id collision"
+            assert len(captured) == 1
+
+            miss_body = {
+                "request_id": "req-miss-1", "session_id": "idem-session",
+                "signal": "manual", "detail": {"note": "forgot"}}
+            code, first_miss = post(httpd, "/miss", miss_body)
+            assert code == 200
+            assert first_miss == {
+                "ok": True, "request_id": "req-miss-1", "duplicate": False}
+            code, duplicate_miss = post(httpd, "/miss", miss_body)
+            assert code == 200
+            assert duplicate_miss == {**first_miss, "duplicate": True}
+            assert conn.misses == 1
+
+            cross_endpoint = {**miss_body, "request_id": "req-capture-1"}
+            code, collision = post(httpd, "/miss", cross_endpoint)
+            assert code == 409
+            assert collision["error"] == "request_id collision"
+            assert conn.misses == 1
+
+            # Legacy clients remain accepted and retain the exact old shape.
+            code, legacy_miss = post(httpd, "/miss", {
+                "session_id": "legacy", "signal": "manual"})
+            assert code == 200 and legacy_miss == {"ok": True}
+            code, legacy_capture = post(httpd, "/capture-events", {
+                "session_id": "legacy", "events": []})
+            assert code == 200 and legacy_capture == {"ok": True, "stored": 0}
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_extraction_request_identity_is_durable() -> None:
+    class Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self):
+            self.requests: dict[str, tuple[str, str, dict]] = {}
+            self.misses = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql: str, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if "pg_advisory_xact_lock" in normalized:
+                return Result((True,))
+            if normalized.startswith("select endpoint, body_sha256, response"):
+                return Result(self.requests.get(params[0]))
+            if normalized.startswith("insert into api_request_ledger"):
+                request_id, endpoint, digest, response = params
+                self.requests[request_id] = (
+                    endpoint, digest,
+                    json.loads(response) if isinstance(response, str) else response)
+                return Result()
+            if normalized.startswith("insert into miss_signals"):
+                self.misses += 1
+                return Result()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self) -> None:
+            pass
+
+    class Pool:
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def connection(self) -> Connection:
+            return self.conn
+
+    def post(httpd, body: dict, path: str = "/extract") -> tuple[int, dict]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        conn = Connection()
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever)
+        try:
+            thread.start()
+            with patch.object(server, "pool", return_value=Pool(conn)):
+                conn.requests["req-db-other"] = (
+                    "/miss", "0" * 64,
+                    {"ok": True, "request_id": "req-db-other",
+                     "duplicate": False})
+                code, db_collision = post(httpd, {
+                    "session_id": "must-not-publish",
+                    "request_id": "req-db-other"})
+                assert code == 409
+                assert db_collision["error"] == "request_id collision"
+                assert not list((core.CFG.spool / "incoming").glob("*.json"))
+
+                code, first = post(httpd, {
+                    "session_id": "extract-idem", "request_id": "req-extract-1"})
+                assert code == 202
+                assert first == {
+                    "queued": True, "request_id": "req-extract-1",
+                    "duplicate": False}
+
+                code, duplicate = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "extract-idem"})
+                assert code == 202
+                assert duplicate == {**first, "duplicate": True}
+                jobs = [json.loads(path.read_text(encoding="utf-8")) for path in
+                        (core.CFG.spool / "incoming").glob("*.json")]
+                assert len(jobs) == 1
+                assert jobs[0]["job_id"] == "req-extract-1"
+
+                canonical_job = next(
+                    (core.CFG.spool / "incoming").glob("*.json"))
+                moved_job = canonical_job.with_name(
+                    f"{canonical_job.stem}-collision{canonical_job.suffix}")
+                os.replace(canonical_job, moved_job)
+
+                real_glob = Path.glob
+                history = core.CFG.spool / "request-identities"
+                for index in range(100):
+                    (history / f"history-{index}.json").write_text(
+                        json.dumps({
+                            "job_id": f"old-{index}",
+                            "request_endpoint": "/extract",
+                            "request_body_sha256": "0" * 64,
+                        }), encoding="utf-8")
+
+                def reject_broad_spool_scan(path: Path, pattern: str):
+                    if pattern == "*.json":
+                        raise AssertionError("request lookup scanned spool state")
+                    return real_glob(path, pattern)
+
+                with patch.object(Path, "glob", new=reject_broad_spool_scan):
+                    assert spool.find_request_identity(
+                        core.CFG.spool, "req-extract-1") == (
+                            "/extract",
+                            jobs[0]["request_body_sha256"])
+
+                claim_path = next(
+                    (core.CFG.spool / "request-claims").glob("*.json"))
+                saved_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+                mismatched = {**saved_claim, "body_sha256": "f" * 64}
+                claim_path.write_text(
+                    json.dumps(mismatched), encoding="utf-8")
+                code, split_identity = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "extract-idem"})
+                assert code == 409
+                assert split_identity["error"] == "request_id collision"
+                claim_path.write_text(json.dumps(saved_claim), encoding="utf-8")
+
+                # Simulate a drain that completes before the API transaction
+                # commits, followed by loss of that transaction. The durable
+                # spool identity must still prevent a second publication.
+                processing = spool.claim_next(core.CFG.spool)
+                assert processing is not None
+                spool.complete_job(processing)
+                conn.requests.clear()
+                code, duplicate = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "extract-idem"})
+                assert code == 202
+                assert duplicate == {**first, "duplicate": True}
+                assert not list((core.CFG.spool / "incoming").glob("*.json"))
+
+                conn.requests.clear()
+                code, cross_collision = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "cross",
+                    "signal": "manual"}, path="/miss")
+                assert code == 409
+                assert cross_collision["error"] == "request_id collision"
+                assert conn.misses == 0
+
+                code, cross_collision = post(httpd, {
+                    "request_id": "req-extract-1", "session_id": "cross",
+                    "events": []}, path="/capture-events")
+                assert code == 409
+                assert cross_collision["error"] == "request_id collision"
+
+                code, collision = post(httpd, {
+                    "session_id": "different", "request_id": "req-extract-1"})
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert not list((core.CFG.spool / "incoming").glob("*.json"))
+
+                code, legacy = post(httpd, {"session_id": "legacy-extract"})
+                assert code == 202 and legacy == {"queued": True}
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            core.CFG.home = old_home
+            while True:
+                try:
+                    server.CAPTURE_Q.get_nowait()
+                except server.queue.Empty:
+                    break
+                else:
+                    server.CAPTURE_Q.task_done()
+
+
+def test_extraction_claim_precedes_collision_safe_move() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "spool"
+        digest = "1" * 64
+        job = spool.enqueue_extraction(
+            spool_root=root, session_id="claim-order",
+            request_id="req-claim-order", request_endpoint="/extract",
+            request_body_sha256=digest)
+        claim_path = next((root / "request-claims").glob("*.json"))
+        claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        claim_path.write_text(
+            json.dumps({**claim, "published": False}), encoding="utf-8")
+
+        incoming = next((root / "incoming").glob("*.json"))
+        blocking = root / "processing" / incoming.name
+        blocking.write_text(json.dumps({
+            "schema_version": 2, "job_id": "blocking-job",
+            "kind": "extraction", "created_at": job["created_at"],
+            "session_id": "blocking", "attempts": 0,
+            "last_error": None, "next_attempt_at": None,
+        }), encoding="utf-8")
+
+        with patch.object(
+                spool, "_sync_replaced_path",
+                side_effect=RuntimeError("crash immediately after move")):
+            try:
+                spool.claim_next(root)
+            except RuntimeError as exc:
+                assert "after move" in str(exc)
+            else:
+                raise AssertionError("post-move crash was not injected")
+
+        durable_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        assert durable_claim["published"] is True
+        moved = [path for path in (root / "processing").glob("*.json")
+                 if path != blocking]
+        assert len(moved) == 1
+        assert json.loads(moved[0].read_text())["job_id"] == "req-claim-order"
+        retry = spool.enqueue_extraction(
+            spool_root=root, session_id="claim-order",
+            request_id="req-claim-order", request_endpoint="/extract",
+            request_body_sha256=digest)
+        assert retry["duplicate"] is True
+        assert not list((root / "incoming").glob("*.json"))
+        moved_after_retry = [
+            path for path in (root / "processing").glob("*.json")
+            if path != blocking]
+        assert moved_after_retry == moved
+
+
+def test_extraction_job_directory_durability_precedes_claim() -> None:
+    digest = "5" * 64
+
+    def leave_visible_job_with_false_claim(root: Path, request_id: str) -> None:
+        real_fsync = spool._fsync_directory
+        incoming = root / "incoming"
+        failed = False
+
+        def fail_after_incoming_rename(path: Path) -> None:
+            nonlocal failed
+            if path == incoming and not failed:
+                failed = True
+                raise OSError(errno.EIO, "incoming directory fsync failed")
+            real_fsync(path)
+
+        with patch.object(spool, "_fsync_directory",
+                          side_effect=fail_after_incoming_rename):
+            try:
+                spool.enqueue_extraction(
+                    spool_root=root, session_id="directory-cut",
+                    request_id=request_id, request_endpoint="/extract",
+                    request_body_sha256=digest)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("incoming directory fsync failure suppressed")
+        assert len(list(incoming.glob("*.json"))) == 1
+        claim_path = next((root / "request-claims").glob("*.json"))
+        assert json.loads(claim_path.read_text())["published"] is False
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "failed-refsync"
+        request_id = "req-directory-refsync-fails"
+        leave_visible_job_with_false_claim(root, request_id)
+        incoming = root / "incoming"
+        real_fsync = spool._fsync_directory
+
+        def fail_refsync(path: Path) -> None:
+            if path == incoming:
+                raise OSError(errno.EIO, "incoming re-fsync failed")
+            real_fsync(path)
+
+        with patch.object(spool, "_fsync_directory", side_effect=fail_refsync):
+            try:
+                spool.enqueue_extraction(
+                    spool_root=root, session_id="directory-cut",
+                    request_id=request_id, request_endpoint="/extract",
+                    request_body_sha256=digest)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("retry claimed an un-fsynced visible job")
+        claim_path = next((root / "request-claims").glob("*.json"))
+        assert json.loads(claim_path.read_text())["published"] is False
+
+        next(incoming.glob("*.json")).unlink()  # lost directory entry after crash
+        republished = spool.enqueue_extraction(
+            spool_root=root, session_id="directory-cut",
+            request_id=request_id, request_endpoint="/extract",
+            request_body_sha256=digest)
+        assert republished["duplicate"] is False
+        assert len(list(incoming.glob("*.json"))) == 1
+        assert json.loads(claim_path.read_text())["published"] is True
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "successful-refsync"
+        request_id = "req-directory-refsync-succeeds"
+        leave_visible_job_with_false_claim(root, request_id)
+        incoming = root / "incoming"
+        real_fsync = spool._fsync_directory
+        fsynced: list[Path] = []
+
+        def record_fsync(path: Path) -> None:
+            fsynced.append(path)
+            real_fsync(path)
+
+        with patch.object(spool, "_fsync_directory", side_effect=record_fsync):
+            recovered = spool.enqueue_extraction(
+                spool_root=root, session_id="directory-cut",
+                request_id=request_id, request_endpoint="/extract",
+                request_body_sha256=digest)
+        assert recovered["duplicate"] is True
+        assert incoming in fsynced
+        claim_path = next((root / "request-claims").glob("*.json"))
+        assert json.loads(claim_path.read_text())["published"] is True
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "claim-next-refsync"
+        request_id = "req-claim-next-refsync"
+        leave_visible_job_with_false_claim(root, request_id)
+        incoming = root / "incoming"
+        real_fsync = spool._fsync_directory
+
+        def fail_claim_refsync(path: Path) -> None:
+            if path == incoming:
+                raise OSError(errno.EIO, "claim_next re-fsync failed")
+            real_fsync(path)
+
+        with patch.object(
+                spool, "_fsync_directory", side_effect=fail_claim_refsync):
+            try:
+                spool.claim_next(root)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("claim_next promoted an un-fsynced job")
+        claim_path = next((root / "request-claims").glob("*.json"))
+        assert json.loads(claim_path.read_text())["published"] is False
+        assert len(list(incoming.glob("*.json"))) == 1
+        assert not list((root / "processing").glob("*.json"))
+
+
+def test_oversize_capture_retry_has_one_archive_occurrence() -> None:
+    class Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self):
+            self.requests: dict[str, tuple[str, str, dict]] = {}
+            self.pending_events = 0
+            self.committed_events = 0
+            self.pending_request = None
+            self.fail_first_record = True
+            self.misses = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, *_args):
+            if exc_type is not None:
+                self.pending_events = 0
+                self.pending_request = None
+            return False
+
+        def execute(self, sql: str, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if "pg_advisory_xact_lock" in normalized:
+                return Result((True,))
+            if normalized.startswith("select endpoint, body_sha256, response"):
+                return Result(self.requests.get(params[0]))
+            if normalized.startswith("insert into api_request_ledger"):
+                if self.fail_first_record:
+                    self.fail_first_record = False
+                    raise RuntimeError("forced rollback after archive publication")
+                request_id, endpoint, digest, response = params
+                self.pending_request = (
+                    request_id, endpoint, digest,
+                    json.loads(response) if isinstance(response, str) else response)
+                return Result()
+            if normalized.startswith("insert into miss_signals"):
+                self.misses += 1
+                return Result()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self) -> None:
+            self.committed_events += self.pending_events
+            self.pending_events = 0
+            if self.pending_request is not None:
+                request_id, endpoint, digest, response = self.pending_request
+                self.requests[request_id] = (endpoint, digest, response)
+                self.pending_request = None
+
+    class Pool:
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def connection(self) -> Connection:
+            return self.conn
+
+    class MidnightClock:
+        moments = iter((
+            datetime(2026, 7, 12, 23, 59, 59, tzinfo=timezone.utc),
+            datetime(2026, 7, 13, 0, 0, 1, tzinfo=timezone.utc),
+        ))
+
+        @classmethod
+        def now(cls, _timezone):
+            return next(cls.moments)
+
+    def post(httpd, body: dict, path: str = "/capture-events") -> tuple[int, dict]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        conn = Connection()
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever)
+
+        def append_event(fake_conn, **_event):
+            fake_conn.pending_events += 1
+            return "evt-pending"
+
+        body = {
+            "request_id": "req-oversize-rollback",
+            "session_id": "oversize-session",
+            "agent": "hermes",
+            "events": [{
+                "kind": "user_message", "payload": {"text": "X" * 5000}}],
+        }
+        try:
+            thread.start()
+            with patch.object(server, "pool", return_value=Pool(conn)), \
+                 patch.object(server, "datetime", MidnightClock), \
+                 patch("memoryd.core.append_event", side_effect=append_event):
+                code, failed = post(httpd, body)
+                assert code == 500
+                assert "forced rollback" in failed["error"], failed
+
+                same_text_changed_body = {
+                    **body, "session_id": "changed-session", "agent": "codex"}
+                code, collision = post(httpd, same_text_changed_body)
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert conn.committed_events == 0
+
+                code, collision = post(httpd, {
+                    "request_id": body["request_id"],
+                    "session_id": "miss-cross", "signal": "manual"},
+                    path="/miss")
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert conn.misses == 0
+
+                code, collision = post(httpd, {
+                    "request_id": body["request_id"],
+                    "session_id": "extract-cross"}, path="/extract")
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert not list((core.CFG.spool / "incoming").glob("*.json"))
+
+                changed = {**body, "events": [{
+                    "kind": "user_message",
+                    "payload": {"text": "Y" * 5000}}]}
+                code, collision = post(httpd, changed)
+                assert code == 409
+                assert collision["error"] == "request_id collision"
+                assert conn.committed_events == 0
+
+                code, retried = post(httpd, body)
+                assert code == 200 and retried["duplicate"] is False
+
+                reserved_body = {
+                    "request_id": "req-reserved-before-archive",
+                    "session_id": "reserved", "events": [{
+                        "kind": "user_message",
+                        "payload": {"text": "reservation survived"}}]}
+                reserved_digest = server._request_identity(reserved_body)[1]
+                core.claim_archive_request_identity(
+                    core.CFG.archive, reserved_body["request_id"],
+                    "/capture-events", reserved_digest)
+                code, resumed = post(httpd, reserved_body)
+                assert code == 200
+                assert resumed["duplicate"] is False
+                assert resumed["stored"] == 1
+            entries = [json.loads(line) for line in
+                       (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
+            assert len(entries) == 1
+            assert entries[0]["ingest_job_id"] == (
+                "req-oversize-rollback:event:0")
+            assert entries[0]["request_id"] == "req-oversize-rollback"
+            assert entries[0]["request_endpoint"] == "/capture-events"
+            assert entries[0]["request_body_sha256"] == (
+                server._request_identity(body)[1])
+            assert entries[0]["fonds_path"] == (
+                "hermes/2026/07/12/oversize-session-0.txt")
+            objects = [path for path in
+                       (core.CFG.archive / "objects" / "sha256").rglob("*")
+                       if path.is_file()]
+            assert len(objects) == 1
+            assert conn.committed_events == 2
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            core.CFG.home = old_home
+
+
+def test_archive_occurrence_identity_survives_path_drift() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            occurrence_id = "req-midnight:event:0"
+            core.archive_bytes(
+                b"same oversize event", "text/plain",
+                "hermes/2026/07/12/session-0.txt",
+                ingest_job_id=occurrence_id, request_id="req-midnight",
+                request_endpoint="/capture-events",
+                request_body_sha256="0" * 64)
+            core.archive_bytes(
+                b"same oversize event", "text/plain",
+                "hermes/2026/07/13/session-0.txt",
+                ingest_job_id=occurrence_id, request_id="req-midnight",
+                request_endpoint="/capture-events",
+                request_body_sha256="0" * 64)
+            entries = [json.loads(line) for line in
+                       (core.CFG.archive / "manifest.jsonl").read_text().splitlines()]
+            assert len(entries) == 1
+            assert entries[0]["fonds_path"] == (
+                "hermes/2026/07/12/session-0.txt")
+            second_view = core.CFG.archive / "fonds/hermes/2026/07/13/session-0.txt"
+            assert not os.path.lexists(second_view)
+
+            manifest = core.CFG.archive / "manifest.jsonl"
+            real_read_text = Path.read_text
+
+            def reject_manifest_scan(path: Path, *args, **kwargs):
+                if path == manifest:
+                    raise AssertionError("request lookup scanned full manifest")
+                return real_read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", new=reject_manifest_scan):
+                assert core.find_archive_request_identity(
+                    core.CFG.archive, "req-midnight") == (
+                        "/capture-events", "0" * 64)
+            sidecars = list(
+                (core.CFG.archive / "request-identities").glob("*.json"))
+            assert len(sidecars) == 1
+
+            core.archive_bytes(
+                b"legacy occurrence", "text/plain", "legacy/original.txt",
+                ingest_job_id="legacy-job")
+            try:
+                core.archive_bytes(
+                    b"legacy occurrence", "text/plain", "legacy/adopted.txt",
+                    ingest_job_id="legacy-job", request_id="legacy-job",
+                    request_endpoint="/capture-events",
+                    request_body_sha256="0" * 64)
+            except core.ArchiveOccurrenceCollision:
+                pass
+            else:
+                raise AssertionError(
+                    "request identity adopted a legacy occurrence")
+        finally:
+            core.CFG.home = old_home
+
+
+def test_legacy_occurrence_conflicts_are_not_first_match_accepted() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            ingest_id = "legacy-conflicting-occurrence"
+            base = {
+                "bytes": 1, "mime": "text/plain",
+                "first_seen": "2026-07-12T00:00:00+00:00",
+                "occurrence_at": "2026-07-12T00:00:00+00:00",
+                "fonds_path": "legacy/a.txt", "ingest_job_id": ingest_id,
+            }
+            core.append_manifest_occurrence(
+                core.CFG.archive, {**base, "sha256": hashlib.sha256(b"A").hexdigest()})
+            core.append_manifest_occurrence(
+                core.CFG.archive, {
+                    **base, "sha256": hashlib.sha256(b"B").hexdigest(),
+                    "fonds_path": "legacy/b.txt"})
+            try:
+                core.archive_bytes(
+                    b"A", "text/plain", "legacy/retry.txt",
+                    ingest_job_id=ingest_id,
+                    legacy_ingest_identity=True)
+            except core.ArchiveOccurrenceCollision:
+                pass
+            else:
+                raise AssertionError("conflicting occurrences used first match")
+            assert not list(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+        finally:
+            core.CFG.home = old_home
+
+
+def test_current_archive_occurrence_lookup_is_keyed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            manifest = core.CFG.archive / "manifest.jsonl"
+            manifest.write_text("".join(
+                json.dumps({
+                    "sha256": hashlib.sha256(str(index).encode()).hexdigest(),
+                    "bytes": 1, "mime": "text/plain",
+                    "first_seen": "2026-07-12T00:00:00+00:00",
+                    "occurrence_at": "2026-07-12T00:00:00+00:00",
+                    "fonds_path": f"history/{index}.txt",
+                    "ingest_job_id": f"historical-{index}",
+                }) + "\n" for index in range(500)), encoding="utf-8")
+            core.ensure_occurrence_index(core.CFG.archive)
+            real_read_text = Path.read_text
+
+            def reject_manifest_scan(path: Path, *args, **kwargs):
+                if path == manifest:
+                    raise AssertionError("current occurrence scanned manifest")
+                return real_read_text(path, *args, **kwargs)
+
+            kwargs = {
+                "ingest_job_id": "req-keyed:event:0",
+                "request_id": "req-keyed",
+                "request_endpoint": "/capture-events",
+                "request_body_sha256": "2" * 64,
+            }
+            with patch.object(Path, "read_text", new=reject_manifest_scan):
+                first = core.archive_bytes(
+                    b"keyed event", "text/plain", "current/first.txt", **kwargs)
+                retry = core.archive_bytes(
+                    b"keyed event", "text/plain", "current/retry.txt", **kwargs)
+                transcript_first = core.archive_bytes(
+                    b"schema-v2 transcript", "application/jsonl",
+                    "claude-code/2026/07/13/session.jsonl",
+                    ingest_job_id="schema-v2-current-job")
+                transcript_retry = core.archive_bytes(
+                    b"schema-v2 transcript", "application/jsonl",
+                    "claude-code/2026/07/13/session.jsonl",
+                    ingest_job_id="schema-v2-current-job")
+            assert first == retry
+            assert transcript_first == transcript_retry
+            sidecars = list(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+            current_sidecars = [
+                json.loads(path.read_text()) for path in sidecars
+                if json.loads(path.read_text()).get("ingest_job_id") in {
+                    kwargs["ingest_job_id"], "schema-v2-current-job"}]
+            assert len(current_sidecars) == 2
+            assert all(value["published"] is True
+                       for value in current_sidecars)
+            matching = [json.loads(line) for line in manifest.read_text().splitlines()
+                        if json.loads(line).get("ingest_job_id") == kwargs["ingest_job_id"]]
+            assert len(matching) == 1
+        finally:
+            core.CFG.home = old_home
+
+
+def test_preupgrade_occurrence_index_migrates_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            data = b"pre-upgrade schema-v2 transcript"
+            ingest_id = "preupgrade-schema-v2-job"
+            fonds = "claude-code/2026/07/12/preupgrade.jsonl"
+            occurrence = {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": len(data), "mime": "application/jsonl",
+                "first_seen": "2026-07-12T00:00:00+00:00",
+                "occurrence_at": "2026-07-12T00:00:00+00:00",
+                "fonds_path": fonds, "ingest_job_id": ingest_id,
+            }
+            core.append_manifest_occurrence(core.CFG.archive, occurrence)
+            before = (core.CFG.archive / "manifest.jsonl").read_text().splitlines()
+            core.archive_bytes(
+                data, "application/jsonl", fonds, ingest_job_id=ingest_id)
+            after = (core.CFG.archive / "manifest.jsonl").read_text().splitlines()
+            assert after == before
+
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert marker.is_file()
+            if os.name != "nt":
+                assert stat.S_IMODE(marker.stat().st_mode) & 0o077 == 0
+            sidecar = next(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+            assert json.loads(sidecar.read_text())["published"] is True
+
+            manifest = core.CFG.archive / "manifest.jsonl"
+            real_open = Path.open
+
+            def reject_historical_rescan(path: Path, *args, **kwargs):
+                mode = args[0] if args else kwargs.get("mode", "r")
+                if path == manifest and mode.startswith("r"):
+                    raise AssertionError("completed occurrence index rescanned")
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", new=reject_historical_rescan):
+                core.archive_bytes(
+                    b"new indexed transcript", "application/jsonl",
+                    "claude-code/2026/07/13/new.jsonl",
+                    ingest_job_id="post-migration-job")
+        finally:
+            core.CFG.home = old_home
+
+
+def test_occurrence_index_migration_resumes_after_crash() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            for index in range(2):
+                data = f"legacy-{index}".encode()
+                core.append_manifest_occurrence(core.CFG.archive, {
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data), "mime": "text/plain",
+                    "first_seen": "2026-07-12T00:00:00+00:00",
+                    "occurrence_at": "2026-07-12T00:00:00+00:00",
+                    "fonds_path": f"legacy/{index}.txt",
+                    "ingest_job_id": f"legacy-migrate-{index}",
+                })
+            real_write = core._write_occurrence_identity
+            writes = 0
+
+            def crash_during_second_sidecar(archive_root: Path, value: dict) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError(errno.EIO, "migration sidecar crash")
+                real_write(archive_root, value)
+
+            with patch.object(
+                    core, "_write_occurrence_identity",
+                    side_effect=crash_during_second_sidecar):
+                try:
+                    core.ensure_occurrence_index(core.CFG.archive)
+                except OSError as exc:
+                    assert exc.errno == errno.EIO
+                else:
+                    raise AssertionError("partial index migration did not fail")
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert not marker.exists()
+            assert len(list(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))) == 1
+
+            core.ensure_occurrence_index(core.CFG.archive)
+            assert marker.is_file()
+            assert len(list(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))) == 2
+        finally:
+            core.CFG.home = old_home
+
+
+def test_occurrence_index_migration_refuses_conflicts() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            for label in ("A", "B"):
+                core.append_manifest_occurrence(core.CFG.archive, {
+                    "sha256": hashlib.sha256(label.encode()).hexdigest(),
+                    "bytes": 1, "mime": "text/plain",
+                    "first_seen": "2026-07-12T00:00:00+00:00",
+                    "occurrence_at": "2026-07-12T00:00:00+00:00",
+                    "fonds_path": f"conflict/{label}.txt",
+                    "ingest_job_id": "conflicting-upgrade-job",
+                })
+            try:
+                core.ensure_occurrence_index(core.CFG.archive)
+            except core.ArchiveOccurrenceCollision:
+                pass
+            else:
+                raise AssertionError("conflicting migration was accepted")
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert not marker.exists()
+        finally:
+            core.CFG.home = old_home
+
+
+def test_doctor_append_invalidates_occurrence_index() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            core.ensure_occurrence_index(core.CFG.archive)
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert marker.is_file()
+
+            data = b"doctor reconstructed occurrence"
+            ingest_id = "doctor-reconstructed-job"
+            fonds = "claude-code/2026/07/12/doctor.jsonl"
+            core.append_manifest_occurrence(
+                core.CFG.archive, {
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data), "mime": "application/x-jsonl",
+                    "first_seen": "2026-07-12T00:00:00+00:00",
+                    "occurrence_at": "2026-07-12T00:00:00+00:00",
+                    "fonds_path": fonds, "ingest_job_id": ingest_id,
+                }, invalidate_occurrence_index=True)
+            assert not marker.exists()
+
+            core.archive_bytes(
+                data, "application/x-jsonl", fonds,
+                ingest_job_id=ingest_id)
+            matches = [json.loads(line) for line in
+                       (core.CFG.archive / "manifest.jsonl").read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") == ingest_id]
+            assert len(matches) == 1
+            assert marker.is_file()
+            sidecars = [json.loads(path.read_text()) for path in
+                        (core.CFG.archive / "occurrence-identities").glob("*.json")]
+            assert any(value.get("ingest_job_id") == ingest_id and
+                       value.get("published") is True for value in sidecars)
+
+            doctor_source = (Path(__file__).resolve().parents[1] /
+                             "memoryd" / "doctor.py").read_text()
+            assert "invalidate_occurrence_index=True" in doctor_source
+        finally:
+            core.CFG.home = old_home
+
+
+def test_absent_occurrence_marker_is_refsynced_before_doctor_append() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        try:
+            core.CFG.ensure_dirs()
+            core.ensure_occurrence_index(core.CFG.archive)
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            marker_parent = marker.parent
+            occurrence = {
+                "sha256": hashlib.sha256(b"doctor retry").hexdigest(),
+                "bytes": 12, "mime": "application/x-jsonl",
+                "first_seen": "2026-07-12T00:00:00+00:00",
+                "occurrence_at": "2026-07-12T00:00:00+00:00",
+                "fonds_path": "doctor/retry.jsonl",
+                "ingest_job_id": "doctor-retry-job",
+            }
+            real_fsync = core._fsync_directory
+
+            def fail_first_marker_fsync(path: Path) -> None:
+                if path == marker_parent:
+                    raise OSError(errno.EIO, "marker unlink fsync failed")
+                real_fsync(path)
+
+            with patch.object(
+                    core, "_fsync_directory",
+                    side_effect=fail_first_marker_fsync):
+                try:
+                    core.append_manifest_occurrence(
+                        core.CFG.archive, occurrence,
+                        invalidate_occurrence_index=True)
+                except OSError as exc:
+                    assert exc.errno == errno.EIO
+                else:
+                    raise AssertionError("marker unlink fsync failure suppressed")
+            assert not marker.exists()
+            manifest = core.CFG.archive / "manifest.jsonl"
+            assert not manifest.exists() or not manifest.read_text().strip()
+
+            fsynced: list[Path] = []
+
+            def record_retry_fsync(path: Path) -> None:
+                fsynced.append(path)
+                real_fsync(path)
+
+            with patch.object(
+                    core, "_fsync_directory", side_effect=record_retry_fsync):
+                core.append_manifest_occurrence(
+                    core.CFG.archive, occurrence,
+                    invalidate_occurrence_index=True)
+            assert marker_parent in fsynced
+            assert len(manifest.read_text().splitlines()) == 1
+        finally:
+            core.CFG.home = old_home
+
+
+def test_claim_rechecks_marker_after_doctor_invalidation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        worker_at_claim = threading.Event()
+        doctor_finished = threading.Event()
+        worker_errors: list[Exception] = []
+        real_claim = core._claim_archive_occurrence
+        data = b"doctor-worker interleaving"
+        ingest_id = "doctor-worker-race-job"
+        fonds = "claude-code/2026/07/13/doctor-worker.jsonl"
+        occurrence = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data), "mime": "application/x-jsonl",
+            "first_seen": "2026-07-13T00:00:00+00:00",
+            "occurrence_at": "2026-07-13T00:00:00+00:00",
+            "fonds_path": fonds, "ingest_job_id": ingest_id,
+        }
+
+        def pause_before_claim(*args, **kwargs):
+            worker_at_claim.set()
+            assert doctor_finished.wait(timeout=5)
+            return real_claim(*args, **kwargs)
+
+        def ingest_worker() -> None:
+            try:
+                core.archive_bytes(
+                    data, "application/x-jsonl", fonds,
+                    ingest_job_id=ingest_id)
+            except Exception as exc:
+                worker_errors.append(exc)
+
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_claim_archive_occurrence",
+                    side_effect=pause_before_claim):
+                worker = threading.Thread(target=ingest_worker)
+                worker.start()
+                assert worker_at_claim.wait(timeout=5)
+                core.append_manifest_occurrence(
+                    core.CFG.archive, occurrence,
+                    invalidate_occurrence_index=True)
+                doctor_finished.set()
+                worker.join(timeout=10)
+            assert not worker_errors, worker_errors
+            manifest = core.CFG.archive / "manifest.jsonl"
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") == ingest_id]
+            assert len(matches) == 1
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert marker.is_file()
+            sidecars = [json.loads(path.read_text()) for path in
+                        marker.parent.glob("*.json")]
+            assert any(value.get("ingest_job_id") == ingest_id and
+                       value.get("published") is True for value in sidecars)
+        finally:
+            doctor_finished.set()
+            core.CFG.home = old_home
+
+
+def test_append_rechecks_marker_after_postclaim_doctor_append() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        worker_before_append = threading.Event()
+        doctor_finished = threading.Event()
+        worker_errors: list[Exception] = []
+        real_append = core.append_manifest_occurrence
+        data = b"doctor after worker claim"
+        ingest_id = "doctor-postclaim-race-job"
+        fonds = "claude-code/2026/07/13/doctor-postclaim.jsonl"
+        occurrence = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data), "mime": "application/x-jsonl",
+            "first_seen": "2026-07-13T00:00:00+00:00",
+            "occurrence_at": "2026-07-13T00:00:00+00:00",
+            "fonds_path": fonds, "ingest_job_id": ingest_id,
+        }
+
+        def pause_worker_append(*args, **kwargs):
+            if threading.current_thread().name == "postclaim-worker":
+                worker_before_append.set()
+                assert doctor_finished.wait(timeout=5)
+            return real_append(*args, **kwargs)
+
+        def ingest_worker() -> None:
+            try:
+                core.archive_bytes(
+                    data, "application/x-jsonl", fonds,
+                    ingest_job_id=ingest_id)
+            except Exception as exc:
+                worker_errors.append(exc)
+
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "append_manifest_occurrence",
+                    side_effect=pause_worker_append):
+                worker = threading.Thread(
+                    target=ingest_worker, name="postclaim-worker")
+                worker.start()
+                assert worker_before_append.wait(timeout=5)
+                real_append(
+                    core.CFG.archive, occurrence,
+                    invalidate_occurrence_index=True)
+                doctor_finished.set()
+                worker.join(timeout=10)
+            assert not worker_errors, worker_errors
+            manifest = core.CFG.archive / "manifest.jsonl"
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") == ingest_id]
+            assert len(matches) == 1
+            marker = core.CFG.archive / "occurrence-identities/.index-complete"
+            assert marker.is_file()
+        finally:
+            doctor_finished.set()
+            core.CFG.home = old_home
+
+
+def test_concurrent_occurrence_publishers_append_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+        real_claim = core._claim_archive_occurrence
+        kwargs = {
+            "ingest_job_id": "req-concurrent:event:0",
+            "request_id": "req-concurrent",
+            "request_endpoint": "/capture-events",
+            "request_body_sha256": "6" * 64,
+        }
+
+        def synchronized_claim(*args, **claim_kwargs):
+            claim = real_claim(*args, **claim_kwargs)
+            barrier.wait(timeout=5)
+            return claim
+
+        def publish() -> None:
+            try:
+                core.archive_bytes(
+                    b"one concurrent occurrence", "text/plain",
+                    "concurrent/one.txt", **kwargs)
+            except Exception as exc:
+                errors.append(exc)
+
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_claim_archive_occurrence",
+                    side_effect=synchronized_claim):
+                threads = [threading.Thread(target=publish) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+            assert not errors, errors
+            manifest = core.CFG.archive / "manifest.jsonl"
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") ==
+                       kwargs["ingest_job_id"]]
+            assert len(matches) == 1
+        finally:
+            core.CFG.home = old_home
+
+
+def test_sidecar_fsync_failure_preserves_durable_occurrence() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        real_fsync = core._fsync_directory
+        identity_dir = core.CFG.archive / "occurrence-identities"
+        failed_published_fsync = False
+        kwargs = {
+            "ingest_job_id": "req-sidecar-fsync:event:0",
+            "request_id": "req-sidecar-fsync",
+            "request_endpoint": "/capture-events",
+            "request_body_sha256": "7" * 64,
+        }
+
+        def fail_published_sidecar_fsync(path: Path) -> None:
+            nonlocal failed_published_fsync
+            if path == identity_dir:
+                published = [
+                    json.loads(candidate.read_text())
+                    for candidate in identity_dir.glob("*.json")]
+                if (not failed_published_fsync and
+                        any(value.get("ingest_job_id") ==
+                            kwargs["ingest_job_id"] and value.get("published")
+                            for value in published)):
+                    failed_published_fsync = True
+                    raise OSError(errno.EIO, "published sidecar fsync failed")
+            real_fsync(path)
+
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_fsync_directory",
+                    side_effect=fail_published_sidecar_fsync):
+                try:
+                    core.archive_bytes(
+                        b"audit survives", "text/plain",
+                        "sidecar/first.txt", **kwargs)
+                except OSError as exc:
+                    assert exc.errno == errno.EIO
+                else:
+                    raise AssertionError("sidecar fsync failure suppressed")
+            manifest = core.CFG.archive / "manifest.jsonl"
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") ==
+                       kwargs["ingest_job_id"]]
+            assert len(matches) == 1
+
+            core.archive_bytes(
+                b"audit survives", "text/plain",
+                "sidecar/retry.txt", **kwargs)
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") ==
+                       kwargs["ingest_job_id"]]
+            assert len(matches) == 1
+            sidecar = next(identity_dir.glob("*.json"))
+            assert json.loads(sidecar.read_text())["published"] is True
+        finally:
+            core.CFG.home = old_home
+
+
+def test_occurrence_publish_waits_for_manifest_directory_fsync() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        manifest = core.CFG.archive / "manifest.jsonl"
+        real_fsync_directory = core._fsync_directory
+        failed = False
+
+        def crash_before_manifest_dir_fsync(path: Path) -> None:
+            nonlocal failed
+            if path == core.CFG.archive and manifest.exists() and not failed:
+                failed = True
+                raise RuntimeError("crash before manifest directory fsync")
+            real_fsync_directory(path)
+
+        kwargs = {
+            "ingest_job_id": "req-dir-fsync:event:0",
+            "request_id": "req-dir-fsync",
+            "request_endpoint": "/capture-events",
+            "request_body_sha256": "3" * 64,
+        }
+        try:
+            core.CFG.ensure_dirs()
+            with patch.object(
+                    core, "_fsync_directory",
+                    side_effect=crash_before_manifest_dir_fsync):
+                try:
+                    core.archive_bytes(
+                        b"directory durable", "text/plain",
+                        "fsync/first.txt", **kwargs)
+                except RuntimeError as exc:
+                    assert "directory fsync" in str(exc)
+                else:
+                    raise AssertionError("directory-fsync crash was not injected")
+            manifest.unlink(missing_ok=True)  # simulate lost first directory entry
+            core.archive_bytes(
+                b"directory durable", "text/plain",
+                "fsync/retry.txt", **kwargs)
+            matches = [json.loads(line) for line in manifest.read_text().splitlines()
+                       if json.loads(line).get("ingest_job_id") ==
+                       kwargs["ingest_job_id"]]
+            assert len(matches) == 1
+            sidecar = next(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+            assert json.loads(sidecar.read_text())["published"] is True
+        finally:
+            core.CFG.home = old_home
+
+
+def test_false_occurrence_claim_cannot_bless_provisional_line() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        ingest_id = "req-provisional:event:0"
+        sha = hashlib.sha256(b"provisional").hexdigest()
+        metadata = ("req-provisional", "/capture-events", "4" * 64)
+        line_ready = threading.Event()
+        allow_rollback = threading.Event()
+        recovery_done = threading.Event()
+        publisher_errors: list[Exception] = []
+        try:
+            core.CFG.ensure_dirs()
+            claim = core._claim_archive_occurrence(
+                core.CFG.archive, ingest_id, sha, metadata,
+                "provisional/line.txt",
+                legacy_fallback=False)
+            assert claim["published"] is False
+            occurrence = {
+                "sha256": sha, "bytes": 11, "mime": "text/plain",
+                "first_seen": "2026-07-12T00:00:00+00:00",
+                "occurrence_at": "2026-07-12T00:00:00+00:00",
+                "fonds_path": "provisional/line.txt",
+                "ingest_job_id": ingest_id,
+                "request_id": metadata[0],
+                "request_endpoint": metadata[1],
+                "request_body_sha256": metadata[2],
+            }
+
+            def publish_then_rollback() -> None:
+                def reject_after_write() -> bool:
+                    line_ready.set()
+                    assert allow_rollback.wait(timeout=5)
+                    return False
+                try:
+                    core.append_manifest_occurrence(
+                        core.CFG.archive, occurrence,
+                        post_append=reject_after_write)
+                except Exception as exc:  # expected postcondition rollback
+                    publisher_errors.append(exc)
+
+            def recover_false_claim() -> None:
+                core._claim_archive_occurrence(
+                    core.CFG.archive, ingest_id, sha, metadata,
+                    "provisional/line.txt",
+                    legacy_fallback=False)
+                recovery_done.set()
+
+            publisher = threading.Thread(target=publish_then_rollback)
+            recovery = threading.Thread(target=recover_false_claim)
+            publisher.start()
+            assert line_ready.wait(timeout=5)
+            recovery.start()
+            assert not recovery_done.wait(timeout=0.2)
+            allow_rollback.set()
+            publisher.join(timeout=5)
+            recovery.join(timeout=5)
+            assert publisher_errors
+            assert recovery_done.is_set()
+            sidecar = next(
+                (core.CFG.archive / "occurrence-identities").glob("*.json"))
+            assert json.loads(sidecar.read_text())["published"] is False
+            manifest = core.CFG.archive / "manifest.jsonl"
+            assert not manifest.read_text().strip()
+        finally:
+            allow_rollback.set()
+            core.CFG.home = old_home
+
+
+def test_lost_response_retries_return_committed_mutations() -> None:
+    class Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def __init__(self):
+            self.requests: dict[str, tuple[str, str, dict]] = {}
+            self.events = 0
+            self.misses = 0
+            self.commits = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql: str, params=()):
+            normalized = " ".join(sql.split()).lower()
+            if "pg_advisory_xact_lock" in normalized:
+                return Result((True,))
+            if normalized.startswith("select endpoint, body_sha256, response"):
+                return Result(self.requests.get(params[0]))
+            if normalized.startswith("insert into api_request_ledger"):
+                request_id, endpoint, digest, response = params
+                self.requests[request_id] = (
+                    endpoint, digest,
+                    json.loads(response) if isinstance(response, str) else response)
+                return Result()
+            if normalized.startswith("insert into miss_signals"):
+                self.misses += 1
+                return Result()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self) -> None:
+            self.commits += 1
+
+    class Pool:
+        def __init__(self, conn: Connection):
+            self.conn = conn
+
+        def connection(self) -> Connection:
+            return self.conn
+
+    def request_for(httpd, path: str, body: dict):
+        return urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+
+    def lose_response(httpd, path: str, body: dict) -> None:
+        real_json = server.Handler._json
+
+        def discard(handler, code: int, obj: dict) -> None:
+            if getattr(handler, "_discard_response", False):
+                raise ConnectionAbortedError("simulated lost response")
+            if (obj.get("request_id") == body["request_id"] and
+                    obj.get("duplicate") is False):
+                handler._discard_response = True
+                raise ConnectionAbortedError("simulated lost response")
+            real_json(handler, code, obj)
+
+        with patch.object(server.Handler, "_json", discard):
+            try:
+                urllib.request.urlopen(
+                    request_for(httpd, path, body), timeout=5)
+            except (http.client.RemoteDisconnected, ConnectionResetError,
+                    urllib.error.URLError):
+                return
+        raise AssertionError("simulated response loss reached the client")
+
+    def post(httpd, path: str, body: dict) -> tuple[int, dict]:
+        with urllib.request.urlopen(
+                request_for(httpd, path, body), timeout=5) as response:
+            return response.status, json.loads(response.read())
+
+    with tempfile.TemporaryDirectory() as td:
+        old_home = core.CFG.home
+        core.CFG.home = Path(td) / "memory"
+        conn = Connection()
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.handle_error = lambda *_args: None
+        thread = threading.Thread(target=httpd.serve_forever)
+
+        def append_event(_conn, **_event):
+            conn.events += 1
+            return f"evt-{conn.events}"
+
+        capture_body = {
+            "request_id": "req-lost-capture", "session_id": "lost",
+            "events": [{"kind": "user_message", "payload": {"text": "once"}}]}
+        miss_body = {
+            "request_id": "req-lost-miss", "session_id": "lost",
+            "signal": "manual"}
+        extract_body = {
+            "request_id": "req-lost-extract", "session_id": "lost"}
+        try:
+            thread.start()
+            with patch.object(server, "pool", return_value=Pool(conn)), \
+                 patch("memoryd.core.append_event", side_effect=append_event):
+                for path, body in (("/capture-events", capture_body),
+                                   ("/miss", miss_body),
+                                   ("/extract", extract_body)):
+                    before_commits = conn.commits
+                    lose_response(httpd, path, body)
+                    assert conn.commits == before_commits + 1
+                    code, duplicate = post(httpd, path, body)
+                    assert code in (200, 202)
+                    assert duplicate["duplicate"] is True
+            assert conn.events == 1
+            assert conn.misses == 1
+            jobs = list((core.CFG.spool / "incoming").glob("*.json"))
+            assert len(jobs) == 1
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            core.CFG.home = old_home
+            while True:
+                try:
+                    server.CAPTURE_Q.get_nowait()
+                except server.queue.Empty:
+                    break
+                else:
+                    server.CAPTURE_Q.task_done()
+
+
+def test_api_request_ledger_migration() -> None:
+    migration = (Path(__file__).resolve().parents[1] /
+                 "migrations" / "007_api_request_ledger.sql")
+    sql = migration.read_text(encoding="utf-8").lower()
+    assert "create table if not exists api_request_ledger" in sql
+    assert "request_id" in sql and "primary key" in sql
+    assert "endpoint" in sql
+    assert "body_sha256" in sql
+    assert "response" in sql and "jsonb" in sql
+    assert "committed_at" in sql and "timestamptz" in sql
 
 
 def test_claim_retry_and_dead_letter_preserve_manifest() -> None:
@@ -3148,6 +4675,27 @@ if __name__ == "__main__":
     test_hook_spools_bytes_when_daemon_is_down()
     test_hook_warns_when_delivery_and_spooling_fail()
     test_capture_persists_snapshot_before_acknowledgement()
+    test_daemon_mutations_are_request_idempotent()
+    test_extraction_request_identity_is_durable()
+    test_extraction_claim_precedes_collision_safe_move()
+    test_extraction_job_directory_durability_precedes_claim()
+    test_oversize_capture_retry_has_one_archive_occurrence()
+    test_archive_occurrence_identity_survives_path_drift()
+    test_legacy_occurrence_conflicts_are_not_first_match_accepted()
+    test_current_archive_occurrence_lookup_is_keyed()
+    test_preupgrade_occurrence_index_migrates_once()
+    test_occurrence_index_migration_resumes_after_crash()
+    test_occurrence_index_migration_refuses_conflicts()
+    test_doctor_append_invalidates_occurrence_index()
+    test_absent_occurrence_marker_is_refsynced_before_doctor_append()
+    test_claim_rechecks_marker_after_doctor_invalidation()
+    test_append_rechecks_marker_after_postclaim_doctor_append()
+    test_concurrent_occurrence_publishers_append_once()
+    test_sidecar_fsync_failure_preserves_durable_occurrence()
+    test_occurrence_publish_waits_for_manifest_directory_fsync()
+    test_false_occurrence_claim_cannot_bless_provisional_line()
+    test_lost_response_retries_return_committed_mutations()
+    test_api_request_ledger_migration()
     test_claim_retry_and_dead_letter_preserve_manifest()
     test_spool_state_transitions_sync_directories_and_leases()
     test_legacy_missing_source_is_preserved()
@@ -3168,4 +4716,4 @@ if __name__ == "__main__":
     test_doctor_repair_preserves_and_requeues_spool_evidence()
     test_doctor_reconstructs_each_supported_occurrence_idempotently()
     test_doctor_rechecks_occurrence_identity_under_manifest_lock()
-    print("31 passed, 0 failed")
+    print("52 passed, 0 failed")
