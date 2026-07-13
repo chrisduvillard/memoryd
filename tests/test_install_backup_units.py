@@ -781,11 +781,37 @@ def test_linux_installer_writes_backup_units_and_enables_timer(
     enable = next(call for call in calls if "enable" in call)
     assert enable[-3:] == [
         "memoryd.service", "memoryd-microsleep.timer", "memoryd-backup.timer"]
+    assert not (tmp_path / "memoryd-backup-initial.service").exists()
+
+
+def test_linux_hermes_installer_writes_non_pruning_initial_backup_unit(
+        monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.sys, "executable", "/opt/memoryd/bin/python")
+    monkeypatch.setattr(Path, "expanduser", lambda self: (
+        tmp_path if self.parts[:1] == ("~",) else self))
+    monkeypatch.setattr(cli, "_run", lambda cmd, timeout=120: (
+        calls.append(cmd) or (0, "")))
+
+    cli.install_autostart(_hermes_mode=True)
+
+    initial = (tmp_path / "memoryd-backup-initial.service").read_text()
+    scheduled = (tmp_path / "memoryd-backup.service").read_text()
+    assert "ExecStartPre=systemctl --user stop memoryd.service" in initial
+    assert ("ExecStart=\"/opt/memoryd/bin/python\" -m memoryd backup create "
+            "--no-retention") in initial
+    assert "ExecStopPost=systemctl --user start memoryd.service" in initial
+    assert "backup create --retain 14" in scheduled
+    assert not (tmp_path / "memoryd-backup-initial.timer").exists()
+    enable = next(call for call in calls if "enable" in call)
+    assert "memoryd-backup-initial.service" not in enable
 
 
 def test_linux_uninstall_disables_and_removes_backup_units(monkeypatch, tmp_path):
     calls: list[list[str]] = []
-    for name in ("memoryd-backup.service", "memoryd-backup.timer"):
+    for name in ("memoryd-backup.service", "memoryd-backup.timer",
+                 "memoryd-backup-initial.service"):
         (tmp_path / name).write_text("unit")
     monkeypatch.setattr(cli.sys, "platform", "linux")
     monkeypatch.setattr(Path, "expanduser", lambda self: (
@@ -799,12 +825,17 @@ def test_linux_uninstall_disables_and_removes_backup_units(monkeypatch, tmp_path
     disable_timer = ["systemctl", "--user", "disable", "--now",
                      "memoryd-backup.timer"]
     stop_backup = ["systemctl", "--user", "stop", "memoryd-backup.service"]
+    stop_initial = [
+        "systemctl", "--user", "stop", "memoryd-backup-initial.service"]
     stop_daemon = ["systemctl", "--user", "disable", "--now",
                    "memoryd.service", "memoryd-microsleep.timer"]
     assert disable_timer in calls
     assert stop_backup in calls
+    assert stop_initial in calls
     assert stop_daemon in calls
     assert calls.index(disable_timer) < calls.index(stop_backup)
-    assert calls.index(stop_backup) < calls.index(stop_daemon)
+    assert calls.index(stop_backup) < calls.index(stop_initial)
+    assert calls.index(stop_initial) < calls.index(stop_daemon)
     assert not (tmp_path / "memoryd-backup.service").exists()
     assert not (tmp_path / "memoryd-backup.timer").exists()
+    assert not (tmp_path / "memoryd-backup-initial.service").exists()

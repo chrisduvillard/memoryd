@@ -288,7 +288,7 @@ def install_hermes_core(
             try:
                 code, _detail = cli._run(
                     ["systemctl", "--user", "start", "--wait",
-                     "memoryd-backup.service"],
+                     "memoryd-backup-initial.service"],
                     timeout=660,
                 )
                 if code != 0:
@@ -300,7 +300,12 @@ def install_hermes_core(
             try:
                 after = {row.path for row in backup.list_backups()}
                 created = after - before
-                if len(created) != 1:
+                if not before <= after:
+                    failure = (
+                        "The initial backup did not preserve existing backup "
+                        "evidence."
+                    )
+                elif len(created) != 1:
                     failure = "The initial backup did not create exactly one new snapshot."
                 else:
                     snapshot = created.pop()

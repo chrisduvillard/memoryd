@@ -882,9 +882,10 @@ def _snapshot_name(created: datetime) -> str:
 
 
 def create_backup(*, output: Path | str | None = None,
-                  retain: int = 14, home: Path | str | None = None) -> Path:
-    """Create, verify, atomically publish, then safely retain snapshots."""
-    if retain < 1:
+                  retain: int | None = 14,
+                  home: Path | str | None = None) -> Path:
+    """Create, verify, atomically publish, then optionally retain snapshots."""
+    if retain is not None and retain < 1:
         raise BackupError("--retain must be at least 1")
     config_home = Path(home) if home is not None else _default_home()
     config = _read_config(config_home)
@@ -907,8 +908,8 @@ def create_backup(*, output: Path | str | None = None,
 
 
 def _create_backup_owned(
-        *, output: Path | str | None, retain: int, config: dict[str, Any],
-        source_home: Path, dsn: str) -> Path:
+        *, output: Path | str | None, retain: int | None,
+        config: dict[str, Any], source_home: Path, dsn: str) -> Path:
     findings = [finding for finding in _doctor_findings(source_home)
                 if _finding_value(finding, "severity") == "error"]
     if findings:
@@ -968,7 +969,8 @@ def _create_backup_owned(
             raise BackupError(f"created snapshot failed verification: {result.reason}")
         _atomic_rename(staging, final)
         staging = None
-        _apply_retention(root, retain, verified={final: result})
+        if retain is not None:
+            _apply_retention(root, retain, verified={final: result})
         return final
     except BackupError:
         raise
@@ -1534,7 +1536,9 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("create")
     create.add_argument("--output", type=Path)
-    create.add_argument("--retain", type=int, default=14)
+    retention = create.add_mutually_exclusive_group()
+    retention.add_argument("--retain", type=int)
+    retention.add_argument("--no-retention", action="store_true")
     listing = commands.add_parser("list")
     listing.add_argument("--output", type=Path)
     verify = commands.add_parser("verify")
@@ -1550,7 +1554,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "create":
-            snapshot = create_backup(output=args.output, retain=args.retain)
+            retain = None if args.no_retention else (
+                args.retain if args.retain is not None else 14)
+            snapshot = create_backup(output=args.output, retain=retain)
             print(f"created {snapshot}")
             return 0
         if args.command == "list":

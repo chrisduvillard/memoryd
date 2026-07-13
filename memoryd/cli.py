@@ -618,6 +618,16 @@ ExecStart={python} -m memoryd backup create --retain 14
 ExecStopPost=systemctl --user start memoryd.service
 """
 
+_SYSTEMD_INITIAL_BACKUP_SERVICE = """[Unit]
+Description=memoryd initial verified backup
+
+[Service]
+Type=oneshot
+ExecStartPre=systemctl --user stop memoryd.service
+ExecStart={python} -m memoryd backup create --no-retention
+ExecStopPost=systemctl --user start memoryd.service
+"""
+
 _SYSTEMD_BACKUP_TIMER = """[Unit]
 Description=memoryd daily verified backup
 
@@ -646,7 +656,7 @@ def _systemd_exec_arg(value: str) -> str:
     return f'"{escaped}"'
 
 
-def install_autostart() -> None:
+def install_autostart(*, _hermes_mode: bool = False) -> None:
     if sys.platform == "win32":
         py = _pythonw()
         code, _ = _run(["schtasks", "/Create", "/F", "/TN", "memoryd",
@@ -680,6 +690,10 @@ def install_autostart() -> None:
         (unit_dir / "memoryd-backup.service").write_text(
             _SYSTEMD_BACKUP_SERVICE.format(python=python),
             encoding="utf-8")
+        if _hermes_mode:
+            (unit_dir / "memoryd-backup-initial.service").write_text(
+                _SYSTEMD_INITIAL_BACKUP_SERVICE.format(python=python),
+                encoding="utf-8")
         (unit_dir / "memoryd-backup.timer").write_text(
             _SYSTEMD_BACKUP_TIMER, encoding="utf-8")
         _run(["systemctl", "--user", "daemon-reload"])
@@ -781,9 +795,10 @@ def install(options: _InstallOptions | None = None) -> int:
     if options is None:
         print(f"  hooks      registered in {register_claude_hooks()}")
         install_hermes_plugin()
+        install_autostart()
     else:
         install_hermes_plugin(options.hermes_home)
-    install_autostart()
+        install_autostart(_hermes_mode=True)
     _start_daemon_now()
     healthy = _wait_for_healthy_daemon()
     if options is not None and not healthy:
@@ -932,12 +947,14 @@ def uninstall() -> None:
         _run(["systemctl", "--user", "disable", "--now",
               "memoryd-backup.timer"])
         _run(["systemctl", "--user", "stop", "memoryd-backup.service"])
+        _run(["systemctl", "--user", "stop",
+              "memoryd-backup-initial.service"])
         _run(["systemctl", "--user", "disable", "--now",
               "memoryd.service", "memoryd-microsleep.timer"])
         unit_dir = Path("~/.config/systemd/user").expanduser()
         for n in ("memoryd.service", "memoryd-microsleep.service",
                   "memoryd-microsleep.timer", "memoryd-backup.service",
-                  "memoryd-backup.timer"):
+                  "memoryd-backup.timer", "memoryd-backup-initial.service"):
             (unit_dir / n).unlink(missing_ok=True)
         _run(["systemctl", "--user", "daemon-reload"])
     elif sys.platform == "darwin":

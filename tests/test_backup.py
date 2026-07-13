@@ -798,6 +798,29 @@ def test_retention_removes_only_old_valid_generated_directories(
         assert link.is_symlink()
 
 
+def test_create_without_retention_preserves_more_than_default_limit(
+        monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    output = tmp_path / "out"
+    times = iter([
+        datetime(2026, 7, day, 1, tzinfo=timezone.utc)
+        for day in range(1, 17)
+    ])
+    monkeypatch.setattr(backup, "_utc_now", lambda: next(times))
+    existing = {
+        backup.create_backup(output=output, home=home, retain=99)
+        for _ in range(15)
+    }
+
+    created = backup.create_backup(output=output, home=home, retain=None)
+    after = set(output.iterdir())
+
+    assert existing <= after
+    assert after - existing == {created}
+    assert backup.verify_snapshot(created).ok
+
+
 def test_retention_reuses_new_result_but_verifies_every_old_candidate(
         monkeypatch, tmp_path):
     home = _home(tmp_path)
@@ -2059,3 +2082,34 @@ def test_cli_routes_backup_arguments_and_exit_code(monkeypatch):
 
     assert exc.value.code == 7
     assert received == [["verify", "/tmp/snapshot"]]
+
+
+def test_backup_create_cli_no_retention_routes_non_pruning_mode(
+        monkeypatch, tmp_path):
+    received: list[dict[str, object]] = []
+    snapshot = tmp_path / "20260713T010203Z-v1"
+    monkeypatch.setattr(
+        backup, "create_backup",
+        lambda **kwargs: received.append(kwargs) or snapshot)
+
+    assert backup.main(["create", "--no-retention"]) == 0
+    assert received == [{"output": None, "retain": None}]
+
+
+def test_backup_create_cli_default_keeps_scheduled_retention(
+        monkeypatch, tmp_path):
+    received: list[dict[str, object]] = []
+    snapshot = tmp_path / "20260713T010203Z-v1"
+    monkeypatch.setattr(
+        backup, "create_backup",
+        lambda **kwargs: received.append(kwargs) or snapshot)
+
+    assert backup.main(["create"]) == 0
+    assert received == [{"output": None, "retain": 14}]
+
+
+def test_backup_create_cli_rejects_retention_with_no_retention(capsys):
+    with pytest.raises(SystemExit):
+        backup.main(["create", "--retain", "14", "--no-retention"])
+
+    assert "not allowed with argument --retain" in capsys.readouterr().err

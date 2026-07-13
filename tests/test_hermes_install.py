@@ -684,7 +684,8 @@ def test_core_install_orders_revalidation_install_backup_verification_and_restar
     def run(command, timeout=120):
         events.append("backup-service")
         assert command == [
-            "systemctl", "--user", "start", "--wait", "memoryd-backup.service"]
+            "systemctl", "--user", "start", "--wait",
+            "memoryd-backup-initial.service"]
         assert timeout >= 600
         return 0, ""
 
@@ -754,7 +755,10 @@ def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_r
     monkeypatch.setattr(
         cli, "register_claude_hooks",
         lambda: pytest.fail("Claude hooks must be skipped in Hermes mode"))
-    monkeypatch.setattr(cli, "install_autostart", lambda: None)
+    autostart_modes: list[bool] = []
+    monkeypatch.setattr(
+        cli, "install_autostart",
+        lambda *, _hermes_mode=False: autostart_modes.append(_hermes_mode))
     monkeypatch.setattr(cli, "_start_daemon_now", lambda: None)
     monkeypatch.setattr(cli, "_wait_for_healthy_daemon", lambda: True, raising=False)
     monkeypatch.setattr(cli, "status", lambda: 0)
@@ -763,7 +767,7 @@ def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_r
     generated = iter(("20260713T010203Z-v1", "20260713T020304Z-v1"))
 
     def run_backup(command, timeout=120):
-        assert command[-1] == "memoryd-backup.service"
+        assert command[-1] == "memoryd-backup-initial.service"
         path = tmp_path / "backups" / next(generated)
         snapshots.append(_backup_row(path))
         return 0, ""
@@ -797,6 +801,7 @@ def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_r
     assert (installed / "__init__.py").read_text(encoding="utf-8") == "VERSION = 2\n"
     assert hermes.classify_memory_home(memory_home) == "managed"
     assert {name: os.environ.get(name) for name in INSTALL_ENV} == before
+    assert autostart_modes == [True, True]
 
 
 @pytest.mark.parametrize(
@@ -820,6 +825,66 @@ def test_core_install_sanitizes_core_or_migration_failure_and_restores_environme
     assert dict(os.environ) == before
     rendered = repr(caught.value) + "".join(traceback.format_exception(caught.value))
     assert "SECRET-SENTINEL" not in rendered
+
+
+def test_managed_rerun_adopts_config_dsn_before_migration_failure_and_preserves_evidence(
+    monkeypatch, tmp_path,
+):
+    target, memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    dsn = "postgresql://memoryd:password@127.0.0.1:5432/memoryd"
+    payload = _managed_payload(memory_home)
+    payload["dsn"] = dsn
+    config = _safe_config(memory_home / "config.json", payload)
+    evidence = {
+        config: config.read_bytes(),
+        memory_home / "archive" / "memory.jsonl": b"archive evidence",
+        memory_home / "spool" / "incoming" / "job.json": b"spool evidence",
+        memory_home / "backups" / "existing" / "manifest.json": b"backup evidence",
+        target.home / "plugins" / "memoryd" / "operator-note": b"plugin evidence",
+        tmp_path / "database-volume.marker": b"database evidence",
+    }
+    for path, contents in evidence.items():
+        if path == config:
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    before = {path: path.read_bytes() for path in evidence}
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    connected: list[str] = []
+    migrated: list[str] = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, *_args):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules, "psycopg",
+        SimpleNamespace(connect=lambda value, **_kwargs: (
+            connected.append(value) or Connection())))
+    monkeypatch.setattr(
+        cli, "ensure_container", lambda: pytest.fail("managed DSN must skip Docker"))
+
+    def fail_migrations(value: str):
+        migrated.append(value)
+        raise RuntimeError("MIGRATION-SECRET-SENTINEL")
+
+    monkeypatch.setattr(cli, "apply_migrations", fail_migrations)
+    monkeypatch.setattr(
+        backup, "list_backups", lambda: pytest.fail("backup must not start"))
+
+    with pytest.raises(hermes.HermesInstallError, match="core|install") as caught:
+        hermes.install_hermes_core(target, credentials)
+
+    assert connected == [dsn]
+    assert migrated == [dsn]
+    assert "MIGRATION-SECRET-SENTINEL" not in str(caught.value)
+    assert {path: path.read_bytes() for path in evidence} == before
 
 
 def test_core_install_requires_successful_systemd_backup_and_preserves_evidence(
@@ -870,6 +935,61 @@ def test_core_install_requires_exactly_one_new_generated_snapshot(
         lambda _path: pytest.fail("ambiguous snapshot must not be verified"))
 
     with pytest.raises(hermes.HermesInstallError, match="exactly one|snapshot"):
+        hermes.install_hermes_core(target, credentials)
+
+
+def test_core_initial_backup_preserves_more_than_scheduled_retention_limit(
+    monkeypatch, tmp_path,
+):
+    target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    before_paths = {
+        tmp_path / "backups" / f"202607{day:02d}T010203Z-v1"
+        for day in range(1, 16)
+    }
+    created = tmp_path / "backups" / "20260716T010203Z-v1"
+    after_paths = before_paths | {created}
+    listings = iter((
+        [_backup_row(path) for path in sorted(before_paths)],
+        [_backup_row(path) for path in sorted(after_paths)],
+    ))
+    commands: list[list[str]] = []
+    monkeypatch.setattr(cli, "install", lambda _options: 0)
+    monkeypatch.setattr(backup, "list_backups", lambda: next(listings))
+    monkeypatch.setattr(cli, "_run", lambda command, timeout=120: (
+        commands.append(command) or (0, "")))
+    monkeypatch.setattr(
+        backup, "verify_snapshot", lambda _path: backup.Verification(True))
+    monkeypatch.setattr(cli, "_wait_for_healthy_daemon", lambda: True, raising=False)
+
+    assert hermes.install_hermes_core(target, credentials) == created
+    assert before_paths <= after_paths
+    assert after_paths - before_paths == {created}
+    assert commands == [[
+        "systemctl", "--user", "start", "--wait",
+        "memoryd-backup-initial.service"]]
+
+
+def test_core_rejects_initial_backup_that_prunes_existing_snapshot(
+    monkeypatch, tmp_path,
+):
+    target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    before_paths = [
+        tmp_path / "backups" / f"202607{day:02d}T010203Z-v1"
+        for day in range(1, 16)
+    ]
+    created = tmp_path / "backups" / "20260716T010203Z-v1"
+    listings = iter((
+        [_backup_row(path) for path in before_paths],
+        [_backup_row(path) for path in [*before_paths[1:], created]],
+    ))
+    monkeypatch.setattr(cli, "install", lambda _options: 0)
+    monkeypatch.setattr(backup, "list_backups", lambda: next(listings))
+    monkeypatch.setattr(cli, "_run", lambda _command, timeout=120: (0, ""))
+    monkeypatch.setattr(
+        backup, "verify_snapshot",
+        lambda _path: pytest.fail("pruning must fail before new verification"))
+
+    with pytest.raises(hermes.HermesInstallError, match="preserv|disappear|backup"):
         hermes.install_hermes_core(target, credentials)
 
 
