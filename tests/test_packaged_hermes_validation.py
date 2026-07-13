@@ -5,11 +5,13 @@ import importlib.resources
 import importlib.util
 import os
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
 
 import memoryd
+import memoryd.hermes_compat as hermes_compat
 from memoryd.hermes_compat import (
     PINNED_HERMES_COMMIT,
     PINNED_HERMES_TAG,
@@ -19,6 +21,7 @@ from memoryd.hermes_compat import (
     validate_hermes_compatibility,
 )
 from memoryd.hermes_validation import contract, installed_runtime
+from memoryd.hermes_validation import resources
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -44,6 +47,32 @@ def _target(tmp_path: Path) -> HermesTarget:
         executable=tmp_path / "pipx" / "bin" / "hermes",
         python=tmp_path / "pipx" / "venv" / "bin" / "python",
     )
+
+
+def _source_layout(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "source-checkout"
+    package = root / "memoryd"
+    shutil.copytree(REPO / "memoryd", package)
+    shutil.copytree(REPO / "hermes_plugin" / "memoryd", root / "hermes_plugin" / "memoryd")
+    shutil.copytree(REPO / "migrations", root / "migrations")
+    (root / "scripts").mkdir()
+    for name in ("check_hermes_contract.py", "validate_installed_hermes.py"):
+        shutil.copy2(REPO / "scripts" / name, root / "scripts" / name)
+    shutil.copy2(REPO / "pyproject.toml", root / "pyproject.toml")
+    adjacent_agent = root / "agent"
+    adjacent_agent.mkdir()
+    (adjacent_agent / "memory_provider.py").write_text(
+        "raise RuntimeError('adjacent agent leaked')\n", encoding="utf-8"
+    )
+    adjacent_distribution = root / "hermes_agent-0.16.0.dist-info"
+    adjacent_distribution.mkdir()
+    (adjacent_distribution / "METADATA").write_text(
+        "Name: hermes-agent\nVersion: 0.16.0\n", encoding="utf-8"
+    )
+    cache = package / "__pycache__"
+    cache.mkdir(exist_ok=True)
+    (cache / "sentinel.cpython-311.pyc").write_bytes(b"not bytecode")
+    return package, root / "hermes_plugin" / "memoryd"
 
 
 def _successful_run(
@@ -123,13 +152,15 @@ def test_validation_uses_exact_target_interpreter_commands_and_isolated_environm
         "--require-pinned-bytes",
     ]
     isolated_home = Path(lifecycle_command[lifecycle_command.index("--hermes-home") + 1])
+    private_import_root = Path(contract_kwargs["env"]["PYTHONPATH"])
+    staged_plugin = private_import_root / "memoryd" / "hermes_plugin"
     assert lifecycle_command == [
         *expected_prefix,
         "memoryd.hermes_validation.installed_runtime",
         "--hermes-home",
         os.fspath(isolated_home),
         "--plugin-source",
-        os.fspath(_canonical_plugin().resolve()),
+        os.fspath(staged_plugin),
         "--expected-version",
         PINNED_HERMES_VERSION,
     ]
@@ -141,7 +172,9 @@ def test_validation_uses_exact_target_interpreter_commands_and_isolated_environm
         assert kwargs["text"] is True
         env = kwargs["env"]
         assert isinstance(env, dict)
-        assert env["PYTHONPATH"] == os.fspath(Path(memoryd.__file__).resolve().parent.parent)
+        assert Path(env["PYTHONPATH"]).name == "import-root"
+        assert Path(env["PYTHONPATH"]).parent == isolated_home.parent
+        assert Path(env["PYTHONPATH"]) != Path(memoryd.__file__).resolve().parent.parent
         assert env["PYTHONNOUSERSITE"] == "1"
         assert env["HERMES_HOME"] == os.fspath(isolated_home)
         assert Path(env["MEMORYD_HOME"]).parent == isolated_home.parent
@@ -149,6 +182,143 @@ def test_validation_uses_exact_target_interpreter_commands_and_isolated_environm
         assert Path(kwargs["cwd"]) == isolated_home.parent
     assert contract_kwargs["env"] == lifecycle_kwargs["env"]
     assert (target.home / "keep").read_text(encoding="utf-8") == "authoritative"
+
+
+def test_private_import_root_excludes_adjacent_agent_and_distribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, plugin = _source_layout(tmp_path)
+    monkeypatch.setattr(hermes_compat, "__file__", str(package / "hermes_compat.py"))
+    target = _target(tmp_path)
+    observations: list[dict[str, object]] = []
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        import_root = Path(environment["PYTHONPATH"])
+        staged = import_root / "memoryd"
+        observations.append({
+            "entries": sorted(path.name for path in import_root.iterdir()),
+            "agent": (import_root / "agent").exists(),
+            "distribution": any(import_root.glob("hermes_agent-*.dist-info")),
+            "pycache": any(staged.rglob("__pycache__")),
+            "pyc": any(staged.rglob("*.pyc")),
+            "plugin": os.fspath(staged / "hermes_plugin"),
+            "command": command,
+        })
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    validate_hermes_compatibility(target, plugin)
+
+    assert len(observations) == 2
+    assert all(item["entries"] == ["memoryd"] for item in observations)
+    assert all(item["agent"] is False for item in observations)
+    assert all(item["distribution"] is False for item in observations)
+    assert all(item["pycache"] is False and item["pyc"] is False for item in observations)
+    lifecycle_command = observations[1]["command"]
+    assert isinstance(lifecycle_command, list)
+    assert lifecycle_command[lifecycle_command.index("--plugin-source") + 1] == observations[1]["plugin"]
+
+
+def test_damaged_wheel_cannot_use_adjacent_fake_plugin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_packages = tmp_path / "venv" / "lib" / "python3.11" / "site-packages"
+    package = site_packages / "memoryd"
+    package.mkdir(parents=True)
+    damaged_module = package / "hermes_compat.py"
+    damaged_module.write_text("# damaged installed package\n", encoding="utf-8")
+    adjacent = site_packages / "hermes_plugin" / "memoryd"
+    adjacent.mkdir(parents=True)
+    (adjacent / "__init__.py").write_text("# adjacent fake\n", encoding="utf-8")
+    monkeypatch.setattr(hermes_compat, "__file__", str(damaged_module))
+    calls: list[object] = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(HermesCompatibilityError, match="bundled memoryd plugin"):
+        validate_hermes_compatibility(_target(tmp_path), adjacent)
+
+    assert calls == []
+
+
+def test_verified_editable_checkout_can_use_canonical_source_plugin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, plugin = _source_layout(tmp_path)
+
+    class EditableDistribution:
+        def locate_file(self, _name: str) -> Path:
+            return package
+
+        def read_text(self, name: str) -> str | None:
+            if name == "direct_url.json":
+                return '{"dir_info": {"editable": true}}'
+            return None
+
+    monkeypatch.setattr(
+        resources.metadata, "distribution", lambda _name: EditableDistribution()
+    )
+
+    assert resources.canonical_plugin_source(package) == plugin.resolve()
+
+
+@pytest.mark.parametrize("plugin_name", ["missing", "invalid-file"])
+def test_missing_or_invalid_plugin_is_always_a_compatibility_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plugin_name: str
+) -> None:
+    package = tmp_path / "damaged" / "memoryd"
+    package.mkdir(parents=True)
+    module = package / "hermes_compat.py"
+    module.write_text("# damaged package\n", encoding="utf-8")
+    monkeypatch.setattr(hermes_compat, "__file__", str(module))
+    plugin = tmp_path / plugin_name
+    if plugin_name == "invalid-file":
+        plugin.write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(HermesCompatibilityError, match="bundled memoryd plugin"):
+        validate_hermes_compatibility(_target(tmp_path), plugin)
+
+
+def test_staged_package_tampering_after_lifecycle_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _target(tmp_path)
+    calls = 0
+
+    def tamper(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            environment = kwargs["env"]
+            assert isinstance(environment, dict)
+            import_root = Path(environment["PYTHONPATH"])
+            if import_root.name == "import-root":
+                (import_root / "memoryd" / "hermes_validation" / "contract.py").write_text(
+                    "tampered = True\n", encoding="utf-8"
+                )
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", tamper)
+
+    with pytest.raises(
+        HermesCompatibilityError, match="(?i)staged memoryd package changed"
+    ):
+        validate_hermes_compatibility(target, _canonical_plugin())
+
+    assert calls == 2
+
+
+def test_staged_package_manifest_errors_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unreadable_manifest(_root: Path) -> dict[str, str]:
+        raise OSError("sensitive staged path")
+
+    monkeypatch.setattr(hermes_compat, "_package_manifest", unreadable_manifest)
+
+    assert not hermes_compat._staged_package_matches(tmp_path, {})
 
 
 def test_contract_stage_failure_is_sanitized_and_stops_lifecycle(

@@ -85,6 +85,16 @@ def test_structured_matrix_enforces_installed_artifact_boundaries() -> None:
     assert "check_hermes_contract.py --require-pinned-bytes" in hermes
     assert "--source-root" not in hermes and "PYTHONPATH" not in hermes
 
+    isolated = steps["Validate packaged preflight against isolated Hermes"]["run"]
+    assert 'HERMES_TARGET_PYTHON="$RUNNER_TEMP/hermes-target/bin/python"' in isolated
+    assert "test_hermes_validation_integration.py" in isolated
+    assert 'cd "$RUNNER_TEMP"' in isolated
+
+    target_install = install
+    assert 'python -m venv "$RUNNER_TEMP/hermes-target"' in target_install
+    assert '"$RUNNER_TEMP/hermes-target/bin/python" -m pip install' in target_install
+    assert '"$HERMES_SOURCE_ROOT"' in target_install
+
     database = steps["Run installed-wheel DB-backed regression matrix"]["run"]
     assert 'cd "$INSTALLED_HARNESS"' in database
     assert all(f"scripts/{name}" in database for name in (

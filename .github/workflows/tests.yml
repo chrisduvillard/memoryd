@@ -169,6 +169,10 @@ jobs:
           "$RUNNER_TEMP/venv-test/bin/python" -m pip install --disable-pip-version-check \
             "${wheels[0]}" pytest "$HERMES_SOURCE_ROOT"
           "$RUNNER_TEMP/venv-test/bin/python" -m pip check
+          python -m venv "$RUNNER_TEMP/hermes-target"
+          "$RUNNER_TEMP/hermes-target/bin/python" -m pip install \
+            --disable-pip-version-check "$HERMES_SOURCE_ROOT"
+          "$RUNNER_TEMP/hermes-target/bin/python" -m pip check
           echo "$RUNNER_TEMP/venv-test/bin" >> "$GITHUB_PATH"
           echo "MEMORYD_WHEEL=$GITHUB_WORKSPACE/${wheels[0]}" >> "$GITHUB_ENV"
 
@@ -259,6 +263,14 @@ jobs:
             --expected-version 0.16.0
           "$RUNNER_TEMP/venv-test/bin/python" -I \
             scripts/test_bitter_lesson.py
+
+      - name: Validate packaged preflight against isolated Hermes
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          HERMES_TARGET_PYTHON="$RUNNER_TEMP/hermes-target/bin/python" \
+            "$RUNNER_TEMP/venv-test/bin/python" -I -m pytest -q \
+            "$GITHUB_WORKSPACE/tests/test_hermes_validation_integration.py"
 
       - name: Apply packaged migrations 001 through 007
         run: |

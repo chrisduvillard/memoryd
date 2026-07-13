@@ -483,3 +483,28 @@ def test_success_resolves_real_command_interpreter_profile_and_pinned_version(
     assert kwargs["check"] is True
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
+
+
+def test_symlinked_venv_python_preserves_environment_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_python = _write_executable(tmp_path / "runtime" / "python3.11", "")
+    venv_python = tmp_path / "pipx" / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+    hermes = _write_executable(tmp_path / "bin" / "hermes", f"#!{venv_python}\n")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(shutil, "which", lambda _command: str(hermes))
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=f"{PINNED_HERMES_VERSION}\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    target = resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
+
+    assert target.python == venv_python.absolute()
+    assert commands[0][0] == os.fspath(venv_python.absolute())

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -10,6 +11,11 @@ import shutil
 import stat
 import subprocess
 import tempfile
+
+from memoryd.hermes_validation.resources import (
+    canonical_migrations_source,
+    require_canonical_plugin_source,
+)
 
 
 PINNED_HERMES_VERSION = "0.16.0"
@@ -145,12 +151,14 @@ def _resolve_python(executable: Path) -> Path:
     if not interpreter.is_absolute() or not interpreter.name.lower().startswith("python"):
         raise _error("The hermes command must use an absolute Python shebang")
     try:
-        python = interpreter.resolve(strict=True)
+        resolved = interpreter.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise _error("The hermes Python interpreter does not exist") from exc
-    if not _is_executable(python):
+    if not _is_executable(resolved):
         raise _error("The hermes Python interpreter is not executable")
-    return python
+    # Keep the venv launcher path: resolving its normal ``bin/python`` symlink
+    # would execute the base interpreter without the Hermes environment.
+    return interpreter
 
 
 def _query_version(python: Path) -> str:
@@ -184,29 +192,90 @@ def resolve_hermes_target(
     return HermesTarget(root=root, home=home, executable=executable, python=python)
 
 
+def _memoryd_package_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
 def _canonical_plugin_source(plugin_source: Path) -> Path:
-    package_root = Path(__file__).resolve().parent
-    packaged = package_root / "hermes_plugin"
-    source_fallback = package_root.parent / "hermes_plugin" / "memoryd"
-    expected = packaged if packaged.is_dir() else source_fallback
     try:
-        source = plugin_source.resolve(strict=True)
-        canonical = expected.resolve(strict=True)
-        matches = os.path.samefile(source, canonical)
-    except (OSError, RuntimeError):
-        matches = False
-    if not matches or not (canonical / "__init__.py").is_file():
-        raise _error("Plugin source must be the bundled memoryd plugin")
-    return canonical
+        return require_canonical_plugin_source(plugin_source, _memoryd_package_root())
+    except (OSError, RuntimeError, ValueError):
+        raise _error("Plugin source must be the bundled memoryd plugin") from None
 
 
-def _validation_environment(root: Path, hermes_home: Path) -> dict[str, str]:
+def _package_manifest(root: Path) -> dict[str, str]:
+    manifest: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if "__pycache__" in relative.parts or path.suffix == ".pyc":
+            continue
+        if path.is_symlink():
+            raise ValueError("memoryd package resources must not contain symlinks")
+        if path.is_file():
+            manifest[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return manifest
+
+
+def _prefixed_manifest(prefix: str, root: Path) -> dict[str, str]:
+    return {
+        f"{prefix}/{relative}": digest
+        for relative, digest in _package_manifest(root).items()
+    }
+
+
+def _staged_package_matches(root: Path, expected: Mapping[str, str]) -> bool:
+    try:
+        return _package_manifest(root) == expected
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _stage_memoryd_package(
+    import_root: Path, package_root: Path, plugin_source: Path
+) -> tuple[Path, dict[str, str]]:
+    migrations_source = canonical_migrations_source(package_root)
+    expected = _package_manifest(package_root)
+    packaged_plugin = package_root / "hermes_plugin"
+    packaged_migrations = package_root / "migrations"
+    if not packaged_plugin.is_dir():
+        expected.update(_prefixed_manifest("hermes_plugin", plugin_source))
+    if not packaged_migrations.is_dir():
+        expected.update(_prefixed_manifest("migrations", migrations_source))
+
+    import_root.mkdir(mode=0o700)
+    staged = import_root / "memoryd"
+    shutil.copytree(
+        package_root,
+        staged,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    if not packaged_plugin.is_dir():
+        shutil.copytree(
+            plugin_source,
+            staged / "hermes_plugin",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+    if not packaged_migrations.is_dir():
+        shutil.copytree(
+            migrations_source,
+            staged / "migrations",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+    if _package_manifest(staged) != expected:
+        raise ValueError("staged memoryd package differs from its verified source")
+    return staged, expected
+
+
+def _validation_environment(
+    root: Path, hermes_home: Path, import_root: Path
+) -> dict[str, str]:
     environment = {
         "HOME": os.fspath(root / "home"),
         "HERMES_HOME": os.fspath(hermes_home),
         "MEMORYD_HOME": os.fspath(root / "memoryd-home"),
         "PYTHONNOUSERSITE": "1",
-        "PYTHONPATH": os.fspath(Path(__file__).resolve().parent.parent),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": os.fspath(import_root),
         "TEMP": os.fspath(root / "tmp"),
         "TMP": os.fspath(root / "tmp"),
         "TMPDIR": os.fspath(root / "tmp"),
@@ -255,8 +324,16 @@ def validate_hermes_compatibility(
         (root / "home").mkdir(mode=0o700)
         (root / "tmp").mkdir(mode=0o700)
         hermes_home = root / "hermes-home"
-        environment = _validation_environment(root, hermes_home)
-        plugin_argument = os.fspath(canonical_plugin)
+        try:
+            staged_package, expected_manifest = _stage_memoryd_package(
+                root / "import-root", _memoryd_package_root(), canonical_plugin
+            )
+        except (OSError, RuntimeError, ValueError):
+            raise _error("Could not stage the bundled memoryd package") from None
+        environment = _validation_environment(root, hermes_home, staged_package.parent)
+        plugin_argument = os.fspath(staged_package / "hermes_plugin")
+        if not _staged_package_matches(staged_package, expected_manifest):
+            raise _error("Staged memoryd package changed before Hermes validation")
         _run_validation_stage(
             target,
             "contract",
@@ -265,6 +342,8 @@ def validate_hermes_compatibility(
             cwd=root,
             environment=environment,
         )
+        if not _staged_package_matches(staged_package, expected_manifest):
+            raise _error("Staged memoryd package changed during Hermes validation")
         _run_validation_stage(
             target,
             "lifecycle",
@@ -280,3 +359,5 @@ def validate_hermes_compatibility(
             cwd=root,
             environment=environment,
         )
+        if not _staged_package_matches(staged_package, expected_manifest):
+            raise _error("Staged memoryd package changed during Hermes validation")

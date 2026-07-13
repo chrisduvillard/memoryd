@@ -16,6 +16,8 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from memoryd.hermes_validation.resources import require_canonical_plugin_source
+
 
 PINNED_HERMES_VERSION = "0.16.0"
 
@@ -29,19 +31,13 @@ def require_installed_plugin_source(
         plugin_source: Path, *,
         site_roots: list[Path] | None = None) -> Path:
     """Require the plugin resource from the installed memoryd wheel."""
-    source = plugin_source.resolve()
     package_root = _memoryd_package_root()
-    packaged = package_root / "hermes_plugin"
-    source_fallback = package_root.parent / "hermes_plugin" / "memoryd"
-    expected = (packaged if packaged.is_dir() else source_fallback).resolve()
     try:
-        same_source = os.path.samefile(source, expected)
-    except OSError:
-        same_source = False
-    if not same_source or not (expected / "__init__.py").is_file():
+        source = require_canonical_plugin_source(plugin_source, package_root)
+    except (OSError, RuntimeError, ValueError):
         raise ValueError(
-            f"--plugin-source must be the wheel-bundled memoryd plugin: {expected}")
-    source = expected
+            "--plugin-source must be the wheel-bundled memoryd plugin"
+        ) from None
     if site_roots is not None:
         roots = [Path(root).resolve() for root in site_roots]
         if not any(root == source or root in source.parents for root in roots):
