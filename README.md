@@ -79,7 +79,7 @@ Works on **Windows, macOS, and Linux**. Requires Python 3.11+ and [Docker](https
 
 ```bash
 # Optional: set OPENROUTER_API_KEY in your shell to enable fact extraction.
-python -m pip install 'git+https://github.com/chrisduvillard/memoryd.git@v0.3.0'
+python -m pip install git+https://github.com/chrisduvillard/memoryd.git@v0.3.0
 memoryd install
 memoryd status                     # Everything green? The local install is ready.
 ```
@@ -138,17 +138,19 @@ and Hermes Agent 0.16.0, creates a clean authoritative `~/memory`, keeps
 PostgreSQL and the daemon on localhost, verifies backup and restore, and then
 starts a 14-day/200-turn canary.
 
-> **Do not install or activate memoryd from an active Hermes tool call.** Give
-> Hermes the [supervised installation prompt](docs/HERMES_INSTALL_PROMPT.md),
-> run each state-changing block yourself in a separate Linux terminal, and exit
-> every active Hermes chat/TUI before the activation gate.
+> **Never run any rollout command from an active Hermes tool call.** Give Hermes
+> the [supervised installation prompt](docs/HERMES_INSTALL_PROMPT.md), but have
+> the operator run every command block in a separate normal Linux terminal.
+> Before activation, exit every active Hermes chat/TUI cleanly and wait for
+> in-flight responses to finish.
 
 The [production runbook](docs/PRODUCTION_ROLLOUT.md) is authoritative. It stops
 on an existing `~/memory` or nonempty restore target and never migrates the
 Windows installation. Enter OpenRouter and Voyage keys only at its interactive
 terminal prompts; do not paste them into chat.
 
-After activation and a clean Hermes restart, require all four checks:
+With every Hermes chat/TUI still closed, the operator must run the activation
+block and all four checks in the normal terminal:
 
 ```bash
 hermes memory status
@@ -158,10 +160,12 @@ hermes memoryd status
 ```
 
 The Hermes report must show `http://127.0.0.1:7437`, zero dead letters, no
-durability fault, and a queue that drains to zero. Complete the disposable
-integration/restore drill and verify the first production snapshot before
-starting the [canary scorecard](docs/CANARY_SCORECARD.md). Treat the instance as
-a production candidate until every canary gate passes.
+durability fault, and a queue that drains to zero. The activation block then
+restores any gateway that was active before the rollout. Start a new Hermes
+chat/TUI only after all four checks pass and that gateway is healthy. Complete
+the disposable integration/restore drill and verify the first production
+snapshot before starting the [canary scorecard](docs/CANARY_SCORECARD.md).
+Treat the instance as a production candidate until every canary gate passes.
 
 ---
 

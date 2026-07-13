@@ -300,9 +300,19 @@ export MEMORYD_DSN="postgresql://postgres:${DRILL_PASSWORD}@127.0.0.1:55432/memo
 install -d -m 700 "$HERMES_HOME"
 
 cleanup() {
-  test -z "${DAEMON_PID:-}" || kill "$DAEMON_PID" 2>/dev/null || true
-  test -z "${RESTORE_PID:-}" || kill "$RESTORE_PID" 2>/dev/null || true
-  docker rm -f "$DRILL_DB" >/dev/null 2>&1 || true
+  status=$?
+  for pid in "${DAEMON_PID:-}" "${RESTORE_PID:-}"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  if (( status != 0 )); then
+    printf 'Drill failed; evidence preserved at:\n' >&2
+    printf '  drill root: %s\n' "$DRILL_ROOT" >&2
+    printf '  database container: %s\n' "$DRILL_DB" >&2
+  fi
+  return "$status"
 }
 trap cleanup EXIT
 
@@ -356,10 +366,18 @@ env -u MEMORYD_DSN MEMORYD_HOME="$RESTORE_HOME" MEMORYD_PORT=17438 \
 kill "$RESTORE_PID"; wait "$RESTORE_PID" || true; unset RESTORE_PID
 ```
 
-Keep `$DRILL_ROOT` and the container until every assertion passes. Remove them
-only after recording the test output. Production promotion still requires the
-[14-day scorecard](CANARY_SCORECARD.md), including a restore of a real
-production snapshot rather than only this synthetic drill.
+The EXIT trap stops helper daemons but never deletes `$DRILL_ROOT` or the
+container. On failure, it prints both evidence locations and preserves them.
+After every assertion passes, first record the complete test output and both
+evidence locations. Then remove the disposable database container manually:
+
+```bash
+docker rm -f "$DRILL_DB"
+```
+
+Retain `$DRILL_ROOT` according to the rollout evidence policy. Production
+promotion still requires the [14-day scorecard](CANARY_SCORECARD.md), including
+a restore of a real production snapshot rather than only this synthetic drill.
 
 ## 6. First production snapshot
 

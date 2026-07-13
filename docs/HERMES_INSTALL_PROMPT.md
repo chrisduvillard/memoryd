@@ -1,9 +1,9 @@
 # Prompt for a supervised Hermes installation
 
 Paste the prompt below into Hermes and attach or link the repository. Hermes
-will guide the rollout, but you will run every state-changing command in a
-separate Linux terminal. This prevents an active Hermes process from replacing
-or restarting its own memory provider.
+will guide the rollout, but you will run every command block in a separate
+normal Linux terminal. This prevents an active Hermes process from changing or
+restarting its own memory provider.
 
 Do not paste API keys into the Hermes chat. Enter them only at the runbook's
 interactive terminal prompts.
@@ -37,15 +37,18 @@ Non-negotiable constraints:
   to 127.0.0.1, and http://127.0.0.1:7437 for memoryd.
 - Configure MEMORYD_LLM=openrouter and MEMORYD_EMBED=voyage.
 - Never ask me to paste an OpenRouter key or Voyage key into this chat. Never
-  echo, log, persist, or place secret values in shell history. Tell me when the
-  runbook requires interactive secret entry in my terminal.
-- Do not execute rollout commands with your own shell or tool calls. Present
-  one normal-shell command block at a time for me to run in a separate terminal,
-  wait for my pasted output, validate it, and only then continue.
+  expose secret values in chat, shell history, logs, documentation, or backups.
+  The only allowed persistence is the owner-private ~/memory/config.json that
+  memoryd install writes for its systemd user service. Tell me when the runbook
+  requires interactive secret entry in my terminal.
+- Do not execute any rollout command with your own shell or tool calls. Present
+  one normal-shell command block at a time for me to run in a separate normal
+  Linux terminal, wait for my pasted output, validate it, and only then continue.
 - Never activate or restart your own memory provider from this active chat.
   At the activation gate, give me the exact runbook block, tell me to exit all
-  Hermes chat/TUI sessions cleanly, and wait. I will run the block in a normal
-  terminal and start a new Hermes session for post-activation verification.
+  Hermes chat/TUI sessions cleanly, and stop. I will run the activation block
+  and all four checks in a normal terminal, restore any previously active
+  gateway, and start a new Hermes chat/TUI only after every check passes.
 - Never delete or overwrite an existing home, database, spool, archive, backup,
   Docker container, or volume. If ~/memory already exists, stop and report it.
 - Run integration and restore tests only against disposable homes, ports,
@@ -62,12 +65,17 @@ Workflow:
 5. Guide interactive OpenRouter and Voyage secret entry, run memoryd install,
    and verify permissions, systemd user services, timers, plugin location,
    localhost bindings, memoryd status, and memoryd doctor.
-6. Stop at the activation boundary. Before I exit, give me this resume sentence:
-   "Resume the memoryd rollout at post-activation verification. Validate all
-   status output before continuing."
-7. In the restarted Hermes session, verify hermes memory status, hermes memoryd
-   config, memoryd status, and hermes memoryd status. Require the exact URL,
-   zero dead letters, no durability fault, and a drained queue.
+6. Stop at the activation boundary. Give me the exact activation block and this
+   resume sentence before I exit every active Hermes chat/TUI:
+   "Resume the memoryd rollout after activation. I ran hermes memory status,
+   hermes memoryd config, memoryd status, and hermes memoryd status in a normal
+   terminal; all four checks passed, and any previously active gateway is
+   healthy. Validate the recorded output before continuing."
+7. Require me to run the activation block and all four checks in that normal
+   terminal, then restore any previously active gateway. Only after they pass
+   may I start a new Hermes chat/TUI and use the resume sentence. In the new
+   session, validate the recorded output, exact URL, zero dead letters, no
+   durability fault, drained queue, and healthy restored gateway.
 8. Guide the disposable integration and restore drill without touching
    production data.
 9. Create and verify the first production snapshot while guaranteeing daemon
@@ -95,7 +103,10 @@ block from section 1 of docs/PRODUCTION_ROLLOUT.md. Do not skip ahead.
 
 ## What success looks like
 
-The installation is connected when a restarted Hermes session reports healthy
-output from both status commands, with the exact localhost URL, zero dead
-letters, no durability fault, and a drained queue. It becomes production-ready
-only after the complete canary passes.
+The installation is connected only after the operator exits every active
+Hermes chat/TUI and a normal terminal reports healthy output from `hermes
+memory status`, `hermes memoryd config`, `memoryd status`, and `hermes memoryd
+status`, with the exact localhost URL, zero dead letters, no durability fault,
+a drained queue, and any previously active gateway restored. Start a new
+Hermes chat/TUI only after those checks pass. The installation becomes
+production-ready only after the complete canary passes.

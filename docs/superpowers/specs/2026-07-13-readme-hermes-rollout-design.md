@@ -16,9 +16,13 @@ executing the rollout.
 - Keep the short cross-platform quickstart for evaluation and local use.
 - Give production Linux and Hermes users an obvious, release-pinned path.
 - Supply one reusable prompt that lets Hermes supervise a safe installation.
-- Keep API-key values out of prompts, shell history, logs, and backups.
+- Keep API-key values out of chat, shell history, logs, documentation, and
+  backups; permit persistence only in the owner-private configuration written
+  by `memoryd install`.
 - Preserve Windows installations and data; the Linux rollout starts clean.
 - Keep the detailed production runbook and canary scorecard authoritative.
+- Correct the disposable drill so failure preserves and identifies its root
+  and database container instead of deleting evidence during EXIT cleanup.
 
 ## Approaches considered
 
@@ -70,15 +74,21 @@ handoff. The prompt will tell Hermes to:
 - use `https://github.com/chrisduvillard/memoryd` at tag `v0.3.0`;
 - treat `docs/PRODUCTION_ROLLOUT.md` and `docs/CANARY_SCORECARD.md` as
   authoritative;
-- verify Hermes Agent 0.16.0 and its resolved source commit;
+- verify Hermes Agent 0.16.0, source tag `v2026.6.5`, and resolved commit
+  `3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`;
 - preserve Windows data and stop if Linux `~/memory` already exists;
-- never request, echo, log, or persist secret values in chat;
-- avoid running rollout commands inside a Hermes tool call;
+- never expose secret values in chat, shell history, logs, documentation, or
+  backups, while allowing `memoryd install` to write them only to the
+  owner-private `~/memory/config.json` required by the systemd user service;
+- prohibit every rollout command inside a Hermes tool call and require the
+  operator to run every command block in a separate normal Linux terminal;
 - present one normal-shell block at a time and validate its output;
-- pause before the operator exits active Hermes sessions and activates the
-  provider;
-- verify `memoryd status`, `hermes memory status`, and
-  `hermes memoryd status` after restart;
+- pause before the operator exits every active Hermes chat/TUI, then require
+  the operator to run the activation block and all four checks in a normal
+  terminal, restore any previously active gateway, and start a new chat/TUI
+  only after those checks pass;
+- verify `hermes memory status`, `hermes memoryd config`, `memoryd status`, and
+  `hermes memoryd status` before a new chat/TUI starts;
 - run integration and restore drills only in disposable homes and databases;
 - create and verify the first production snapshot;
 - begin the canary and use evidence-preserving rollback if a gate fails.
@@ -86,16 +96,31 @@ handoff. The prompt will tell Hermes to:
 The prompt will require concise progress reports with four states: completed,
 waiting for operator action, blocked, and failed with preserved evidence.
 
+### Authoritative production runbook correction
+
+Update `docs/PRODUCTION_ROLLOUT.md` so the disposable drill's EXIT trap stops
+helper daemon processes but never deletes the drill container or
+`$DRILL_ROOT`. A failure must print both evidence locations without printing
+secrets. After success, the operator records the output first and removes the
+container only with an explicit manual command; the runbook never removes it
+automatically.
+
 ## Safety boundaries
 
 - The prompt cannot contain OpenRouter or Voyage key values. The operator
-  enters them interactively in a normal terminal.
+  enters them interactively in a normal terminal. Values may persist only in
+  the owner-private `~/memory/config.json` written by `memoryd install`; they
+  never appear in chat, shell history, logs, documentation, or backups.
 - The active Hermes session may inspect and explain the runbook, but it must
-  not replace, activate, or restart its own provider.
+  not execute any rollout command. The operator runs every command block in a
+  separate normal Linux terminal.
 - Production uses exactly `~/memory`; disposable drills use separate temporary
   homes and databases.
 - Existing homes, databases, spools, archives, backups, containers, and volumes
   are evidence. The procedure stops instead of deleting or overwriting them.
+- The disposable drill preserves its root and database container on failure,
+  prints both evidence locations, and removes the container manually only
+  after success output has been recorded.
 - README shortcuts never weaken a runbook gate.
 
 ## Verification
@@ -105,11 +130,17 @@ waiting for operator action, blocked, and failed with preserved evidence.
   production runbook.
 - Scan the documentation for secret-shaped example values and unpinned install
   commands.
+- Confirm the portable quickstart uses an unquoted pinned VCS URL that Bash,
+  PowerShell, and `cmd.exe` can pass unchanged.
+- Inspect the disposable drill cleanup to prove it contains no container or
+  root deletion, prints both evidence locations on failure, and places the
+  manual container-removal command only after the success instructions.
 - Render or lint Markdown when local tooling permits.
 - Run the full Python regression suite to confirm a documentation-only diff
   does not disturb packaging or tests.
 - Review the final diff for duplication, contradictory instructions, and
-  accidental changes outside the two documentation files and this design.
+  accidental changes outside `README.md`, `docs/HERMES_INSTALL_PROMPT.md`,
+  `docs/PRODUCTION_ROLLOUT.md`, this design, and the implementation plan.
 
 ## Non-goals
 
