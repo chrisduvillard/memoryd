@@ -40,6 +40,35 @@ def _fake_psycopg(monkeypatch, connect):
     monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
 
 
+def test_hermes_plugin_install_uses_active_profile_and_exact_private_config(
+        monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes-profile"
+    hermes_home.mkdir(mode=0o700)
+    source = tmp_path / "plugin-source"
+    source.mkdir()
+    (source / "__init__.py").write_text("# provider\n", encoding="utf-8")
+    (source / "plugin.yaml").write_text(
+        "name: memoryd\nversion: 0.3.0\n", encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(cli, "_resource_dir", lambda name: source)
+
+    stale = hermes_home / "memoryd.json"
+    stale.write_text('{"url":"http://127.0.0.1:1"}', encoding="utf-8")
+    cli.install_hermes_plugin()
+
+    installed = hermes_home / "plugins" / "memoryd"
+    assert (installed / "__init__.py").is_file()
+    assert not (hermes_home / "plugins" / "memory" / "memoryd").exists()
+    assert json.loads(stale.read_text(encoding="utf-8")) == {
+        "url": "http://127.0.0.1:7437"}
+    if os.name != "nt":
+        assert stat.S_IMODE(stale.stat().st_mode) == 0o600
+    assert not list(hermes_home.glob(".memoryd.json.*.tmp"))
+
+
 def test_only_explicit_docker_absence_is_definitive():
     assert cli._container_definitively_absent(
         1, "Error: No such object: memoryd-pgvector")

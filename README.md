@@ -110,7 +110,10 @@ Done by `memoryd install` — recall and capture run on every turn. For manual s
 
 ### 🤝 Connect Hermes Agent
 
-If `~/.hermes` existed at install time the plugin is already in place; otherwise re-run `memoryd install`. Then activate it:
+`memoryd install` uses the active `$HERMES_HOME` (default `~/.hermes`) and
+installs the provider at `$HERMES_HOME/plugins/memoryd`. Export the same
+`HERMES_HOME` for memoryd and Hermes; create it and re-run the installer if it
+did not exist initially. Then activate it:
 
 ```bash
 hermes config set memory.provider memoryd

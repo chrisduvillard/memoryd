@@ -10,8 +10,9 @@ per-agent visas.
 ## Install
 
 1. Run the memoryd daemon (see the main memoryd README).
-2. Copy this directory to `<hermes install>/plugins/memory/memoryd/`
-   (or `~/.hermes/plugins/memory/memoryd/` for user plugins).
+2. Export the authoritative `HERMES_HOME` used by Hermes and copy this
+   directory to `$HERMES_HOME/plugins/memoryd/`. The default-profile path is
+   `~/.hermes/plugins/memoryd/`.
 3. Activate:
    ```
    hermes memory setup        # pick "memoryd", set url if non-default

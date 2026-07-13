@@ -1,7 +1,7 @@
 """memoryd CLI — one command to a working install on Windows/macOS/Linux.
 
   memoryd install      DB (Docker pgvector) + migrations + config + Claude Code
-                       hooks + autostart + Hermes plugin (when ~/.hermes exists)
+                       hooks + autostart + Hermes plugin (when HERMES_HOME exists)
   memoryd status       is it actually working? (the antidote to fail-open silence)
   memoryd serve        run the daemon in the foreground
   memoryd doctor       inspect spool and archive integrity (read-only)
@@ -39,6 +39,7 @@ IMAGE = "pgvector/pgvector:pg16"
 LEGACY_PG_PASSWORD = "memoryd"
 MANAGED_CREDENTIALS = ".managed-postgres.json"
 DOCKER_ENV_PREFIX = ".memoryd-docker-env-"
+HERMES_MEMORYD_URL = "http://127.0.0.1:7437"
 HOOK_SENTINEL = "-m memoryd.hook"
 HOOK_EVENTS = {
     "UserPromptSubmit": ("recall", 5),
@@ -75,6 +76,35 @@ def _resource_dir(name: str) -> Path:
 
 def _home() -> Path:
     return Path(os.environ.get("MEMORYD_HOME", "~/memory")).expanduser()
+
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+
+
+def _atomic_owner_json(path: Path, value: dict) -> None:
+    """Publish JSON in one rename without leaving credentials world-readable."""
+    temporary = path.with_name(
+        f".{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = None
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        _fsync_managed_credential_dir(path.parent)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
 
 
 def _mask(dsn: str) -> str:
@@ -517,18 +547,15 @@ def register_claude_hooks() -> Path:
 
 
 def install_hermes_plugin() -> None:
-    hermes = Path("~/.hermes").expanduser()
+    hermes = _hermes_home()
     if not hermes.is_dir():
-        print("  hermes     not detected - after installing Hermes, re-run: memoryd install")
+        print(f"  hermes     not detected at {hermes} - create/select HERMES_HOME, "
+              "then re-run: memoryd install")
         return
-    dst = hermes / "plugins" / "memory" / "memoryd"
+    dst = hermes / "plugins" / "memoryd"
     shutil.copytree(_resource_dir("hermes_plugin"), dst, dirs_exist_ok=True)
     cfgp = hermes / "memoryd.json"
-    if not cfgp.exists():
-        from .hook import _cfg
-        port, _ = _cfg()
-        cfgp.write_text(json.dumps({"url": f"http://127.0.0.1:{port}"}, indent=2),
-                        encoding="utf-8")
+    _atomic_owner_json(cfgp, {"url": HERMES_MEMORYD_URL})
     print(f"  hermes     plugin installed -> {dst}")
     print("             activate with: hermes config set memory.provider memoryd")
 
@@ -805,8 +832,8 @@ def status() -> int:
         plist = Path("~/Library/LaunchAgents/io.memoryd.daemon.plist").expanduser()
         print(f"  autostart  launchd agents: {'present' if plist.exists() else 'MISSING'}")
 
-    hp = Path("~/.hermes/plugins/memory/memoryd").expanduser()
-    print(f"  hermes     {'plugin installed' if hp.is_dir() else 'not installed (~/.hermes missing)'}")
+    hp = _hermes_home() / "plugins" / "memoryd"
+    print(f"  hermes     {'plugin installed' if hp.is_dir() else f'not installed ({_hermes_home()} missing)'}")
 
     spool_counts = _spool_counts(home / "spool")
     if spool_counts["dead_letter"]:
@@ -889,8 +916,7 @@ def uninstall() -> None:
             _run(["launchctl", "bootout", f"gui/{uid}/{label}"])
             (Path("~/Library/LaunchAgents").expanduser() / f"{label}.plist").unlink(
                 missing_ok=True)
-    shutil.rmtree(Path("~/.hermes/plugins/memory/memoryd").expanduser(),
-                  ignore_errors=True)
+    shutil.rmtree(_hermes_home() / "plugins" / "memoryd", ignore_errors=True)
     print("  autostart  removed")
     print("  kept your data. Full purge:")
     print(f"    docker rm -f {CONTAINER} && docker volume rm {VOLUME}")

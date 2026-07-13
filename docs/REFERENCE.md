@@ -402,9 +402,11 @@ verbatim ABC from the Hermes repo, vendored in scripts/_stubs/):
 - Tools exposed to the model: `memoryd_search`, `memoryd_report_miss`.
 - CLI: `hermes memoryd status|config|miss`.
 
-Setup: copy `hermes_plugin/memoryd/` to `<hermes>/plugins/memory/memoryd/`,
-then `hermes config set memory.provider memoryd` (or `hermes memory setup`).
-Requires migrations 001–003. Per-agent scopes via `MEMORYD_VISAS`, e.g.
+Setup: export the authoritative `HERMES_HOME`, then copy
+`hermes_plugin/memoryd/` to `$HERMES_HOME/plugins/memoryd/` (or let
+`memoryd install` do so). Activate with
+`hermes config set memory.provider memoryd` (or `hermes memory setup`).
+Requires migrations 001–007. Per-agent scopes via `MEMORYD_VISAS`, e.g.
 `{"hermes": ["work_private","project_shared","public"]}`. Cross-agent
 sharing is automatic: memories extracted from Claude Code sessions are
 recallable in Hermes (and vice versa) under each agent's visa.
