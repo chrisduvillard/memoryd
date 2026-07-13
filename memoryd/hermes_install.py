@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from . import backup, cli
 from .embed import VoyageEmbedder
+from .hermes_compat import HermesTarget, resolve_hermes_home
 from .llm import OpenAIChatClient
 
 
@@ -32,6 +34,7 @@ class ProviderCredentials:
 
 _KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
 _VALIDATION_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *_KEY_NAMES)
+_INSTALL_ENV = ("HERMES_HOME", *_KEY_NAMES, "MEMORYD_LLM", "MEMORYD_EMBED")
 
 
 def require_guided_environment() -> None:
@@ -239,6 +242,94 @@ def validate_provider_credentials(credentials: ProviderCredentials) -> None:
         for name in _VALIDATION_ENV:
             os.environ.pop(name, None)
         os.environ.update(previous)
+
+
+def install_hermes_core(
+    target: HermesTarget, credentials: ProviderCredentials,
+) -> Path:
+    """Install memoryd for one validated Hermes target and verify its backup."""
+    previous = {name: os.environ[name] for name in _INSTALL_ENV if name in os.environ}
+    failure: str | None = None
+    snapshot: Path | None = None
+    try:
+        try:
+            current_root, current_home = resolve_hermes_home()
+            if current_root != target.root or current_home != target.home:
+                failure = "The authoritative Hermes target changed during revalidation."
+            else:
+                classify_memory_home(cli._home())
+        except (Exception, SystemExit):
+            failure = "The Hermes target or memoryd home failed safety revalidation."
+
+        if failure is None:
+            try:
+                os.environ.update(
+                    {
+                        "HERMES_HOME": os.fspath(target.home),
+                        "OPENROUTER_API_KEY": credentials.openrouter_key,
+                        "VOYAGE_API_KEY": credentials.voyage_key,
+                        "MEMORYD_LLM": "openrouter",
+                        "MEMORYD_EMBED": "voyage",
+                    }
+                )
+                if cli.install(cli._InstallOptions(hermes_home=target.home)) != 0:
+                    failure = "Hermes core installation status validation failed."
+            except (Exception, SystemExit):
+                failure = "Hermes core installation failed; artifacts were preserved."
+
+        before: set[Path] = set()
+        if failure is None:
+            try:
+                before = {row.path for row in backup.list_backups()}
+            except (Exception, SystemExit):
+                failure = "The existing backup listing could not be inspected safely."
+
+        if failure is None:
+            try:
+                code, _detail = cli._run(
+                    ["systemctl", "--user", "start", "--wait",
+                     "memoryd-backup.service"],
+                    timeout=660,
+                )
+                if code != 0:
+                    failure = "The initial backup service failed; artifacts were preserved."
+            except (Exception, SystemExit):
+                failure = "The initial backup service failed; artifacts were preserved."
+
+        if failure is None:
+            try:
+                after = {row.path for row in backup.list_backups()}
+                created = after - before
+                if len(created) != 1:
+                    failure = "The initial backup did not create exactly one new snapshot."
+                else:
+                    snapshot = created.pop()
+            except (Exception, SystemExit):
+                failure = "The new backup listing could not be inspected safely."
+
+        if failure is None and snapshot is not None:
+            try:
+                verification = backup.verify_snapshot(snapshot)
+                if not verification.ok:
+                    failure = "The initial backup verification failed; artifacts were preserved."
+            except (Exception, SystemExit):
+                failure = "The initial backup verification failed; artifacts were preserved."
+
+        if failure is None:
+            try:
+                if not cli._wait_for_healthy_daemon():
+                    failure = "memoryd did not become healthy after the backup service restart."
+            except (Exception, SystemExit):
+                failure = "memoryd did not become healthy after the backup service restart."
+    finally:
+        for name in _INSTALL_ENV:
+            os.environ.pop(name, None)
+        os.environ.update(previous)
+
+    if failure is not None:
+        raise HermesInstallError(failure)
+    assert snapshot is not None
+    return snapshot
 
 
 def _read_owner_only_config(config_path: Path) -> object:

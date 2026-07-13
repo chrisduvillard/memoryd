@@ -4,7 +4,9 @@ import builtins
 import getpass
 import json
 import os
+import stat
 import subprocess
+import sys
 import traceback
 import urllib.request
 from pathlib import Path
@@ -12,11 +14,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from memoryd import backup, cli
+from memoryd.hermes_compat import HermesTarget
 import memoryd.hermes_install as hermes
 
 
 KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
 AFFECTED_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *KEY_NAMES)
+INSTALL_ENV = ("HERMES_HOME", "OPENROUTER_API_KEY", "VOYAGE_API_KEY",
+               "MEMORYD_LLM", "MEMORYD_EMBED")
 
 
 def _tty(value: bool = True) -> SimpleNamespace:
@@ -605,3 +611,322 @@ def test_failed_validation_never_mutates_target_filesystem(tmp_path, monkeypatch
 
     after = (tuple(path.name for path in home.iterdir()), marker.read_bytes(), marker.stat().st_mode)
     assert after == before
+
+
+def _hermes_target(tmp_path: Path) -> HermesTarget:
+    root = tmp_path / "hermes"
+    home = root / "profiles" / "work"
+    home.mkdir(parents=True)
+    os.chmod(home, 0o700)
+    (root / "active_profile").write_text("work", encoding="utf-8")
+    return HermesTarget(
+        root=root.resolve(),
+        home=home.resolve(),
+        executable=tmp_path / "bin" / "hermes",
+        python=tmp_path / "venv" / "bin" / "python",
+    )
+
+
+def _backup_row(path: Path, *, ok: bool = True) -> backup.BackupListing:
+    return backup.BackupListing(
+        timestamp=path.name.removesuffix("-v1"),
+        path=path,
+        ok=ok,
+        reason="ok" if ok else "corrupt",
+    )
+
+
+def _prepare_core(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> tuple[HermesTarget, Path, hermes.ProviderCredentials]:
+    target = _hermes_target(tmp_path)
+    memory_home = tmp_path / "memory"
+    monkeypatch.setenv("HERMES_HOME", str(target.root))
+    monkeypatch.setattr(cli, "_home", lambda: memory_home)
+    credentials = hermes.ProviderCredentials("new-openrouter", "new-voyage")
+    return target, memory_home, credentials
+
+
+def test_core_install_orders_revalidation_install_backup_verification_and_restart_health(
+    monkeypatch, tmp_path,
+):
+    target, memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    old = tmp_path / "backups" / "20260712T010203Z-v1"
+    new = tmp_path / "backups" / "20260713T010203Z-v1"
+    events: list[str] = []
+    listings = iter(([_backup_row(old)], [_backup_row(old), _backup_row(new)]))
+
+    def resolve_home():
+        events.append("profile-revalidation")
+        return target.root, target.home
+
+    def classify(home):
+        events.append("memory-home-revalidation")
+        assert home == memory_home
+        return "fresh"
+
+    def install(options):
+        events.append("core-install")
+        assert options.hermes_home == target.home
+        assert {name: os.environ[name] for name in INSTALL_ENV} == {
+            "HERMES_HOME": str(target.home),
+            "OPENROUTER_API_KEY": credentials.openrouter_key,
+            "VOYAGE_API_KEY": credentials.voyage_key,
+            "MEMORYD_LLM": "openrouter",
+            "MEMORYD_EMBED": "voyage",
+        }
+        return 0
+
+    def list_backups():
+        events.append("list-before" if "backup-service" not in events else "list-after")
+        return next(listings)
+
+    def run(command, timeout=120):
+        events.append("backup-service")
+        assert command == [
+            "systemctl", "--user", "start", "--wait", "memoryd-backup.service"]
+        assert timeout >= 600
+        return 0, ""
+
+    monkeypatch.setattr(hermes, "resolve_hermes_home", resolve_home, raising=False)
+    monkeypatch.setattr(hermes, "classify_memory_home", classify)
+    monkeypatch.setattr(cli, "install", install)
+    monkeypatch.setattr(backup, "list_backups", list_backups)
+    monkeypatch.setattr(cli, "_run", run)
+    monkeypatch.setattr(
+        backup, "verify_snapshot",
+        lambda path: events.append("verify-new") or backup.Verification(path == new))
+    monkeypatch.setattr(
+        cli, "_wait_for_healthy_daemon",
+        lambda: events.append("restart-health") or True,
+        raising=False,
+    )
+
+    assert hermes.install_hermes_core(target, credentials) == new
+    assert events == [
+        "profile-revalidation",
+        "memory-home-revalidation",
+        "core-install",
+        "list-before",
+        "backup-service",
+        "list-after",
+        "verify-new",
+        "restart-health",
+    ]
+
+
+def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_reruns(
+    monkeypatch, tmp_path,
+):
+    target, memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    plugin_source = tmp_path / "canonical-plugin"
+    plugin_source.mkdir()
+    (plugin_source / "__init__.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (plugin_source / "plugin.yaml").write_text("name: memoryd\n", encoding="utf-8")
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_base.sql").write_text("SELECT 1;\n", encoding="utf-8")
+    monkeypatch.setenv("MEMORYD_DSN", "postgresql:///memoryd")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "caller-openrouter")
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.setenv("MEMORYD_LLM", "caller-llm")
+    monkeypatch.delenv("MEMORYD_EMBED", raising=False)
+    before = {name: os.environ.get(name) for name in INSTALL_ENV}
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, *_args):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules, "psycopg",
+        SimpleNamespace(connect=lambda *_args, **_kwargs: Connection()))
+    monkeypatch.setattr(cli, "ensure_container", lambda: pytest.fail("Docker must not run"))
+    monkeypatch.setattr(cli, "apply_migrations", lambda _dsn: [])
+    monkeypatch.setattr(
+        cli, "_resource_dir",
+        lambda name: plugin_source if name == "hermes_plugin" else migrations)
+    monkeypatch.setattr(
+        cli, "register_claude_hooks",
+        lambda: pytest.fail("Claude hooks must be skipped in Hermes mode"))
+    monkeypatch.setattr(cli, "install_autostart", lambda: None)
+    monkeypatch.setattr(cli, "_start_daemon_now", lambda: None)
+    monkeypatch.setattr(cli, "_wait_for_healthy_daemon", lambda: True, raising=False)
+    monkeypatch.setattr(cli, "status", lambda: 0)
+
+    snapshots: list[backup.BackupListing] = []
+    generated = iter(("20260713T010203Z-v1", "20260713T020304Z-v1"))
+
+    def run_backup(command, timeout=120):
+        assert command[-1] == "memoryd-backup.service"
+        path = tmp_path / "backups" / next(generated)
+        snapshots.append(_backup_row(path))
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_run", run_backup)
+    monkeypatch.setattr(backup, "list_backups", lambda: list(snapshots))
+    monkeypatch.setattr(backup, "verify_snapshot", lambda _path: backup.Verification(True))
+
+    first = hermes.install_hermes_core(target, credentials)
+    installed = target.home / "plugins" / "memoryd"
+    assert first == snapshots[0].path
+    assert (installed / "__init__.py").read_text(encoding="utf-8") == "VERSION = 1\n"
+    hermes_config = target.home / "memoryd.json"
+    assert json.loads(hermes_config.read_text(encoding="utf-8")) == {
+        "url": "http://127.0.0.1:7437"}
+    config = json.loads((memory_home / "config.json").read_text(encoding="utf-8"))
+    assert config["env"] == {
+        "OPENROUTER_API_KEY": credentials.openrouter_key,
+        "VOYAGE_API_KEY": credentials.voyage_key,
+        "MEMORYD_LLM": "openrouter",
+        "MEMORYD_EMBED": "voyage",
+    }
+    if os.name != "nt":
+        assert stat.S_IMODE(hermes_config.stat().st_mode) == 0o600
+        assert stat.S_IMODE((memory_home / "config.json").stat().st_mode) == 0o600
+    assert {name: os.environ.get(name) for name in INSTALL_ENV} == before
+
+    (plugin_source / "__init__.py").write_text("VERSION = 2\n", encoding="utf-8")
+    second = hermes.install_hermes_core(target, credentials)
+    assert second == snapshots[1].path
+    assert (installed / "__init__.py").read_text(encoding="utf-8") == "VERSION = 2\n"
+    assert hermes.classify_memory_home(memory_home) == "managed"
+    assert {name: os.environ.get(name) for name in INSTALL_ENV} == before
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("MIGRATION-SECRET-SENTINEL"), SystemExit("CORE-SECRET-SENTINEL")],
+)
+def test_core_install_sanitizes_core_or_migration_failure_and_restores_environment(
+    monkeypatch, tmp_path, failure,
+):
+    target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    for name, value in zip(INSTALL_ENV, (str(target.root), "old-open", "old-voyage", "old-llm", "old-embed")):
+        monkeypatch.setenv(name, value)
+    before = dict(os.environ)
+    monkeypatch.setattr(cli, "install", lambda _options: (_ for _ in ()).throw(failure))
+    monkeypatch.setattr(
+        backup, "list_backups", lambda: pytest.fail("backup must not start"))
+
+    with pytest.raises(hermes.HermesInstallError, match="core|install") as caught:
+        hermes.install_hermes_core(target, credentials)
+
+    assert dict(os.environ) == before
+    rendered = repr(caught.value) + "".join(traceback.format_exception(caught.value))
+    assert "SECRET-SENTINEL" not in rendered
+
+
+def test_core_install_requires_successful_systemd_backup_and_preserves_evidence(
+    monkeypatch, tmp_path,
+):
+    target, memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    _safe_config(memory_home / "config.json", _managed_payload(memory_home))
+    evidence = {
+        memory_home / "archive" / "memory.jsonl": b"archive evidence",
+        memory_home / "spool" / "incoming" / "job.json": b"spool evidence",
+        memory_home / "logs" / "daemon.log": b"log evidence",
+        memory_home / "backups" / "20260712T010203Z-v1" / "manifest.json": b"backup evidence",
+        target.home / "plugins" / "memoryd" / "operator-note": b"plugin evidence",
+        tmp_path / "database-volume.marker": b"database evidence",
+    }
+    for path, payload in evidence.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    before = {path: path.read_bytes() for path in evidence}
+    old = _backup_row(memory_home / "backups" / "20260712T010203Z-v1")
+    monkeypatch.setattr(cli, "install", lambda _options: 0)
+    monkeypatch.setattr(backup, "list_backups", lambda: [old])
+    monkeypatch.setattr(cli, "_run", lambda _command, timeout=120: (1, "SECRET service detail"))
+
+    with pytest.raises(hermes.HermesInstallError, match="backup|service") as caught:
+        hermes.install_hermes_core(target, credentials)
+
+    assert "SECRET service detail" not in str(caught.value)
+    assert {path: path.read_bytes() for path in evidence} == before
+
+
+@pytest.mark.parametrize("new_count", [0, 2])
+def test_core_install_requires_exactly_one_new_generated_snapshot(
+    monkeypatch, tmp_path, new_count,
+):
+    target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    old = _backup_row(tmp_path / "backups" / "20260712T010203Z-v1")
+    additions = [
+        _backup_row(tmp_path / "backups" / f"20260713T0{index}0203Z-v1")
+        for index in range(new_count)
+    ]
+    listings = iter(([old], [old, *additions]))
+    monkeypatch.setattr(cli, "install", lambda _options: 0)
+    monkeypatch.setattr(backup, "list_backups", lambda: next(listings))
+    monkeypatch.setattr(cli, "_run", lambda _command, timeout=120: (0, ""))
+    monkeypatch.setattr(
+        backup, "verify_snapshot",
+        lambda _path: pytest.fail("ambiguous snapshot must not be verified"))
+
+    with pytest.raises(hermes.HermesInstallError, match="exactly one|snapshot"):
+        hermes.install_hermes_core(target, credentials)
+
+
+def test_core_install_rejects_failed_snapshot_verification(
+    monkeypatch, tmp_path,
+):
+    target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    snapshot = tmp_path / "backups" / "20260713T010203Z-v1"
+    listings = iter(([], [_backup_row(snapshot, ok=False)]))
+    monkeypatch.setattr(cli, "install", lambda _options: 0)
+    monkeypatch.setattr(backup, "list_backups", lambda: next(listings))
+    monkeypatch.setattr(cli, "_run", lambda _command, timeout=120: (0, ""))
+    monkeypatch.setattr(
+        backup, "verify_snapshot",
+        lambda _path: backup.Verification(False, "SECRET corrupt detail"))
+    monkeypatch.setattr(
+        cli, "_wait_for_healthy_daemon",
+        lambda: pytest.fail("unverified backup must not reach health check"),
+        raising=False,
+    )
+
+    with pytest.raises(hermes.HermesInstallError, match="verification|backup") as caught:
+        hermes.install_hermes_core(target, credentials)
+
+    assert "SECRET corrupt detail" not in str(caught.value)
+
+
+def test_core_install_requires_daemon_restart_health_after_verified_backup(
+    monkeypatch, tmp_path,
+):
+    target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    snapshot = tmp_path / "backups" / "20260713T010203Z-v1"
+    listings = iter(([], [_backup_row(snapshot)]))
+    monkeypatch.setattr(cli, "install", lambda _options: 0)
+    monkeypatch.setattr(backup, "list_backups", lambda: next(listings))
+    monkeypatch.setattr(cli, "_run", lambda _command, timeout=120: (0, ""))
+    monkeypatch.setattr(backup, "verify_snapshot", lambda _path: backup.Verification(True))
+    monkeypatch.setattr(cli, "_wait_for_healthy_daemon", lambda: False, raising=False)
+
+    with pytest.raises(hermes.HermesInstallError, match="healthy|restart"):
+        hermes.install_hermes_core(target, credentials)
+
+
+@pytest.mark.parametrize("change", ["identity", "mode"])
+def test_core_install_revalidates_authoritative_profile_before_first_mutation(
+    monkeypatch, tmp_path, change,
+):
+    target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    if change == "identity":
+        other = target.root / "profiles" / "other"
+        other.mkdir()
+        os.chmod(other, 0o700)
+        (target.root / "active_profile").write_text("other", encoding="utf-8")
+    else:
+        os.chmod(target.home, 0o755)
+    monkeypatch.setattr(
+        cli, "install", lambda _options: pytest.fail("mutation started before revalidation"))
+
+    with pytest.raises(hermes.HermesInstallError, match="revalid|profile|target"):
+        hermes.install_hermes_core(target, credentials)

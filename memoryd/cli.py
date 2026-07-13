@@ -32,6 +32,7 @@ import sys
 import time
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 CONTAINER = "memoryd-pgvector"
@@ -562,8 +563,8 @@ def register_claude_hooks() -> Path:
     return settings
 
 
-def install_hermes_plugin() -> None:
-    hermes = _hermes_home()
+def install_hermes_plugin(hermes_home: Path | None = None) -> None:
+    hermes = _hermes_home() if hermes_home is None else Path(hermes_home)
     if not hermes.is_dir():
         print(f"  hermes     not detected at {hermes} - create/select HERMES_HOME, "
               "then re-run: memoryd install")
@@ -733,9 +734,24 @@ def _start_daemon_now() -> None:
         subprocess.Popen([sys.executable, "-m", "memoryd", "serve"], **kwargs)
 
 
+def _wait_for_healthy_daemon() -> bool:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        health = _health()
+        if health and health.get("ok"):
+            return True
+        time.sleep(1)
+    return False
+
+
 # ----------------------------------------------------------------- commands
 
-def install() -> int:
+@dataclass(frozen=True)
+class _InstallOptions:
+    hermes_home: Path
+
+
+def install(options: _InstallOptions | None = None) -> int:
     import psycopg
     print("memoryd install")
     # BYO-Postgres short-circuit: a working preset DSN skips Docker entirely
@@ -762,16 +778,16 @@ def install() -> int:
     print(f"  migrations {len(applied)} applied, {total} total"
           + (f" ({', '.join(applied)})" if applied else ""))
     print(f"  config     {write_config(dsn)}")
-    print(f"  hooks      registered in {register_claude_hooks()}")
-    install_hermes_plugin()
+    if options is None:
+        print(f"  hooks      registered in {register_claude_hooks()}")
+        install_hermes_plugin()
+    else:
+        install_hermes_plugin(options.hermes_home)
     install_autostart()
     _start_daemon_now()
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        h = _health()
-        if h and h.get("ok"):
-            break
-        time.sleep(1)
+    healthy = _wait_for_healthy_daemon()
+    if options is not None and not healthy:
+        raise RuntimeError("memoryd did not become healthy after installation")
     print()
     return status()
 
