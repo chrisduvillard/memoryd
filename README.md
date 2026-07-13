@@ -149,7 +149,10 @@ memoryd backup verify ~/memory/backups/20260713T023500Z-v1
 
 Snapshot metadata is sanitized: database passwords and API-key values are not
 included. The manifest lists the secret environment-variable names you must
-re-enter on the restored installation.
+re-enter on the restored installation. On POSIX, backup and restore abort if
+owner-only directory (`0700`) or file (`0600`) modes cannot be enforced;
+Windows applies its available chmod protection on a best-effort basis, so use
+an account-private directory and appropriate NTFS ACLs.
 
 Practice the restore into an **empty database and empty/new home**, never over
 the live installation:

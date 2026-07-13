@@ -67,6 +67,18 @@ def _refresh_file_entry(snapshot: Path, name: str) -> None:
         json.dumps(manifest, indent=2, sort_keys=True))
 
 
+def _write_tar(path: Path, members: list[tuple[str, bytes | None]]) -> None:
+    with tarfile.open(path, "w:gz") as archive:
+        for name, payload in members:
+            member = tarfile.TarInfo(name)
+            if payload is None:
+                member.type = tarfile.DIRTYPE
+                archive.addfile(member)
+            else:
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+
+
 def test_create_produces_verified_secret_free_owner_only_snapshot(
         monkeypatch, tmp_path):
     home = _home(tmp_path)
@@ -164,6 +176,46 @@ def test_create_refuses_doctor_errors_and_dead_letters(monkeypatch, tmp_path):
         backup.create_backup(output=tmp_path / "out", home=home)
 
 
+def test_posix_chmod_failure_aborts_create(monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    monkeypatch.setattr(backup, "POSIX_MODE_ENFORCED", True, raising=False)
+    monkeypatch.setattr(
+        backup.os, "chmod",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("chmod denied")))
+
+    with pytest.raises(backup.BackupError, match="permissions"):
+        backup.create_backup(output=tmp_path / "out", home=home)
+
+    assert not list((tmp_path / "out").glob(".memoryd-backup-*"))
+
+
+def test_posix_chmod_failure_aborts_restore_and_cleans_staging(
+        monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=home)
+    os.chmod(snapshot, 0o700)
+    for path in snapshot.iterdir():
+        os.chmod(path, 0o600)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "POSIX_MODE_ENFORCED", True, raising=False)
+    monkeypatch.setattr(backup, "_require_mode", lambda _path, _mode: None)
+    monkeypatch.setattr(
+        backup.os, "chmod",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("chmod denied")))
+    target = tmp_path / "target"
+
+    with pytest.raises(backup.BackupError, match="permissions"):
+        backup.restore_backup(snapshot, target_dsn="postgresql:///empty",
+                              target_home=target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".target.restore-*"))
+
+
 @pytest.mark.parametrize("name", ["database.dump", "memory.tar.gz"])
 def test_verify_detects_corruption(monkeypatch, tmp_path, name):
     home = _home(tmp_path)
@@ -190,6 +242,60 @@ def test_verify_rejects_incomplete_manifest(monkeypatch, tmp_path):
 
     assert not result.ok
     assert "manifest" in result.reason.lower()
+
+
+@pytest.mark.parametrize("schema,migrations", [
+    (True, ["001_init.sql"]),
+    (1, []),
+    (1, ["001_init.sql", "001_init.sql"]),
+    (1, ["002_second.sql", "001_init.sql"]),
+])
+def test_verify_rejects_non_strict_schema_and_migrations(
+        monkeypatch, tmp_path, schema, migrations):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=home)
+    manifest = _manifest(snapshot)
+    manifest["schema_version"] = schema
+    manifest["db_migrations"] = migrations
+    (snapshot / "manifest.json").write_text(json.dumps(manifest))
+
+    result = backup.verify_snapshot(snapshot)
+
+    assert not result.ok
+
+
+def test_verify_rejects_wrong_snapshot_or_file_mode(monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=home)
+    os.chmod(snapshot, 0o755)
+    os.chmod(snapshot / "manifest.json", 0o644)
+    monkeypatch.setattr(backup, "POSIX_MODE_ENFORCED", True, raising=False)
+
+    result = backup.verify_snapshot(snapshot)
+
+    assert not result.ok
+    assert "mode" in result.reason.lower()
+
+
+def test_verify_checks_mode_of_every_snapshot_file(monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=home)
+    checked: list[tuple[Path, int]] = []
+
+    def reject_manifest(path, expected):
+        checked.append((path, expected))
+        if path.name == "manifest.json":
+            raise backup.BackupError("unsafe mode for manifest.json")
+
+    monkeypatch.setattr(backup, "_require_mode", reject_manifest)
+
+    result = backup.verify_snapshot(snapshot)
+
+    assert not result.ok
+    assert (snapshot / "manifest.json", 0o600) in checked
 
 
 @pytest.mark.parametrize("kind", ["traversal", "symlink"])
@@ -247,6 +353,71 @@ def test_verify_reports_empty_normalized_tar_path_as_corrupt(
 
     assert not result.ok
     assert "tar" in result.reason.lower()
+
+
+def test_verify_and_restore_reject_normalized_tar_aliases(monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=home)
+    tar_path = snapshot / "memory.tar.gz"
+    _write_tar(tar_path, [
+        ("archive", None), ("spool", None),
+        ("archive/x", b"first"), ("archive/./x", b"second"),
+    ])
+    _refresh_file_entry(snapshot, "memory.tar.gz")
+
+    result = backup.verify_snapshot(snapshot)
+    assert not result.ok
+    assert "duplicate" in result.reason.lower()
+    with pytest.raises(backup.BackupError, match="verification failed"):
+        backup.restore_backup(
+            snapshot, target_dsn="postgresql:///empty",
+            target_home=tmp_path / "restored")
+
+
+def test_extract_validates_and_extracts_same_open_tar_handle(
+        monkeypatch, tmp_path):
+    safe = tmp_path / "safe.tar.gz"
+    hostile = tmp_path / "hostile.tar.gz"
+    _write_tar(safe, [
+        ("archive", None), ("spool", None), ("archive/good", b"safe")])
+    _write_tar(hostile, [("../escaped", b"hostile")])
+    real_open = tarfile.open
+    opened: list[Path] = []
+
+    def switched_open(_path, mode="r", **kwargs):
+        selected = safe if not opened else hostile
+        opened.append(selected)
+        return real_open(selected, mode, **kwargs)
+
+    monkeypatch.setattr(backup.tarfile, "open", switched_open)
+    destination = tmp_path / "stage"
+    destination.mkdir()
+
+    backup._extract_memory_tar(tmp_path / "swapped.tar.gz", destination)
+
+    assert opened == [safe]
+    assert (destination / "archive" / "good").read_bytes() == b"safe"
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_extract_privatises_implicit_intermediate_directories(
+        monkeypatch, tmp_path):
+    source = tmp_path / "source.tar.gz"
+    _write_tar(source, [
+        ("archive", None), ("spool", None),
+        ("archive/implicit/child/data", b"safe"),
+    ])
+    destination = tmp_path / "stage"
+    destination.mkdir()
+    modes: dict[Path, int] = {}
+    monkeypatch.setattr(
+        backup, "_chmod", lambda path, mode: modes.__setitem__(path, mode))
+
+    backup._extract_memory_tar(source, destination)
+
+    assert modes[destination / "archive" / "implicit"] == 0o700
+    assert modes[destination / "archive" / "implicit" / "child"] == 0o700
 
 
 def test_list_reports_valid_and_corrupt_without_mutating(monkeypatch, tmp_path):
@@ -322,6 +493,27 @@ def test_restore_verifies_then_publishes_home_with_target_config(
     assert restored and restored[0][1] == dsn
 
 
+def test_restore_checks_staged_home_and_config_modes(monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
+    checked: list[tuple[Path, int]] = []
+    monkeypatch.setattr(
+        backup, "_require_mode",
+        lambda path, expected: checked.append((path, expected)))
+    target = tmp_path / "restored"
+
+    backup.restore_backup(
+        snapshot, target_dsn="postgresql:///empty", target_home=target)
+
+    assert any(path.name.startswith(".restored.restore-") and mode == 0o700
+               for path, mode in checked)
+    assert any(path.name == "config.json" and mode == 0o600
+               for path, mode in checked)
+
+
 def test_restore_refuses_daemon_nonempty_home_and_nonempty_db(
         monkeypatch, tmp_path):
     source_home = _home(tmp_path)
@@ -368,6 +560,34 @@ def test_restore_command_failure_removes_only_staging_and_warns_db_risk(
     assert snapshot.exists()
     assert not target.exists()
     assert not list(tmp_path.glob(".target.restore-*"))
+
+
+def test_restore_publish_failure_preserves_existing_empty_target(
+        monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+    target.mkdir()
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
+    real_rename = backup._atomic_rename
+
+    def fail_staging_publish(source, destination):
+        if source.name.startswith(".target.restore-"):
+            raise OSError("injected publish failure")
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(backup, "_atomic_rename", fail_staging_publish)
+
+    with pytest.raises(backup.BackupError, match="publish failure"):
+        backup.restore_backup(snapshot, target_dsn="postgresql:///empty",
+                              target_home=target)
+
+    assert target.is_dir()
+    assert not list(target.iterdir())
+    assert not list(tmp_path.glob(".target.restore-*"))
+    assert not list(tmp_path.glob(".target.empty-*"))
 
 
 def test_local_pg_tools_keep_password_out_of_argv(monkeypatch, tmp_path):

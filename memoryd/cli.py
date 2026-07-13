@@ -629,9 +629,14 @@ def uninstall() -> None:
                 "Microsoft/Windows/Start Menu/Programs/Startup/memoryd.cmd")
         shim.unlink(missing_ok=True)
     elif sys.platform.startswith("linux"):
+        # Prevent a new timer activation, then stop any in-flight backup. Its
+        # ExecStopPost may start the daemon, so daemon disable/stop comes last
+        # and is the final authority on daemon state during uninstall.
         _run(["systemctl", "--user", "disable", "--now",
-              "memoryd.service", "memoryd-microsleep.timer",
               "memoryd-backup.timer"])
+        _run(["systemctl", "--user", "stop", "memoryd-backup.service"])
+        _run(["systemctl", "--user", "disable", "--now",
+              "memoryd.service", "memoryd-microsleep.timer"])
         unit_dir = Path("~/.config/systemd/user").expanduser()
         for n in ("memoryd.service", "memoryd-microsleep.service",
                   "memoryd-microsleep.timer", "memoryd-backup.service",

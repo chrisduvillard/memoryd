@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -21,7 +22,9 @@ from typing import Any
 from . import __version__
 
 SCHEMA_VERSION = 1
+POSIX_MODE_ENFORCED = os.name != "nt"
 SNAPSHOT_RE = re.compile(r"^\d{8}T\d{6}Z-v1$")
+MIGRATION_RE = re.compile(r"^\d{3}_[A-Za-z0-9][A-Za-z0-9_-]*\.sql$")
 SNAPSHOT_FILES = {
     "database.dump", "memory.tar.gz", "config.sanitized.json",
     "manifest.json",
@@ -73,11 +76,21 @@ def _default_home() -> Path:
 
 
 def _chmod(path: Path, mode: int) -> None:
-    if os.name != "nt":
-        try:
-            os.chmod(path, mode, follow_symlinks=False)
-        except OSError:
-            pass
+    try:
+        os.chmod(path, mode, follow_symlinks=False)
+    except OSError as exc:
+        if POSIX_MODE_ENFORCED:
+            raise BackupError(
+                f"cannot enforce owner-only permissions on {path}: {exc}") from exc
+
+
+def _require_mode(path: Path, expected: int) -> None:
+    if not POSIX_MODE_ENFORCED:
+        return
+    actual = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+    if actual != expected:
+        raise BackupError(
+            f"unsafe mode for {path}: expected {expected:04o}, got {actual:04o}")
 
 
 def _ensure_owner_dir(path: Path) -> None:
@@ -87,15 +100,16 @@ def _ensure_owner_dir(path: Path) -> None:
 
 def _atomic_rename(source: Path, destination: Path) -> None:
     """Publish atomically, tolerating short-lived Windows scanner handles."""
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 5
+    destination_existed = os.path.lexists(destination)
     while True:
         try:
             os.replace(source, destination)
             return
         except PermissionError:
-            if os.name != "nt" or time.monotonic() >= deadline:
+            if destination_existed or time.monotonic() >= deadline:
                 raise
-            time.sleep(0.01)
+            time.sleep(0.005)
 
 
 def _daemon_health() -> dict | None:
@@ -374,9 +388,10 @@ def create_backup(*, output: Path | str | None = None,
     final = root / _snapshot_name(created)
     if os.path.lexists(final):
         raise BackupError(f"snapshot already exists: {final}")
-    staging = Path(tempfile.mkdtemp(prefix=".memoryd-backup-", dir=root))
-    _chmod(staging, 0o700)
+    staging: Path | None = None
     try:
+        staging = Path(tempfile.mkdtemp(prefix=".memoryd-backup-", dir=root))
+        _chmod(staging, 0o700)
         dump = staging / "database.dump"
         memory_tar = staging / "memory.tar.gz"
         sanitized_path = staging / "config.sanitized.json"
@@ -445,35 +460,47 @@ def _validate_config_secrets(value: Any, *, parent: str = "") -> None:
             raise BackupError("sanitized config contains a password-bearing DSN")
 
 
+def _validated_tar_members(
+        archive: tarfile.TarFile, *, read_payloads: bool,
+) -> list[tuple[tarfile.TarInfo, tuple[str, ...]]]:
+    validated: list[tuple[tarfile.TarInfo, tuple[str, ...]]] = []
+    seen: set[tuple[str, ...]] = set()
+    roots: set[str] = set()
+    for member in archive:
+        name = member.name
+        pure = PurePosixPath(name)
+        parts = pure.parts
+        if (not name or not parts or "\\" in name or pure.is_absolute() or
+                ".." in parts or parts[0] not in {"archive", "spool"}):
+            raise BackupError(f"unsafe tar member path: {name!r}")
+        normalized = tuple(parts)
+        if normalized in seen:
+            raise BackupError(
+                f"duplicate normalized tar destination: {'/'.join(normalized)}")
+        seen.add(normalized)
+        if not (member.isdir() or member.isreg()):
+            raise BackupError(f"unsafe tar member type: {name}")
+        if len(normalized) == 1 and member.isdir():
+            roots.add(normalized[0])
+        if member.isreg() and read_payloads:
+            payload = archive.extractfile(member)
+            if payload is None:
+                raise BackupError(f"unreadable tar member: {name}")
+            with payload:
+                while payload.read(1024 * 1024):
+                    pass
+        validated.append((member, normalized))
+    missing = {"archive", "spool"} - roots
+    if missing:
+        raise BackupError(
+            f"memory tar is missing required roots: {sorted(missing)!r}")
+    return validated
+
+
 def _validate_tar(path: Path) -> None:
     try:
         with tarfile.open(path, "r:gz") as archive:
-            seen: set[str] = set()
-            roots: set[str] = set()
-            for member in archive:
-                name = member.name
-                pure = PurePosixPath(name)
-                if (not name or not pure.parts or "\\" in name or pure.is_absolute() or
-                        ".." in pure.parts or pure.parts[0] not in {"archive", "spool"}):
-                    raise BackupError(f"unsafe tar member path: {name!r}")
-                if name in seen:
-                    raise BackupError(f"duplicate tar member: {name}")
-                seen.add(name)
-                if not (member.isdir() or member.isreg()):
-                    raise BackupError(f"unsafe tar member type: {name}")
-                if len(pure.parts) == 1 and member.isdir():
-                    roots.add(name)
-                if member.isreg():
-                    source = archive.extractfile(member)
-                    if source is None:
-                        raise BackupError(f"unreadable tar member: {name}")
-                    with source:
-                        while source.read(1024 * 1024):
-                            pass
-            missing = {"archive", "spool"} - roots
-            if missing:
-                raise BackupError(
-                    f"memory tar is missing required roots: {sorted(missing)!r}")
+            _validated_tar_members(archive, read_payloads=True)
     except BackupError:
         raise
     except (OSError, tarfile.TarError) as exc:
@@ -488,6 +515,7 @@ def verify_snapshot(snapshot: Path | str, *,
             raise BackupError("snapshot name is not a generated v1 name")
         if path.is_symlink() or not path.is_dir():
             raise BackupError("snapshot must be a real directory")
+        _require_mode(path, 0o700)
         actual = {child.name for child in path.iterdir()}
         if actual != SNAPSHOT_FILES:
             raise BackupError(
@@ -496,10 +524,12 @@ def verify_snapshot(snapshot: Path | str, *,
             mode = child.stat(follow_symlinks=False).st_mode
             if child.is_symlink() or not stat.S_ISREG(mode):
                 raise BackupError(f"snapshot entry is not a regular file: {child.name}")
+            _require_mode(child, 0o600)
         manifest = _load_manifest(path)
         if set(manifest) != MANIFEST_FIELDS:
             raise BackupError("manifest field allowlist mismatch")
-        if manifest.get("schema_version") != SCHEMA_VERSION:
+        if (type(manifest.get("schema_version")) is not int or
+                manifest["schema_version"] != SCHEMA_VERSION):
             raise BackupError("unsupported manifest schema_version")
         created_at = manifest.get("created_at")
         if not isinstance(created_at, str) or not created_at.endswith("Z"):
@@ -537,9 +567,10 @@ def verify_snapshot(snapshot: Path | str, *,
                 required != sorted(set(required))):
             raise BackupError("invalid required_secret_env_names")
         migrations = manifest.get("db_migrations")
-        if (not isinstance(migrations, list) or
-                any(not isinstance(name, str) or Path(name).name != name
-                    for name in migrations)):
+        if (not isinstance(migrations, list) or not migrations or
+                any(not isinstance(name, str) or not MIGRATION_RE.fullmatch(name)
+                    for name in migrations) or
+                migrations != sorted(set(migrations))):
             raise BackupError("invalid db_migrations")
         try:
             config = json.loads(
@@ -602,22 +633,58 @@ def _target_db_has_tables(dsn: str) -> bool:
     return bool(row[0])
 
 
+def _ensure_private_directories(root: Path, target: Path) -> None:
+    current = root
+    for part in target.relative_to(root).parts:
+        current /= part
+        current.mkdir(exist_ok=True)
+        _chmod(current, 0o700)
+
+
 def _extract_memory_tar(path: Path, destination: Path) -> None:
-    _validate_tar(path)
-    with tarfile.open(path, "r:gz") as archive:
-        for member in archive:
-            target = destination.joinpath(*PurePosixPath(member.name).parts)
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                _chmod(target, 0o700)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            source = archive.extractfile(member)
-            if source is None:
-                raise BackupError(f"unreadable tar member: {member.name}")
-            with source, target.open("xb") as handle:
-                shutil.copyfileobj(source, handle)
-            _chmod(target, 0o600)
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            members = _validated_tar_members(archive, read_payloads=False)
+            for member, normalized in members:
+                target = destination.joinpath(*normalized)
+                if member.isdir():
+                    _ensure_private_directories(destination, target)
+                    continue
+                _ensure_private_directories(destination, target.parent)
+                payload = archive.extractfile(member)
+                if payload is None:
+                    raise BackupError(
+                        f"unreadable tar member: {member.name}")
+                with payload, target.open("xb") as handle:
+                    shutil.copyfileobj(payload, handle)
+                _chmod(target, 0o600)
+    except BackupError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        raise BackupError(f"memory tar extraction failed: {exc}") from exc
+
+
+def _publish_restored_home(
+        staging: Path, home: Path, *, caller_empty_home: bool) -> None:
+    if not caller_empty_home:
+        _atomic_rename(staging, home)
+        return
+    try:
+        _atomic_rename(staging, home)
+        return
+    except OSError as direct_error:
+        placeholder = home.with_name(
+            f".{home.name}.empty-{secrets.token_hex(8)}")
+        try:
+            _atomic_rename(home, placeholder)
+        except OSError:
+            raise direct_error
+        try:
+            _atomic_rename(staging, home)
+        except Exception:
+            _atomic_rename(placeholder, home)
+            raise
+        placeholder.rmdir()
 
 
 def restore_backup(snapshot: Path | str, *, target_dsn: str,
@@ -629,17 +696,16 @@ def restore_backup(snapshot: Path | str, *, target_dsn: str,
     if _daemon_health() is not None:
         raise BackupError("stop the memoryd daemon before restoring a backup")
     home = Path(target_home)
+    caller_empty_home = False
     if os.path.lexists(home):
         if home.is_symlink():
             raise BackupError(f"target home must not be a symlink: {home}")
         if not home.is_dir():
             raise BackupError(f"target home is not a directory: {home}")
-        try:
-            next(home.iterdir())
-        except StopIteration:
-            pass
-        else:
-            raise BackupError(f"target home is not empty: {home}")
+        with os.scandir(home) as entries:
+            if next(entries, None) is not None:
+                raise BackupError(f"target home is not empty: {home}")
+        caller_empty_home = True
     try:
         if _target_db_has_tables(target_dsn):
             raise BackupError("target database already has user tables")
@@ -649,11 +715,12 @@ def restore_backup(snapshot: Path | str, *, target_dsn: str,
         raise BackupError(f"cannot validate target database: {exc}") from exc
 
     home.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(
-        prefix=f".{home.name}.restore-", dir=home.parent))
-    _chmod(staging, 0o700)
+    staging: Path | None = None
     database_risk = False
     try:
+        staging = Path(tempfile.mkdtemp(
+            prefix=f".{home.name}.restore-", dir=home.parent))
+        _chmod(staging, 0o700)
         _extract_memory_tar(source / "memory.tar.gz", staging)
         config = json.loads(
             (source / "config.sanitized.json").read_text(encoding="utf-8"))
@@ -663,11 +730,12 @@ def restore_backup(snapshot: Path | str, *, target_dsn: str,
         config_path.write_text(
             json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
         _chmod(config_path, 0o600)
+        _require_mode(staging, 0o700)
+        _require_mode(config_path, 0o600)
         database_risk = True
         _restore_database(source / "database.dump", target_dsn)
-        if home.exists():
-            home.rmdir()
-        _atomic_rename(staging, home)
+        _publish_restored_home(
+            staging, home, caller_empty_home=caller_empty_home)
         staging = None
         return home
     except Exception as exc:  # noqa: BLE001

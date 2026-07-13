@@ -102,6 +102,10 @@ Each owner-only snapshot contains `database.dump` (PostgreSQL custom format),
 `memory.tar.gz` (`archive/` and `spool/` only), `config.sanitized.json`, and a
 checksummed v1 manifest. API keys and password-bearing DSNs are excluded. The
 manifest records the secret environment-variable names that must be re-entered.
+POSIX creation, verification, and restore require snapshot/home directories to
+be mode `0700` and files to be `0600`; permission-setting failures abort.
+Windows chmod protection is best-effort, so operators should also use
+account-private NTFS ACLs.
 
 `verify` checks the exact file allowlist, sizes and SHA-256 checksums, database
 dump signature, JSON schema, and every tar member. Absolute/traversal paths,

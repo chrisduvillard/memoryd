@@ -186,7 +186,15 @@ def test_linux_uninstall_disables_and_removes_backup_units(monkeypatch, tmp_path
 
     cli.uninstall()
 
-    disable = next(call for call in calls if "disable" in call)
-    assert "memoryd-backup.timer" in disable
+    disable_timer = ["systemctl", "--user", "disable", "--now",
+                     "memoryd-backup.timer"]
+    stop_backup = ["systemctl", "--user", "stop", "memoryd-backup.service"]
+    stop_daemon = ["systemctl", "--user", "disable", "--now",
+                   "memoryd.service", "memoryd-microsleep.timer"]
+    assert disable_timer in calls
+    assert stop_backup in calls
+    assert stop_daemon in calls
+    assert calls.index(disable_timer) < calls.index(stop_backup)
+    assert calls.index(stop_backup) < calls.index(stop_daemon)
     assert not (tmp_path / "memoryd-backup.service").exists()
     assert not (tmp_path / "memoryd-backup.timer").exists()
