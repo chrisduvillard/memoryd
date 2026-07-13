@@ -1,12 +1,76 @@
 name: tests
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 jobs:
+  pinned-hermes-contract:
+    name: Pinned Hermes v2026.6.5 compatibility (blocking)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pinned Hermes Agent v2026.6.5
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: v2026.6.5
+          path: _hermes-agent
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify immutable pinned Hermes commit
+        shell: bash
+        run: |
+          actual=$(git -C _hermes-agent rev-parse HEAD)
+          expected=3c231eb3979ab9c57d5cd6d02f1d577a3b718b43
+          echo "Hermes v2026.6.5 resolved commit: $actual"
+          test "$actual" = "$expected"
+      - name: Run pinned Hermes contract and DB-free plugin checks
+        run: |
+          python scripts/check_hermes_contract.py --source-root _hermes-agent
+          python scripts/test_hermes_contract.py
+      - name: Run durable-spool suite against pinned Hermes
+        env:
+          HERMES_SOURCE_ROOT: ${{ github.workspace }}/_hermes-agent
+        run: python scripts/test_hermes_spool.py
+
+  upstream-hermes-advisory:
+    name: "ADVISORY: latest Hermes main compatibility (non-blocking)"
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out latest Hermes Agent main (advisory only)
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: main
+          path: _hermes-agent-main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Log advisory scope
+        run: |
+          echo "ADVISORY ONLY: checking moving NousResearch/hermes-agent main."
+          echo "Failures here do not gate memoryd push or pull-request jobs."
+          git -C _hermes-agent-main rev-parse HEAD
+      - name: Run advisory contract and DB-free plugin checks
+        run: |
+          python scripts/check_hermes_contract.py --source-root _hermes-agent-main
+          HERMES_SOURCE_ROOT="$GITHUB_WORKSPACE/_hermes-agent-main" python scripts/test_hermes_spool.py
+
   hermes-spool:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -21,6 +85,7 @@ jobs:
         run: python scripts/test_hermes_spool.py
 
   test:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -19,6 +19,20 @@ per-agent visas.
    ```
 4. Verify: `hermes memoryd status`
 
+## Hermes compatibility
+
+This plugin is pinned to Hermes Agent tag `v2026.6.5`, resolved commit
+`3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`, source path
+`agent/memory_provider.py`. To troubleshoot activation against a Hermes source
+checkout without a database, run:
+
+```bash
+python scripts/check_hermes_contract.py --source-root /path/to/hermes-agent
+```
+
+Omit `--source-root` to check the actually installed
+`agent.memory_provider.MemoryProvider`.
+
 ## Behavior & guarantees
 
 - **Crash-durable capture.** Every primary-context capture, extraction, and

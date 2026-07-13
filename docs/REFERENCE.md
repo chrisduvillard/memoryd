@@ -335,11 +335,22 @@ Requires migrations 001–003. Per-agent scopes via `MEMORYD_VISAS`, e.g.
 sharing is automatic: memories extracted from Claude Code sessions are
 recallable in Hermes (and vice versa) under each agent's visa.
 
-Version note: the plugin targets the MemoryProvider ABC as of hermes-agent
-main, 2026-07. Hermes moves fast (`hermes update`); if activation fails
-after an update, re-diff `agent/memory_provider.py` against
-`scripts/_stubs/agent/memory_provider.py` — divergence there is the first
-thing to check.
+Version note: the plugin targets Hermes Agent tag `v2026.6.5`, resolved commit
+`3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`, source path
+`agent/memory_provider.py`. The vendored pinned contract is
+`scripts/_stubs/agent/memory_provider.py`.
+
+Hermes moves fast (`hermes update`). If plugin activation fails after an
+update, run this exact DB-free compatibility check against the Hermes checkout
+you installed or updated:
+
+```bash
+python scripts/check_hermes_contract.py --source-root /path/to/hermes-agent
+```
+
+Without `--source-root`, the checker validates the actually installed
+`agent.memory_provider.MemoryProvider`. A mismatch report identifies removed
+methods, abstract-method changes, and required signature changes.
 
 ## Next: deploy + trial (M6–M8)
 

@@ -19,7 +19,15 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "scripts" / "_stubs"))
+HERMES_SOURCE_ROOT = os.environ.get("HERMES_SOURCE_ROOT")
+sys.path.insert(
+    0,
+    str(
+        Path(HERMES_SOURCE_ROOT).resolve()
+        if HERMES_SOURCE_ROOT
+        else REPO / "scripts" / "_stubs"
+    ),
+)
 
 SPEC = importlib.util.spec_from_file_location(
     "hermes_memoryd_plugin", REPO / "hermes_plugin" / "memoryd" / "__init__.py")

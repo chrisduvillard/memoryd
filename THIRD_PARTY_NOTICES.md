@@ -3,9 +3,12 @@
 ## NousResearch/hermes-agent
 
 `scripts/_stubs/agent/memory_provider.py` is a vendored copy of the Hermes
-Agent `agent/memory_provider.py` contract, used for compatibility tests.
+Agent `agent/memory_provider.py` contract from tag `v2026.6.5`, resolved commit
+`3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`, used for compatibility tests.
 
-Source: <https://github.com/NousResearch/hermes-agent>
+Source path: `agent/memory_provider.py`
+
+Source: <https://github.com/NousResearch/hermes-agent/blob/3c231eb3979ab9c57d5cd6d02f1d577a3b718b43/agent/memory_provider.py>
 
 License: MIT
 
