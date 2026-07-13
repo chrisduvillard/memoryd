@@ -7,7 +7,7 @@
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache_2.0-4c1d95?style=for-the-badge"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-312e81?style=for-the-badge&logo=python&logoColor=white">
   <img alt="Platform: Windows, macOS, Linux" src="https://img.shields.io/badge/platform-Windows_|_macOS_|_Linux-1e1b4b?style=for-the-badge">
-  <img alt="Version 0.2.0" src="https://img.shields.io/badge/version-0.2.0-6d28d9?style=for-the-badge">
+  <img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-6d28d9?style=for-the-badge">
 </p>
 
 [**Install**](#-install-2-minutes) · [**Daily use**](#-daily-use) · [**Docs**](docs/REFERENCE.md) · [**Architecture**](docs/ARCHITECTURE.md)
@@ -245,6 +245,9 @@ volume are absent.
 
 - [docs/REFERENCE.md](docs/REFERENCE.md) — full feature reference, configuration, embedder options
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the design: why raw evidence is sacred, how promotion works, the threat model, and what's deliberately not built yet
+- [docs/PRODUCTION_ROLLOUT.md](docs/PRODUCTION_ROLLOUT.md) — hardened Linux and Hermes rollout, verification, and rollback
+- [docs/CANARY_SCORECARD.md](docs/CANARY_SCORECARD.md) — the required 14-day, 200-turn production gate
+- [CHANGELOG.md](CHANGELOG.md) — release history
 
 ---
 

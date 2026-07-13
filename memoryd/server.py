@@ -198,7 +198,7 @@ def _capture_worker() -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "memoryd/0.1"
+    server_version = "memoryd/0.3.0"
 
     def _json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode()
