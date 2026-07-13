@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import subprocess
+import sys
+import threading
 import traceback
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -15,6 +18,24 @@ from memoryd.hermes_compat import HermesTarget
 
 
 SECRET = "CHILD-CONFIG-SECRET-SENTINEL"
+
+
+def _move_job_under_plugin_lock(
+    lock_path: str, source: str, destination: str, locked, release,
+) -> None:
+    import fcntl
+
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked.set()
+        if not release.wait(5):
+            return
+        os.replace(source, destination)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _write_provider(home: Path, provider: str | None) -> None:
@@ -223,6 +244,40 @@ def test_capture_probe_failures_are_sanitized(
     assert boundary.events[-1] == failure_event
 
 
+@pytest.mark.parametrize(
+    "provider_yaml",
+    [
+        f"\n    secret: {SECRET}",
+        f"\n    - {SECRET}",
+        f' "Unsafe Provider {SECRET}"',
+    ],
+)
+def test_real_provider_child_rejects_unsafe_value_without_emitting_it(
+    tmp_path, provider_yaml,
+):
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        f"memory:\n  provider:{provider_yaml}\n", encoding="utf-8"
+    )
+    environment = dict(os.environ)
+    environment["HERMES_HOME"] = os.fspath(home)
+
+    result = subprocess.run(
+        [sys.executable, "-c", hermes._PROVIDER_PROBE],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert SECRET not in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("gateway_running", [False, True])
 def test_activation_succeeds_with_exact_check_order_and_original_gateway_state(
     monkeypatch, tmp_path, gateway_running,
@@ -337,6 +392,94 @@ def test_activation_treats_broken_spool_state_symlink_as_unreadable(
 
     assert state.is_symlink()
     assert _read_provider(target.home) == "legacy"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink safety")
+def test_spool_snapshot_rejects_symlinked_spool_ancestor(tmp_path):
+    target = _target(tmp_path, "legacy")
+    outside = tmp_path / "outside-spool"
+    for name in ("incoming", "processing", "dead-letter"):
+        (outside / "memoryd" / name).mkdir(parents=True, exist_ok=True)
+    (target.home / "spool").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(hermes.HermesInstallError, match="spool"):
+        hermes._pending_spool_jobs(target)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink safety")
+def test_spool_snapshot_rejects_symlinked_lock(tmp_path):
+    target = _target(tmp_path, "legacy")
+    root = _spool_root(target)
+    outside = tmp_path / "outside-lock"
+    outside.write_text("operator evidence", encoding="utf-8")
+    (root / "spool.lock").symlink_to(outside)
+
+    with pytest.raises(hermes.HermesInstallError, match="spool"):
+        hermes._pending_spool_jobs(target)
+
+    assert outside.read_text(encoding="utf-8") == "operator evidence"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory permissions")
+def test_spool_snapshot_rejects_unreadable_state_directory(tmp_path):
+    target = _target(tmp_path, "legacy")
+    incoming = _spool_root(target) / "incoming"
+    incoming.chmod(0)
+    try:
+        with pytest.raises(hermes.HermesInstallError, match="spool"):
+            hermes._pending_spool_jobs(target)
+    finally:
+        incoming.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory locks")
+def test_spool_snapshot_waits_for_plugin_lock_and_observes_atomic_move(tmp_path):
+    target = _target(tmp_path, "legacy")
+    root = _spool_root(target)
+    source = root / "processing" / "000-job.json"
+    destination = root / "incoming" / source.name
+    source.write_text("{}", encoding="utf-8")
+    context = multiprocessing.get_context("fork")
+    locked = context.Event()
+    release = context.Event()
+    mover = context.Process(
+        target=_move_job_under_plugin_lock,
+        args=(
+            os.fspath(root / "spool.lock"),
+            os.fspath(source),
+            os.fspath(destination),
+            locked,
+            release,
+        ),
+    )
+    mover.start()
+    assert locked.wait(5)
+    results: list[int] = []
+    failures: list[BaseException] = []
+    finished = threading.Event()
+
+    def inspect() -> None:
+        try:
+            results.append(hermes._pending_spool_jobs(target))
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            finished.set()
+
+    reader = threading.Thread(target=inspect, daemon=True)
+    reader.start()
+    finished_while_move_locked = finished.wait(0.5)
+    release.set()
+    mover.join(5)
+    reader.join(5)
+
+    assert not finished_while_move_locked
+    assert mover.exitcode == 0
+    assert not reader.is_alive()
+    assert failures == []
+    assert results == [1]
+    assert destination.exists()
+    assert not source.exists()
 
 
 class FakeClock:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import json
 import math
@@ -43,15 +44,18 @@ class ProviderCredentials:
 _KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
 _VALIDATION_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *_KEY_NAMES)
 _INSTALL_ENV = ("HERMES_HOME", *_KEY_NAMES, "MEMORYD_LLM", "MEMORYD_EMBED")
-_PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_PROVIDER_PATTERN = r"[a-z0-9][a-z0-9_-]{0,63}"
+_PROVIDER_NAME = re.compile(_PROVIDER_PATTERN)
 _PLUGIN_URL = "http://127.0.0.1:7437"
 _SPOOL_DRAIN_TIMEOUT = 15.0
 _SPOOL_POLL_INTERVAL = 0.1
 _PROVIDER_PROBE = """\
 import json
 import os
+import re
 from pathlib import Path
 import yaml
+provider_pattern = %r
 try:
     loaded = yaml.safe_load(
         (Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text(
@@ -65,10 +69,17 @@ try:
     memory = {} if loaded_memory is None else loaded_memory
     if not isinstance(memory, dict):
         raise ValueError
-    print(json.dumps(memory.get("provider")))
+    provider = memory.get("provider")
+    if provider is not None and (
+        type(provider) is not str
+        or re.fullmatch(provider_pattern, provider) is None
+    ):
+        raise ValueError
+    encoded = json.dumps(provider)
 except BaseException:
     raise SystemExit(2)
-"""
+print(encoded)
+""" % _PROVIDER_PATTERN
 _GATEWAY_PROBE = """\
 try:
     from hermes_cli.gateway import get_gateway_runtime_snapshot
@@ -168,24 +179,158 @@ def _verify_plugin_config(target: HermesTarget) -> None:
         raise HermesInstallError("The Hermes plugin config is invalid.")
 
 
-def _safe_json_file_count(directory: Path) -> int:
+def _optional_path_stat(path: Path, *, directory: bool) -> os.stat_result | None:
     try:
-        if not os.path.lexists(directory):
-            return 0
-        directory_stat = directory.lstat()
-        if directory.is_symlink() or not stat.S_ISDIR(directory_stat.st_mode):
-            raise OSError
-        paths = list(directory.glob("*.json"))
-        for path in paths:
-            path_stat = path.lstat()
-            if path.is_symlink() or not stat.S_ISREG(path_stat.st_mode):
-                raise OSError
-        return len(paths)
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise HermesInstallError("The Hermes durable spool is unreadable.") from None
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(path_stat.st_mode):
+        raise HermesInstallError("The Hermes durable spool has unsafe topology.")
+    return path_stat
+
+
+def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _canonical_spool_home(target: HermesTarget) -> tuple[Path, os.stat_result]:
+    home = Path(target.home)
+    try:
+        canonical = home.resolve(strict=True)
     except (OSError, RuntimeError):
         raise HermesInstallError("The Hermes durable spool is unreadable.") from None
+    if canonical != home:
+        raise HermesInstallError("The Hermes durable spool has unsafe topology.")
+    home_stat = _optional_path_stat(home, directory=True)
+    if home_stat is None:
+        raise HermesInstallError("The Hermes durable spool is unreadable.")
+    return home, home_stat
 
 
-def _read_safe_json(path: Path) -> object:
+def _require_same_directory(path: Path, expected: os.stat_result) -> None:
+    current = _optional_path_stat(path, directory=True)
+    if current is None or not _same_file(current, expected):
+        raise HermesInstallError("The Hermes durable spool has unsafe topology.")
+
+
+def _validate_lock_stat(lock_stat: os.stat_result) -> None:
+    if stat.S_IMODE(lock_stat.st_mode) != 0o600:
+        raise HermesInstallError("The Hermes durable spool lock is not owner-only.")
+    if hasattr(os, "geteuid") and lock_stat.st_uid != os.geteuid():
+        raise HermesInstallError("The Hermes durable spool lock has the wrong owner.")
+
+
+def _open_spool_lock(lock_path: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    for _attempt in range(3):
+        existing = _optional_path_stat(lock_path, directory=False)
+        if existing is not None:
+            _validate_lock_stat(existing)
+        created = False
+        try:
+            if existing is None:
+                descriptor = os.open(
+                    lock_path,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow,
+                    0o600,
+                )
+                created = True
+            else:
+                descriptor = os.open(lock_path, os.O_RDWR | nofollow)
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise HermesInstallError("The Hermes durable spool lock is unreadable.") from None
+        try:
+            if created:
+                os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise HermesInstallError("The Hermes durable spool lock is unsafe.")
+            _validate_lock_stat(opened)
+            current = _optional_path_stat(lock_path, directory=False)
+            if current is None or not _same_file(opened, current):
+                raise HermesInstallError("The Hermes durable spool lock changed.")
+            if existing is not None and not _same_file(existing, opened):
+                raise HermesInstallError("The Hermes durable spool lock changed.")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    raise HermesInstallError("The Hermes durable spool lock changed.")
+
+
+@contextlib.contextmanager
+def _locked_spool(lock_path: Path):
+    import fcntl
+
+    descriptor = _open_spool_lock(lock_path)
+    locked = False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        opened = os.fstat(descriptor)
+        current = _optional_path_stat(lock_path, directory=False)
+        if current is None or not _same_file(opened, current):
+            raise HermesInstallError("The Hermes durable spool lock changed.")
+        yield
+    except OSError:
+        raise HermesInstallError("The Hermes durable spool lock failed.") from None
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _json_file_count(directory: Path) -> int:
+    expected = _optional_path_stat(directory, directory=True)
+    if expected is None:
+        return 0
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file(expected, opened):
+            raise HermesInstallError("The Hermes durable spool directory changed.")
+        count = 0
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json"):
+                    continue
+                try:
+                    entry_stat = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(entry_stat.st_mode):
+                    raise HermesInstallError(
+                        "The Hermes durable spool has unsafe evidence."
+                    )
+                count += 1
+        return count
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        raise HermesInstallError("The Hermes durable spool is unreadable.") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_safe_json(
+    path: Path, *, expected: os.stat_result | None = None,
+) -> object:
     descriptor = -1
     try:
         descriptor = os.open(
@@ -196,6 +341,8 @@ def _read_safe_json(path: Path) -> object:
         )
         opened_stat = os.fstat(descriptor)
         if not stat.S_ISREG(opened_stat.st_mode):
+            raise OSError
+        if expected is not None and not _same_file(expected, opened_stat):
             raise OSError
         stream = os.fdopen(descriptor, "r", encoding="utf-8")
         descriptor = -1
@@ -209,36 +356,49 @@ def _read_safe_json(path: Path) -> object:
 
 
 def _pending_spool_jobs(target: HermesTarget) -> int:
-    root = target.home / "spool" / "memoryd"
     try:
-        if os.path.lexists(root):
-            root_stat = root.lstat()
-            if root.is_symlink() or not stat.S_ISDIR(root_stat.st_mode):
-                raise OSError
-    except (OSError, RuntimeError):
+        home, home_stat = _canonical_spool_home(target)
+        spool = home / "spool"
+        spool_stat = _optional_path_stat(spool, directory=True)
+        if spool_stat is None:
+            return 0
+        root = spool / "memoryd"
+        root_stat = _optional_path_stat(root, directory=True)
+        if root_stat is None:
+            return 0
+        lock_path = root / "spool.lock"
+        with _locked_spool(lock_path):
+            _require_same_directory(home, home_stat)
+            _require_same_directory(spool, spool_stat)
+            _require_same_directory(root, root_stat)
+            incoming = _json_file_count(root / "incoming")
+            processing = _json_file_count(root / "processing")
+            dead_letters = _json_file_count(root / "dead-letter")
+            if dead_letters:
+                raise HermesInstallError("The Hermes durable spool has dead letters.")
+
+            state_path = root / "state.json"
+            state_stat = _optional_path_stat(state_path, directory=False)
+            if state_stat is not None:
+                state = _read_safe_json(state_path, expected=state_stat)
+                if not isinstance(state, dict):
+                    raise HermesInstallError(
+                        "The Hermes durable spool state is unreadable."
+                    )
+                fault = state.get("durability_fault")
+                if fault not in (None, ""):
+                    if type(fault) is not str:
+                        raise HermesInstallError(
+                            "The Hermes durable spool state is unreadable."
+                        )
+                    raise HermesInstallError(
+                        "The Hermes durable spool has a durability fault."
+                    )
+            return incoming + processing
+    except HermesInstallError:
+        raise
+    except (OSError, RuntimeError, UnicodeError, ValueError, RecursionError):
         raise HermesInstallError("The Hermes durable spool is unreadable.") from None
-
-    incoming = _safe_json_file_count(root / "incoming")
-    processing = _safe_json_file_count(root / "processing")
-    dead_letters = _safe_json_file_count(root / "dead-letter")
-    if dead_letters:
-        raise HermesInstallError("The Hermes durable spool has dead letters.")
-
-    state_path = root / "state.json"
-    try:
-        state_exists = os.path.lexists(state_path)
-    except OSError:
-        raise HermesInstallError("The Hermes durable spool state is unreadable.") from None
-    if state_exists:
-        state = _read_safe_json(state_path)
-        if not isinstance(state, dict):
-            raise HermesInstallError("The Hermes durable spool state is unreadable.")
-        fault = state.get("durability_fault")
-        if fault not in (None, ""):
-            if type(fault) is not str:
-                raise HermesInstallError("The Hermes durable spool state is unreadable.")
-            raise HermesInstallError("The Hermes durable spool has a durability fault.")
-    return incoming + processing
 
 
 def _wait_for_spool_drain(
