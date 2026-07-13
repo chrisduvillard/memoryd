@@ -1359,6 +1359,7 @@ def publish_guided_plugin(target: HermesTarget) -> None:
         stage_fd = -1
         config_payload = b""
         committed = False
+        prior_signal_mask: set[signal.Signals] | None = None
         try:
             try:
                 os.mkdir(plugin_stage, 0o700, dir_fd=plugins_fd)
@@ -1377,6 +1378,13 @@ def publish_guided_plugin(target: HermesTarget) -> None:
                 _require_config_entry(home_fd, config_stage, config_payload)
                 _require_root_still_open(target.home, home_fd)
                 _require_directory_entry(home_fd, "plugins", plugins_fd)
+
+                # Once the first visible name can move, kernel-defer SIGINT and
+                # SIGTERM until the pair is either committed/cleaned or exactly
+                # rolled back. Direct BaseExceptions are still handled below.
+                prior_signal_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM},
+                )
 
                 if old_plugin_stat is not None:
                     os.replace(
@@ -1528,10 +1536,10 @@ def publish_guided_plugin(target: HermesTarget) -> None:
             if deferred is not None:
                 raise deferred
         finally:
-            # ExitStack owns every held fd. No path-based cleanup occurs here: an
-            # interrupted transaction either completed fd-relative cleanup or
-            # deliberately retained its random, private evidence names.
-            pass
+            # Restoring the exact prior mask may deliver a pending signal here,
+            # after the visible pair and both cleanup/fsync paths are coherent.
+            if prior_signal_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, prior_signal_mask)
 
 
 def install_hermes_core(

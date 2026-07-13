@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import builtins
 import getpass
+import inspect
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -1125,6 +1127,70 @@ def test_guided_plugin_postcommit_final_fsync_interrupt_keeps_coherent_new_pair(
     assert json.loads((target.home / "memoryd.json").read_text(encoding="utf-8")) == {
         "url": "http://127.0.0.1:7437",
     }
+
+
+def _real_sigint_publication_child(root: str) -> None:
+    tmp_path = Path(root)
+    target = _hermes_target(tmp_path)
+    source = _plugin_source(tmp_path, "one")
+    original_resource_dir = cli._resource_dir
+    cli._resource_dir = lambda _name: source
+    hermes.publish_guided_plugin(target)
+    (source / "__init__.py").write_text("VERSION = 'two'\n", encoding="utf-8")
+    lines, start_line = inspect.getsourcelines(hermes.publish_guided_plugin)
+    cleanup_line = start_line + next(
+        index for index, line in enumerate(lines)
+        if "_unlink_config_at(home_fd, config_rollback)" in line
+    )
+    sent = False
+
+    def trace(frame, event, _argument):
+        nonlocal sent
+        if (
+            not sent
+            and event == "line"
+            and frame.f_code is hermes.publish_guided_plugin.__code__
+            and frame.f_lineno == cleanup_line
+        ):
+            sent = True
+            os.kill(os.getpid(), signal.SIGINT)
+        return trace
+
+    sys.settrace(trace)
+    try:
+        hermes.publish_guided_plugin(target)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("pending SIGINT was not delivered after cleanup")
+    finally:
+        sys.settrace(None)
+        cli._resource_dir = original_resource_dir
+
+    assert sent
+    assert _file_manifest(target.home / "plugins" / "memoryd") == _file_manifest(source)
+    assert json.loads((target.home / "memoryd.json").read_text(encoding="utf-8")) == {
+        "url": "http://127.0.0.1:7437",
+    }
+    assert not list((target.home / "plugins").glob(".memoryd-*-*"))
+    assert not list(target.home.glob(".memoryd-config-*-*"))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fd publication is POSIX-only")
+def test_guided_plugin_real_sigint_during_postcommit_cleanup_is_deferred(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy; ns=runpy.run_path(" + repr(str(Path(__file__)))
+            + "); ns['_real_sigint_publication_child'](" + repr(str(tmp_path)) + ")",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fd publication is POSIX-only")
