@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import io
 import json
 import multiprocessing
 import os
@@ -805,7 +806,7 @@ def _guided_outcome() -> tuple[int | None, BaseException | None]:
 
 
 def test_signal_during_post_activation_report_rolls_back_provider_and_gateway(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, capsys,
 ):
     target = _target(tmp_path, "legacy")
     _spool_root(target)
@@ -819,7 +820,7 @@ def test_signal_during_post_activation_report_rolls_back_provider_and_gateway(
 
     def interrupt_success_report(*args, **kwargs):
         nonlocal delivered
-        if not delivered and kwargs.get("file") is None:
+        if not delivered and isinstance(kwargs.get("file"), io.StringIO):
             delivered = True
             signals.deliver(signal.SIGTERM)
         return real_print(*args, **kwargs)
@@ -835,10 +836,13 @@ def test_signal_during_post_activation_report_rolls_back_provider_and_gateway(
     assert boundary.gateway_running is True
     assert artifact.read_bytes() == b"preserved installation evidence"
     assert signals.current == signals.previous
+    output = capsys.readouterr()
+    assert "Authoritative Hermes profile" not in output.out
+    assert "14-day/200-turn canary" not in output.out
 
 
 def test_signal_during_failure_reporting_cannot_escape_or_leak_handlers(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, capsys,
 ):
     target = _target(tmp_path, "legacy")
     boundary = _install_boundary(
@@ -872,11 +876,14 @@ def test_signal_during_failure_reporting_cannot_escape_or_leak_handlers(
     assert boundary.gateway_running is True
     assert artifact.read_bytes() == b"preserved installation evidence"
     assert signals.current == signals.previous
+    output = capsys.readouterr()
+    assert "Authoritative Hermes profile" not in output.out
+    assert "14-day/200-turn canary" not in output.out
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
 def test_signal_during_each_handler_restore_rolls_back_and_restores_both(
-    monkeypatch, tmp_path, signum,
+    monkeypatch, tmp_path, capsys, signum,
 ):
     target = _target(tmp_path, "legacy")
     _spool_root(target)
@@ -896,3 +903,41 @@ def test_signal_during_each_handler_restore_rolls_back_and_restores_both(
     assert boundary.gateway_running is True
     assert artifact.read_bytes() == b"preserved installation evidence"
     assert signals.current == signals.previous
+    output = capsys.readouterr()
+    assert "Authoritative Hermes profile" not in output.out
+    assert "14-day/200-turn canary" not in output.out
+
+
+def test_failure_report_oserror_preserves_result_and_always_restores_handlers(
+    monkeypatch, tmp_path, capsys,
+):
+    target = _target(tmp_path, "legacy")
+    boundary = _install_boundary(
+        monkeypatch,
+        target,
+        gateway_running=True,
+        failures={"hermes memory status": [7]},
+    )
+    artifact = tmp_path / "memory" / "initial.snapshot"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"preserved installation evidence")
+    signals = _prepare_guided_activation(monkeypatch, target, artifact)
+    real_print = builtins.print
+
+    def fail_stderr_report(*args, **kwargs):
+        if kwargs.get("file") is sys.stderr:
+            raise OSError(SECRET)
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", fail_stderr_report)
+
+    result, escaped = _guided_outcome()
+
+    assert escaped is None
+    assert result == 1
+    assert _read_provider(target.home) == "legacy"
+    assert boundary.gateway_running is True
+    assert artifact.read_bytes() == b"preserved installation evidence"
+    assert signals.current == signals.previous
+    output = capsys.readouterr()
+    assert SECRET not in output.out + output.err

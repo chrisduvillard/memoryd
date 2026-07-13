@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import getpass
+import io
 import json
 import math
 import os
@@ -944,11 +945,13 @@ def guided_hermes_install() -> int:
         )
         for secret in (credentials.openrouter_key, credentials.voyage_key):
             report = report.replace(secret, "<redacted>")
+        report_buffer = io.StringIO()
         with _activation_transaction(target):
-            print(report)
+            print(report, file=report_buffer)
             restore_handlers()
             if interrupted_signal is not None:
                 raise KeyboardInterrupt
+        print(report_buffer.getvalue(), end="")
     except KeyboardInterrupt:
         signal_can_interrupt = False
         if interrupted_signal is None:
@@ -965,15 +968,20 @@ def guided_hermes_install() -> int:
     finally:
         signal_can_interrupt = False
         if installed_handlers:
-            if interrupted_signal is not None:
-                report_interruption(interrupted_signal)
-                interruption_reported = True
-            elif failure_message is not None:
-                print(
-                    f"Hermes guided installation failed: {failure_message}",
-                    file=sys.stderr,
-                )
-            restore_handlers()
+            try:
+                try:
+                    if interrupted_signal is not None:
+                        report_interruption(interrupted_signal)
+                        interruption_reported = True
+                    elif failure_message is not None:
+                        print(
+                            f"Hermes guided installation failed: {failure_message}",
+                            file=sys.stderr,
+                        )
+                except OSError:
+                    pass
+            finally:
+                restore_handlers()
 
     if interrupted_signal is not None:
         if not interruption_reported:
