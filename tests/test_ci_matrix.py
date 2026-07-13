@@ -102,7 +102,14 @@ def test_structured_source_and_installed_suites_are_separate() -> None:
     steps = _named_steps(job)
     source = steps["Run checkout unit and fault-injection suites"]["run"]
     installed = steps["Run installed-wheel DB-backed regression matrix"]["run"]
-    assert "python -m pytest -q tests" in source
+    assert 'VENV_PYTHON="$RUNNER_TEMP/venv-test/bin/python"' in source
+    invocations = [
+        line.strip() for line in source.splitlines()
+        if line.strip().startswith(('python ', '"$VENV_PYTHON" '))
+    ]
+    assert len(invocations) == 6
+    assert all(line.startswith('"$VENV_PYTHON" ') for line in invocations)
+    assert '"$VENV_PYTHON" -m pytest -q tests' in source
     assert "test_durable_capture.py" in source
     assert "$INSTALLED_HARNESS" not in source
     assert "$INSTALLED_HARNESS" in installed
@@ -127,8 +134,8 @@ def test_blocking_matrix_exercises_every_required_suite() -> None:
     job = _job(workflow, "test")
 
     required = {
-        "python -m compileall",
-        "python -m pytest -q tests",
+        '"$VENV_PYTHON" -m compileall',
+        '"$VENV_PYTHON" -m pytest -q tests',
         "scripts/test_durable_capture.py",
         "scripts/test_hermes_spool.py",
         "scripts/test_bitter_lesson.py",

@@ -206,12 +206,13 @@ jobs:
 
       - name: Run checkout unit and fault-injection suites
         run: |
-          python -m compileall -q memoryd hermes_plugin scripts tests
-          python -m pytest -q tests
-          python scripts/test_durable_capture.py
-          python scripts/test_hermes_spool.py
-          python scripts/test_bitter_lesson.py
-          python scripts/test_hermes_contract.py
+          VENV_PYTHON="$RUNNER_TEMP/venv-test/bin/python"
+          "$VENV_PYTHON" -m compileall -q memoryd hermes_plugin scripts tests
+          "$VENV_PYTHON" -m pytest -q tests
+          "$VENV_PYTHON" scripts/test_durable_capture.py
+          "$VENV_PYTHON" scripts/test_hermes_spool.py
+          "$VENV_PYTHON" scripts/test_bitter_lesson.py
+          "$VENV_PYTHON" scripts/test_hermes_contract.py
 
       - name: Stage installed-artifact harnesses outside checkout
         run: |
