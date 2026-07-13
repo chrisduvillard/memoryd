@@ -41,6 +41,8 @@ class ParameterContract(NamedTuple):
 class MethodContract(NamedTuple):
     parameters: tuple[ParameterContract, ...]
     abstract: bool
+    asynchronous: bool
+    descriptor: str
 
 
 def _clean_import_modules() -> None:
@@ -115,14 +117,27 @@ def _ast_parameters(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[Param
     return tuple(parameters)
 
 
+def _decorator_name(decorator: ast.expr) -> str | None:
+    if isinstance(decorator, ast.Name):
+        return decorator.id
+    if isinstance(decorator, ast.Attribute):
+        return decorator.attr
+    return None
+
+
 def _is_abstract(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    for decorator in node.decorator_list:
-        name = decorator.id if isinstance(decorator, ast.Name) else None
-        if isinstance(decorator, ast.Attribute):
-            name = decorator.attr
-        if name == "abstractmethod":
-            return True
-    return False
+    return any(
+        _decorator_name(decorator) == "abstractmethod"
+        for decorator in node.decorator_list
+    )
+
+
+def _ast_descriptor(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    decorators = {_decorator_name(item) for item in node.decorator_list}
+    for descriptor in ("property", "staticmethod", "classmethod"):
+        if descriptor in decorators:
+            return descriptor
+    return "instance method"
 
 
 def _parse_contract(path: Path) -> dict[str, MethodContract]:
@@ -143,13 +158,26 @@ def _parse_contract(path: Path) -> dict[str, MethodContract]:
             continue
         if node.name.startswith("_"):
             continue
-        contract[node.name] = MethodContract(_ast_parameters(node), _is_abstract(node))
+        contract[node.name] = MethodContract(
+            _ast_parameters(node),
+            _is_abstract(node),
+            isinstance(node, ast.AsyncFunctionDef),
+            _ast_descriptor(node),
+        )
     return contract
 
 
-def _runtime_parameters(member: Any) -> tuple[ParameterContract, ...] | None:
+def _runtime_method(member: Any) -> MethodContract | None:
+    descriptor = "instance method"
     if isinstance(member, property):
+        descriptor = "property"
         member = member.fget
+    elif isinstance(member, staticmethod):
+        descriptor = "staticmethod"
+        member = member.__func__
+    elif isinstance(member, classmethod):
+        descriptor = "classmethod"
+        member = member.__func__
     if not callable(member):
         return None
     parameters: list[ParameterContract] = []
@@ -162,7 +190,12 @@ def _runtime_parameters(member: Any) -> tuple[ParameterContract, ...] | None:
         parameters.append(
             ParameterContract(parameter.name, parameter.kind.name, default)
         )
-    return tuple(parameters)
+    return MethodContract(
+        tuple(parameters),
+        bool(getattr(member, "__isabstractmethod__", False)),
+        inspect.iscoroutinefunction(member),
+        descriptor,
+    )
 
 
 def _format_parameters(parameters: tuple[ParameterContract, ...]) -> str:
@@ -183,6 +216,18 @@ def _compare_contracts(
                 f"contract signature changed for {name}: pinned "
                 f"{_format_parameters(pinned_method.parameters)}; checked "
                 f"{_format_parameters(checked_method.parameters)}"
+            )
+        if checked_method.asynchronous != pinned_method.asynchronous:
+            errors.append(
+                f"contract async/sync changed for {name}: "
+                f"pinned async={pinned_method.asynchronous}, "
+                f"checked async={checked_method.asynchronous}"
+            )
+        if checked_method.descriptor != pinned_method.descriptor:
+            errors.append(
+                f"contract descriptor changed for {name}: "
+                f"pinned={pinned_method.descriptor}, "
+                f"checked={checked_method.descriptor}"
             )
         if checked_method.abstract != pinned_method.abstract:
             errors.append(
@@ -245,17 +290,31 @@ def _validate_plugin(
         errors.append(f"MemorydProvider is not instantiable: {exc}")
         return errors
     for name, checked_method in checked.items():
-        override = vars(provider_class).get(name)
-        if override is None:
+        if name not in vars(provider_class):
             if checked_method.abstract:
                 errors.append(f"MemorydProvider does not override abstract method {name}")
             continue
-        actual = _runtime_parameters(override)
-        if actual != checked_method.parameters:
+        override = inspect.getattr_static(provider_class, name)
+        actual = _runtime_method(override)
+        if actual is None:
+            errors.append(f"MemorydProvider override {name} is not callable")
+            continue
+        if actual.descriptor != checked_method.descriptor:
+            errors.append(
+                f"MemorydProvider descriptor mismatch for {name}: contract "
+                f"{checked_method.descriptor}; plugin {actual.descriptor}"
+            )
+        if actual.asynchronous != checked_method.asynchronous:
+            errors.append(
+                f"MemorydProvider async/sync mismatch for {name}: contract "
+                f"async={checked_method.asynchronous}; plugin "
+                f"async={actual.asynchronous}"
+            )
+        if actual.parameters != checked_method.parameters:
             errors.append(
                 f"MemorydProvider signature mismatch for {name}: contract "
                 f"{_format_parameters(checked_method.parameters)}; plugin "
-                f"{_format_parameters(actual or ())}"
+                f"{_format_parameters(actual.parameters)}"
             )
     if not isinstance(provider.name, str) or not provider.name:
         errors.append("MemorydProvider.name must be a non-empty string")

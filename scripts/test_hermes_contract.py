@@ -48,6 +48,22 @@ class _ContractMutation(ast.NodeTransformer):
                 for parameter in method.args.args
                 if parameter.arg != "metadata"
             ]
+        elif self.action == "remove-property":
+            method = next(
+                item for item in node.body
+                if isinstance(item, ast.FunctionDef) and item.name == self.method
+            )
+            method.decorator_list = [
+                decorator
+                for decorator in method.decorator_list
+                if not isinstance(decorator, ast.Name) or decorator.id != "property"
+            ]
+        elif self.action in {"add-staticmethod", "add-classmethod"}:
+            method = next(
+                item for item in node.body
+                if isinstance(item, ast.FunctionDef) and item.name == self.method
+            )
+            method.decorator_list.insert(0, ast.Name(id=self.action.removeprefix("add-")))
         elif self.action == "add-abstract":
             extra = ast.parse(
                 "class Added:\n"
@@ -70,6 +86,26 @@ def _mutate(
     source: str, method: str, action: str, class_name: str = "MemoryProvider"
 ) -> str:
     tree = _ContractMutation(method, action, class_name).visit(ast.parse(source))
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
+
+
+def _make_async(source: str, method: str, class_name: str) -> str:
+    tree = ast.parse(source)
+    target = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    for index, node in enumerate(target.body):
+        if isinstance(node, ast.FunctionDef) and node.name == method:
+            replacement = ast.AsyncFunctionDef(
+                **{field: getattr(node, field) for field in node._fields}
+            )
+            target.body[index] = ast.copy_location(replacement, node)
+            break
+    else:
+        raise AssertionError(f"missing {class_name}.{method}")
     ast.fix_missing_locations(tree)
     return ast.unparse(tree) + "\n"
 
@@ -140,6 +176,34 @@ class HermesContractCheckerTests(unittest.TestCase):
         self._write_contract(_mutate(self.pinned_source, "", "add-concrete"))
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_candidate_async_change_is_incompatible(self) -> None:
+        self._write_contract(
+            _make_async(self.pinned_source, "prefetch", "MemoryProvider")
+        )
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("prefetch", result.stdout + result.stderr)
+        self.assertIn("async", (result.stdout + result.stderr).lower())
+
+    def test_candidate_abstract_property_removed_is_incompatible(self) -> None:
+        self._write_contract(
+            _mutate(self.pinned_source, "name", "remove-property")
+        )
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("name", result.stdout + result.stderr)
+        self.assertIn("descriptor", (result.stdout + result.stderr).lower())
+
+    def test_candidate_static_and_class_descriptor_changes_are_incompatible(self) -> None:
+        for descriptor in ("staticmethod", "classmethod"):
+            with self.subTest(descriptor=descriptor):
+                self._write_contract(
+                    _mutate(self.pinned_source, "prefetch", f"add-{descriptor}")
+                )
+                result = self._run()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("descriptor", (result.stdout + result.stderr).lower())
 
     def test_annotation_spelling_changes_are_compatible(self) -> None:
         self._write_contract(
@@ -214,6 +278,83 @@ class HermesContractCheckerTests(unittest.TestCase):
             any("on_memory_write" in error and "signature" in error for error in errors),
             errors,
         )
+
+    def test_plugin_async_override_mismatch_is_incompatible(self) -> None:
+        self._write_contract(self.pinned_source)
+        plugin_dir = Path(self.tmp.name) / "async_plugin"
+        plugin_dir.mkdir()
+        plugin_path = plugin_dir / "__init__.py"
+        (plugin_dir / "spool.py").write_text(
+            PLUGIN.with_name("spool.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        plugin_path.write_text(
+            _make_async(
+                PLUGIN.read_text(encoding="utf-8"),
+                "prefetch",
+                "MemorydProvider",
+            ),
+            encoding="utf-8",
+        )
+        checker = self._load_checker()
+        errors = checker.check_contract(self.root, plugin_path=plugin_path)
+        self.assertTrue(
+            any("prefetch" in error and "async" in error for error in errors), errors
+        )
+
+    def test_plugin_property_override_mismatch_is_incompatible(self) -> None:
+        self._write_contract(self.pinned_source)
+        plugin_dir = Path(self.tmp.name) / "property_plugin"
+        plugin_dir.mkdir()
+        plugin_path = plugin_dir / "__init__.py"
+        (plugin_dir / "spool.py").write_text(
+            PLUGIN.with_name("spool.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        plugin_path.write_text(
+            _mutate(
+                PLUGIN.read_text(encoding="utf-8"),
+                "name",
+                "remove-property",
+                "MemorydProvider",
+            ),
+            encoding="utf-8",
+        )
+        checker = self._load_checker()
+        errors = checker.check_contract(self.root, plugin_path=plugin_path)
+        self.assertTrue(
+            any("name" in error and "descriptor" in error for error in errors), errors
+        )
+
+    def test_plugin_static_and_class_override_mismatches_are_incompatible(self) -> None:
+        self._write_contract(self.pinned_source)
+        checker = self._load_checker()
+        for descriptor in ("staticmethod", "classmethod"):
+            with self.subTest(descriptor=descriptor):
+                plugin_dir = Path(self.tmp.name) / f"{descriptor}_plugin"
+                plugin_dir.mkdir()
+                plugin_path = plugin_dir / "__init__.py"
+                (plugin_dir / "spool.py").write_text(
+                    PLUGIN.with_name("spool.py").read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                plugin_path.write_text(
+                    _mutate(
+                        PLUGIN.read_text(encoding="utf-8"),
+                        "prefetch",
+                        f"add-{descriptor}",
+                        "MemorydProvider",
+                    ),
+                    encoding="utf-8",
+                )
+                errors = checker.check_contract(self.root, plugin_path=plugin_path)
+                self.assertTrue(
+                    any(
+                        "prefetch" in error and "descriptor" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
 
     def test_synthetic_modules_are_cleaned_after_success_and_failure(self) -> None:
         self._write_contract(self.pinned_source)
