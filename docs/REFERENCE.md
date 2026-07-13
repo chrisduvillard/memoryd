@@ -41,12 +41,14 @@ adoptable without data deletion. Fresh credentials are atomically persisted to
 owner-only `~/memory/.managed-postgres.json` before Docker creation so a crash
 before migration/config publication remains recoverable. This secret record is
 not part of a backup snapshot. If the container is absent but the named volume
-remains, its recorded credential is reused; without a record, only the legacy
-`memoryd` credential is attempted and is persisted only after readiness proves
-it. Docker receives these values through a short-lived owner-only env file, not
-argv. A failed or timed-out Docker command deletes a newly generated record
-only after follow-up inspection proves that both container and volume are
-absent.
+remains, its recorded credential is reused. Without a record, a read-only,
+networkless ephemeral probe checks whether `PG_VERSION` is nonempty: empty data
+is treated as fresh, initialized data attempts only the legacy `memoryd`
+credential and persists it only after readiness proves it, and an inconclusive
+probe refuses without mutation. Docker receives these values through a
+short-lived owner-only env file, not argv. A failed or timed-out Docker command
+deletes a newly generated record only after follow-up inspection proves that
+both container and volume are absent.
 
 Manual path (bring your own Postgres 16 + pgvector; no Docker):
 
@@ -138,9 +140,12 @@ restore drill should finish with `MEMORYD_HOME=<target> memoryd doctor`;
 re-enter API keys separately.
 
 Local `pg_dump`/`pg_restore` calls receive connection secrets through a private,
-per-operation libpq service file and use only `service=memoryd` on argv. Docker
-fallback transfers use an unpredictable remote path per operation and remove
-only that operation's path.
+per-operation libpq service file under owner-only
+`$MEMORYD_HOME/.pg-service/` and use only `service=memoryd` on argv. Cleanup is
+fsynced and retried; a later operation safely reclaims validated residue from a
+prior interrupted cleanup. Docker fallback transfers use an unpredictable
+remote path per operation and remove only that operation's path, including
+after a partial copy failure.
 
 Backups are local-only: memoryd does not upload snapshots. Linux installs a
 02:35 persistent systemd user timer that stops `memoryd.service`, creates and

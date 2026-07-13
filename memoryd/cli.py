@@ -148,6 +148,19 @@ def _volume_definitively_absent(code: int, detail: str) -> bool:
     return code != 0 and "no such volume" in detail.lower()
 
 
+def _volume_pgdata_initialized() -> bool | None:
+    code, detail = _docker(
+        "run", "--rm", "--network", "none", "--read-only",
+        "--entrypoint", "test",
+        "-v", f"{VOLUME}:/var/lib/postgresql/data:ro", IMAGE,
+        "-s", "/var/lib/postgresql/data/PG_VERSION")
+    if code == 0:
+        return True
+    if code == 1 and not detail.strip():
+        return False
+    return None
+
+
 def _managed_credential_value(port: int, password: str) -> dict:
     return {
         "schema_version": 1,
@@ -345,7 +358,16 @@ def ensure_container() -> str:
             "container changes were made; check Docker and re-run: memoryd "
             "install")
     prior_managed = _read_managed_credentials()
-    recovering_legacy = prior_managed is None and volume_code == 0
+    recovering_legacy = False
+    if prior_managed is None and volume_code == 0:
+        initialized = _volume_pgdata_initialized()
+        if initialized is None:
+            raise SystemExit(
+                f"cannot classify PostgreSQL data in Docker volume {VOLUME}; "
+                "the probe was inconclusive. No persistent container or "
+                "credential record was created; check Docker and re-run: "
+                "memoryd install")
+        recovering_legacy = initialized
     if prior_managed is not None:
         password = prior_managed["password"]
     elif recovering_legacy:

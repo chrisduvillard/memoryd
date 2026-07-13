@@ -229,6 +229,8 @@ def test_absent_container_reuses_record_for_initialized_volume(
 
 def test_initialized_legacy_volume_is_recovered_without_random_secret(
         monkeypatch, tmp_path):
+    probe_calls: list[tuple[str, ...]] = []
+
     def docker(*args):
         if args[0] == "info":
             return 0, ""
@@ -236,6 +238,9 @@ def test_initialized_legacy_volume_is_recovered_without_random_secret(
             return 1, "Error: No such object: memoryd-pgvector"
         if args[:2] == ("volume", "inspect"):
             return 0, "initialized-volume"
+        if args[0] == "run" and "--rm" in args:
+            probe_calls.append(args)
+            return 0, ""
         return 0, "container-id"
 
     monkeypatch.setattr(cli, "_docker", docker)
@@ -251,9 +256,86 @@ def test_initialized_legacy_volume_is_recovered_without_random_secret(
     dsn = cli.ensure_container()
 
     assert f":{cli.LEGACY_PG_PASSWORD}@" in dsn
+    assert len(probe_calls) == 1
+    probe = probe_calls[0]
+    assert probe[probe.index("--entrypoint") + 1] == "test"
+    assert probe[-2:] == ("-s", "/var/lib/postgresql/data/PG_VERSION")
+    assert "sh" not in probe and "-c" not in probe
     record = json.loads(
         (tmp_path / "memory" / ".managed-postgres.json").read_text())
     assert record["password"] == cli.LEGACY_PG_PASSWORD
+
+
+def test_existing_empty_volume_is_classified_fresh_and_gets_random_secret(
+        monkeypatch, tmp_path):
+    password = "random-for-empty-volume"
+    probe_calls: list[tuple[str, ...]] = []
+    persistent_runs: list[tuple[str, ...]] = []
+
+    def docker(*args):
+        if args[0] == "info":
+            return 0, ""
+        if args[0] == "inspect":
+            return 1, "Error: No such object: memoryd-pgvector"
+        if args[:2] == ("volume", "inspect"):
+            return 0, "existing-empty-volume"
+        if args[0] == "run" and "--rm" in args:
+            probe_calls.append(args)
+            return 1, ""
+        if args[0] == "run":
+            persistent_runs.append(args)
+            return 0, "container-id"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    monkeypatch.setattr(cli, "_pg_ready", lambda dsn, _wait: password in dsn)
+    monkeypatch.setattr("secrets.token_urlsafe", lambda _size: password)
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    dsn = cli.ensure_container()
+
+    assert password in dsn
+    assert len(probe_calls) == 1
+    assert len(persistent_runs) == 1
+    record = json.loads(
+        (tmp_path / "memory" / ".managed-postgres.json").read_text())
+    assert record["password"] == password
+
+
+def test_existing_volume_probe_inconclusive_refuses_without_mutation(
+        monkeypatch, tmp_path):
+    generated: list[str] = []
+    persistent_runs: list[tuple[str, ...]] = []
+
+    def docker(*args):
+        if args[0] == "info":
+            return 0, ""
+        if args[0] == "inspect":
+            return 1, "Error: No such object: memoryd-pgvector"
+        if args[:2] == ("volume", "inspect"):
+            return 0, "existing-volume"
+        if args[0] == "run" and "--rm" in args:
+            return 125, "Docker daemon lost the probe"
+        if args[0] == "run":
+            persistent_runs.append(args)
+            return 0, "container-id"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    monkeypatch.setattr(cli, "_pg_ready", lambda _dsn, _wait: True)
+    monkeypatch.setattr(
+        "secrets.token_urlsafe",
+        lambda _size: generated.append("random") or "random")
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    with pytest.raises(SystemExit, match="cannot classify PostgreSQL data"):
+        cli.ensure_container()
+
+    assert generated == []
+    assert persistent_runs == []
+    assert not (tmp_path / "memory" / ".managed-postgres.json").exists()
 
 
 def test_initialized_unknown_volume_refuses_without_random_record(

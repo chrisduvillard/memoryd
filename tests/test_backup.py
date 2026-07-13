@@ -904,6 +904,7 @@ def test_local_pg_tools_keep_all_passwords_out_of_argv(
     monkeypatch.setattr(backup.shutil, "which", lambda name: f"/tools/{name}")
     monkeypatch.setattr(backup.subprocess, "run", run)
     monkeypatch.setenv("PGPASSWORD", "inherited-password")
+    monkeypatch.setenv("PGSSLPASSWORD", "inherited-ssl-password")
     backup._dump_database(dsn, dump)
     backup._restore_database(dump, dsn)
 
@@ -914,7 +915,8 @@ def test_local_pg_tools_keep_all_passwords_out_of_argv(
                for command, _env in commands)
     assert all(command[command.index("--dbname") + 1] == "service=memoryd"
                for command, _env in commands)
-    assert all("PGPASSWORD" not in env for _command, env in commands)
+    assert all("PGPASSWORD" not in env and "PGSSLPASSWORD" not in env
+               for _command, env in commands)
     assert all("super-secret" not in env.values() and
                "tls-secret" not in env.values()
                for _command, env in commands)
@@ -970,6 +972,150 @@ def test_restore_tool_failure_redacts_secrets_and_keeps_mock_database_empty(
     assert len(observed_service_files) == 1
     assert not observed_service_files[0].exists()
     assert not observed_service_files[0].parent.exists()
+
+
+def test_service_cleanup_retries_transient_unlink_under_private_home_root(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    dump = tmp_path / "dump"
+    observed: list[Path] = []
+    unlink_attempts = 0
+    real_unlink = Path.unlink
+
+    def run(command, **kwargs):
+        path = Path(kwargs["env"]["PGSERVICEFILE"])
+        observed.append(path)
+        dump.write_bytes(b"PGDMPservice")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    def flaky_unlink(path, *args, **kwargs):
+        nonlocal unlink_attempts
+        if path.name == "pg_service.conf" and path in observed:
+            unlink_attempts += 1
+            if unlink_attempts == 1:
+                raise PermissionError("transient scanner handle")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(backup, "_default_home", lambda: home)
+    monkeypatch.setattr(backup, "SERVICE_CLEANUP_RETRY_S", 0.05,
+                        raising=False)
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: "/tools/pg_dump")
+    monkeypatch.setattr(backup.subprocess, "run", run)
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    backup._dump_database(
+        "postgresql://operator:secret@localhost/memoryd", dump)
+
+    assert unlink_attempts >= 2
+    service_file = observed[0]
+    assert service_file.parent.parent == home / ".pg-service"
+    assert not service_file.exists()
+    assert not service_file.parent.exists()
+    assert service_file.parent.parent.is_dir()
+
+
+def test_persistent_service_residue_is_cleaned_by_next_operation(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    dump = tmp_path / "dump"
+    observed: list[Path] = []
+    blocked: set[Path] = set()
+    real_unlink = Path.unlink
+
+    def run(command, **kwargs):
+        path = Path(kwargs["env"]["PGSERVICEFILE"])
+        observed.append(path)
+        dump.write_bytes(b"PGDMPservice")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    def persistent_unlink(path, *args, **kwargs):
+        if path in blocked:
+            raise PermissionError("persistent scanner handle")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(backup, "_default_home", lambda: home)
+    monkeypatch.setattr(backup, "SERVICE_CLEANUP_RETRY_S", 0.01,
+                        raising=False)
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: "/tools/pg_dump")
+    monkeypatch.setattr(backup.subprocess, "run", run)
+    monkeypatch.setattr(Path, "unlink", persistent_unlink)
+
+    def block_first(command, **kwargs):
+        result = run(command, **kwargs)
+        blocked.add(observed[-1])
+        return result
+
+    monkeypatch.setattr(backup.subprocess, "run", block_first)
+    with pytest.raises(backup.BackupError, match="clean.*service"):
+        backup._dump_database(
+            "postgresql://operator:secret@localhost/memoryd", dump)
+    stale = observed[0]
+    assert stale.is_file()
+
+    blocked.clear()
+    monkeypatch.setattr(backup.subprocess, "run", run)
+    backup._dump_database(
+        "postgresql://operator:secret@localhost/memoryd", dump)
+
+    assert not stale.exists()
+    assert not stale.parent.exists()
+    assert len(observed) == 2
+
+
+def test_service_cleanup_failure_preserves_original_tool_error_as_primary(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    dump = tmp_path / "dump"
+    blocked: set[Path] = set()
+    real_unlink = Path.unlink
+
+    def run(command, **kwargs):
+        blocked.add(Path(kwargs["env"]["PGSERVICEFILE"]))
+        return types.SimpleNamespace(
+            returncode=1, stderr=b"original database failure")
+
+    def persistent_unlink(path, *args, **kwargs):
+        if path in blocked:
+            raise PermissionError("persistent scanner handle")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(backup, "_default_home", lambda: home)
+    monkeypatch.setattr(backup, "SERVICE_CLEANUP_RETRY_S", 0.01,
+                        raising=False)
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: "/tools/pg_restore")
+    monkeypatch.setattr(backup.subprocess, "run", run)
+    monkeypatch.setattr(Path, "unlink", persistent_unlink)
+    dump.write_bytes(b"PGDMPservice")
+
+    with pytest.raises(
+            backup.BackupError, match="original database failure") as exc:
+        backup._restore_database(
+            dump, "postgresql://operator:secret@localhost/memoryd")
+
+    notes = getattr(exc.value, "__notes__", [])
+    assert any("service cleanup failed" in note for note in notes)
+
+
+def test_service_root_rejects_unrecognized_stale_artifact(
+        monkeypatch, tmp_path):
+    root = tmp_path / "memory" / ".pg-service"
+    root.mkdir(parents=True)
+    if os.name != "nt":
+        root.chmod(0o700)
+    unexpected = root / "not-an-operation"
+    unexpected.write_text("do not delete", encoding="utf-8")
+    monkeypatch.setattr(backup, "_default_home", lambda: tmp_path / "memory")
+    monkeypatch.setattr(
+        backup.subprocess, "run",
+        lambda *_args, **_kwargs: pytest.fail("tool must not run"))
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: "/tools/pg_dump")
+
+    with pytest.raises(backup.BackupError, match="unrecognized service artifact"):
+        backup._dump_database(
+            "postgresql://operator:secret@localhost/memoryd",
+            tmp_path / "dump")
+
+    assert unexpected.is_file()
 
 
 def test_invalid_conninfo_diagnostic_does_not_echo_password_fields():
@@ -1075,6 +1221,37 @@ def test_interleaved_docker_restores_never_delete_peer_remote_path(
     assert len(set(copy_paths)) == 2
     assert set(restore_paths) == set(copy_paths)
     assert set(cleaned_paths) == set(copy_paths)
+
+
+def test_docker_restore_cp_failure_cleans_its_unique_remote_path(
+        monkeypatch, tmp_path):
+    copied_paths: list[str] = []
+    cleaned_paths: list[str] = []
+
+    def docker(*args):
+        if args[0] == "inspect":
+            return 0, "exists"
+        if args[0] == "cp":
+            copied_paths.append(args[2].split(":", 1)[1])
+            return 1, "partial copy failed"
+        if args[:4] == ("exec", cli.CONTAINER, "rm", "-f"):
+            cleaned_paths.append(args[4])
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(cli, "_container_port", lambda: "5432")
+    monkeypatch.setattr(cli, "_docker", docker)
+    dump = tmp_path / "restore.dump"
+    dump.write_bytes(b"PGDMPpartial")
+
+    with pytest.raises(backup.BackupError, match="partial copy failed"):
+        backup._restore_database(
+            dump,
+            "postgresql://postgres:secret@127.0.0.1:5432/memoryd")
+
+    assert len(copied_paths) == 1
+    assert cleaned_paths == copied_paths
 
 
 def test_cli_routes_backup_arguments_and_exit_code(monkeypatch):

@@ -45,6 +45,10 @@ SECRET_KEY_RE = re.compile(
 SECRET_ENV_RE = re.compile(
     r"(?:^|_)(?:API_KEY|PASSWORD|PASSWD|SECRET|TOKEN|CREDENTIALS?)(?:$|_)",
     re.I)
+SERVICE_ROOT_NAME = ".pg-service"
+SERVICE_OPERATION_RE = re.compile(r"^op-[0-9a-f]{32}$")
+SERVICE_CLEANUP_RETRY_S = 1.0
+SERVICE_CLEANUP_RETRY_INTERVAL_S = 0.01
 
 
 class BackupError(RuntimeError):
@@ -254,16 +258,125 @@ def _safe_conninfo(dsn: str) -> tuple[dict[str, str], tuple[str, ...]]:
     return values, redactions
 
 
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise BackupError(f"cannot fsync service directory {path}: {exc}") from exc
+
+
+def _require_service_artifact(
+        path: Path, *, directory: bool, mode: int) -> None:
+    try:
+        value = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise BackupError(f"cannot inspect service artifact {path}: {exc}") from exc
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if path.is_symlink() or not expected(value.st_mode):
+        raise BackupError(f"unsafe service artifact: {path}")
+    if (hasattr(os, "getuid") and value.st_uid != os.getuid()):
+        raise BackupError(f"service artifact is not owned by this user: {path}")
+    if POSIX_MODE_ENFORCED and stat.S_IMODE(value.st_mode) != mode:
+        raise BackupError(
+            f"unsafe mode for service artifact {path}: expected {mode:04o}")
+
+
+def _remove_service_artifact(path: Path, *, directory: bool) -> None:
+    deadline = time.monotonic() + SERVICE_CLEANUP_RETRY_S
+    while True:
+        try:
+            if directory:
+                path.rmdir()
+            else:
+                path.unlink()
+            _fsync_directory(path.parent)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise BackupError(
+                    f"cannot clean service artifact {path}: {exc}") from exc
+            time.sleep(SERVICE_CLEANUP_RETRY_INTERVAL_S)
+
+
+def _cleanup_service_operation(operation: Path) -> None:
+    _require_service_artifact(operation, directory=True, mode=0o700)
+    try:
+        children = list(operation.iterdir())
+    except OSError as exc:
+        raise BackupError(
+            f"cannot inspect service operation {operation}: {exc}") from exc
+    if children:
+        if len(children) != 1 or children[0].name != "pg_service.conf":
+            raise BackupError(
+                f"unrecognized service artifact in {operation}")
+        service_file = children[0]
+        _require_service_artifact(service_file, directory=False, mode=0o600)
+        _remove_service_artifact(service_file, directory=False)
+    _remove_service_artifact(operation, directory=True)
+
+
+def _service_root() -> Path:
+    home = _default_home()
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BackupError(f"cannot create memory home {home}: {exc}") from exc
+    root = home / SERVICE_ROOT_NAME
+    created = False
+    try:
+        root.mkdir(mode=0o700)
+        created = True
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise BackupError(f"cannot create service root {root}: {exc}") from exc
+    if created:
+        _chmod(root, 0o700)
+        _fsync_directory(home)
+    _require_service_artifact(root, directory=True, mode=0o700)
+    try:
+        children = list(root.iterdir())
+    except OSError as exc:
+        raise BackupError(f"cannot inspect service root {root}: {exc}") from exc
+    for operation in children:
+        if not SERVICE_OPERATION_RE.fullmatch(operation.name):
+            raise BackupError(f"unrecognized service artifact: {operation}")
+        _cleanup_service_operation(operation)
+    return root
+
+
 @contextmanager
 def _libpq_service(values: dict[str, str]):
-    directory = Path(tempfile.mkdtemp(prefix="memoryd-pg-service-"))
-    service_file = directory / "pg_service.conf"
+    operation: Path | None = None
+    primary: BaseException | None = None
     try:
-        _chmod(directory, 0o700)
         for value in values.values():
             if "\n" in value or "\r" in value:
                 raise BackupError(
                     "PostgreSQL connection values cannot contain newlines")
+        root = _service_root()
+        for _attempt in range(3):
+            candidate = root / f"op-{secrets.token_hex(16)}"
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            operation = candidate
+            break
+        if operation is None:
+            raise BackupError("cannot allocate a unique service operation")
+        _chmod(operation, 0o700)
+        _fsync_directory(root)
+        service_file = operation / "pg_service.conf"
         flags = (os.O_CREAT | os.O_EXCL | os.O_WRONLY |
                  getattr(os, "O_BINARY", 0))
         fd = os.open(service_file, flags, 0o600)
@@ -274,17 +387,24 @@ def _libpq_service(values: dict[str, str]):
             handle.flush()
             os.fsync(handle.fileno())
         _chmod(service_file, 0o600)
+        _fsync_directory(operation)
         env = os.environ.copy()
-        for name in ("PGPASSWORD", "PGSERVICE", "PGSERVICEFILE"):
+        for name in ("PGPASSWORD", "PGSSLPASSWORD", "PGSERVICE",
+                     "PGSERVICEFILE"):
             env.pop(name, None)
         env["PGSERVICEFILE"] = str(service_file)
         yield "service=memoryd", env
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        service_file.unlink(missing_ok=True)
-        try:
-            directory.rmdir()
-        except FileNotFoundError:
-            pass
+        if operation is not None:
+            try:
+                _cleanup_service_operation(operation)
+            except BackupError as cleanup_exc:
+                if primary is None:
+                    raise
+                primary.add_note(f"service cleanup failed: {cleanup_exc}")
 
 
 def _run_tool(
@@ -374,10 +494,11 @@ def _restore_database(dump: Path, dsn: str) -> None:
     from .cli import CONTAINER, _docker
     user, database = connection
     remote = _remote_dump_path("restore")
-    code, detail = _docker("cp", str(dump), f"{CONTAINER}:{remote}")
-    if code:
-        raise BackupError(f"copying database dump into Docker failed: {detail}")
     try:
+        code, detail = _docker("cp", str(dump), f"{CONTAINER}:{remote}")
+        if code:
+            raise BackupError(
+                f"copying database dump into Docker failed: {detail}")
         _docker_tool(["pg_restore", "--exit-on-error", "--single-transaction",
                       "--no-owner", "--no-privileges", "-U", user, "-d",
                       database, remote])

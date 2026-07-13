@@ -228,8 +228,10 @@ Before creating Docker resources, the installer atomically records fresh
 managed credentials in owner-only `~/memory/.managed-postgres.json`; this lets
 a rerun recover safely if installation stops before migrations or config write.
 If the container was removed but its named volume remains, the installer reuses
-that record; without a record it tries only the explicit legacy credential and
-refuses safely if that cannot be proven. Docker receives credentials through a
+that record. Without a record it probes `PG_VERSION` through a read-only,
+networkless ephemeral container: empty data gets a new random credential,
+initialized data gets only the explicit legacy recovery attempt, and an
+inconclusive probe refuses safely. Docker receives credentials through a
 short-lived owner-only env file, not its process arguments. The credential
 record is not included in backups. A failed or timed-out `docker run` removes a
 new record only when follow-up inspection confirms that both the container and
