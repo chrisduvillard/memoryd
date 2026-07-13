@@ -97,6 +97,16 @@ def test_structured_matrix_enforces_installed_artifact_boundaries() -> None:
     assert "PYTHONPATH" not in database
 
 
+def test_job_environment_does_not_use_step_only_runner_context() -> None:
+    job = _workflow_model()["jobs"]["test"]
+    assert all("${{ runner." not in str(value) for value in job["env"].values())
+
+    configure = _named_steps(job)["Configure temporary runtime paths"]["run"]
+    assert 'MEMORYD_HOME=$RUNNER_TEMP/memoryd-home' in configure
+    assert 'MEMORYD_LLM_MOCK_FILE=$RUNNER_TEMP/mock_llm.json' in configure
+    assert configure.count("GITHUB_ENV") == 2
+
+
 def test_structured_source_and_installed_suites_are_separate() -> None:
     job = _workflow_model()["jobs"]["test"]
     steps = _named_steps(job)
