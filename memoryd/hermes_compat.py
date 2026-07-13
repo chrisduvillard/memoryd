@@ -49,6 +49,19 @@ def _error(message: str) -> HermesCompatibilityError:
 def _canonical_absolute(path: Path, description: str) -> Path:
     if not path.is_absolute():
         raise _error(f"{description} must be absolute")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise _error(f"Could not inspect {description}") from exc
+        if stat.S_ISLNK(mode):
+            raise _error(
+                f"{description} must not contain symlinks or ambiguous components"
+            )
     try:
         resolved = path.resolve(strict=False)
     except (OSError, RuntimeError) as exc:

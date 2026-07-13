@@ -187,14 +187,18 @@ def test_symlinked_root_is_rejected(tmp_path: Path) -> None:
     assert linked_root.is_symlink()
 
 
+@pytest.mark.parametrize(
+    "suffix", [(), ("child",)], ids=["home", "ancestor"]
+)
 def test_symlink_loop_in_home_is_reported_as_compatibility_error(
-    tmp_path: Path,
+    tmp_path: Path, suffix: tuple[str, ...]
 ) -> None:
     loop = tmp_path / ".hermes"
     loop.symlink_to(loop, target_is_directory=True)
+    configured = loop.joinpath(*suffix)
 
     with pytest.raises(HermesCompatibilityError) as exc_info:
-        resolve_hermes_home({"HERMES_HOME": str(loop)})
+        resolve_hermes_home({"HERMES_HOME": str(configured)})
 
     _assert_safe_error(exc_info)
 
