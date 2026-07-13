@@ -220,7 +220,8 @@ jobs:
           test ! -e "$INSTALLED_HARNESS"
           mkdir -p "$INSTALLED_HARNESS/scripts/_stubs/agent"
           cp scripts/smoke_test.py scripts/test_extract.py scripts/test_vector.py \
-            scripts/test_bitter_lesson.py scripts/test_postgres_recovery.py \
+            scripts/test_bitter_lesson.py scripts/test_hermes.py \
+            scripts/test_postgres_recovery.py \
             scripts/check_hermes_contract.py scripts/validate_installed_hermes.py \
             "$INSTALLED_HARNESS/scripts/"
           cp scripts/_stubs/agent/__init__.py \
@@ -305,6 +306,11 @@ jobs:
           "$RUNNER_TEMP/venv-test/bin/python" -I scripts/smoke_test.py
           "$RUNNER_TEMP/venv-test/bin/python" -I scripts/test_extract.py
           "$RUNNER_TEMP/venv-test/bin/python" -I scripts/test_vector.py
+          "$RUNNER_TEMP/venv-test/bin/python" -I \
+            scripts/test_hermes.py --installed \
+            --hermes-home "$RUNNER_TEMP/hermes-live-profile" \
+            --plugin-source "$MEMORYD_PLUGIN_SOURCE" \
+            --expected-version 0.16.0
           "$RUNNER_TEMP/venv-test/bin/python" -I \
             scripts/test_postgres_recovery.py idempotency
           "$RUNNER_TEMP/venv-test/bin/python" -I -m memoryd doctor

@@ -74,6 +74,7 @@ def test_structured_matrix_enforces_installed_artifact_boundaries() -> None:
 
     staging = steps["Stage installed-artifact harnesses outside checkout"]["run"]
     assert 'INSTALLED_HARNESS="$RUNNER_TEMP/installed-harness"' in staging
+    assert "scripts/test_hermes.py" in staging
     assert "plugin = package / 'hermes_plugin'" in staging
     assert "GITHUB_ENV" in staging
 
@@ -87,8 +88,11 @@ def test_structured_matrix_enforces_installed_artifact_boundaries() -> None:
     database = steps["Run installed-wheel DB-backed regression matrix"]["run"]
     assert 'cd "$INSTALLED_HARNESS"' in database
     assert all(f"scripts/{name}" in database for name in (
-        "smoke_test.py", "test_extract.py", "test_vector.py",
+        "smoke_test.py", "test_extract.py", "test_vector.py", "test_hermes.py",
         "test_postgres_recovery.py"))
+    assert "scripts/test_hermes.py --installed" in database
+    assert '--hermes-home "$RUNNER_TEMP/hermes-live-profile"' in database
+    assert '--plugin-source "$MEMORYD_PLUGIN_SOURCE"' in database
     assert "GITHUB_WORKSPACE/scripts" not in database
     assert "PYTHONPATH" not in database
 
@@ -131,6 +135,7 @@ def test_blocking_matrix_exercises_every_required_suite() -> None:
         "scripts/smoke_test.py",
         "scripts/test_extract.py",
         "scripts/test_vector.py",
+        "scripts/test_hermes.py --installed",
         "scripts/validate_installed_hermes.py",
         "scripts/test_postgres_recovery.py idempotency",
         "scripts/test_postgres_recovery.py backup-restore",
@@ -152,6 +157,29 @@ def test_blocking_matrix_exercises_every_required_suite() -> None:
     assert "HERMES_SOURCE_ROOT" in job
     assert "PYTHONPATH=" not in job
     assert "check_hermes_contract.py --require-pinned-bytes" in job
+
+
+def test_live_hermes_harness_has_strict_installed_mode_and_full_lifecycle() -> None:
+    source = (REPO / "scripts" / "test_hermes.py").read_text(encoding="utf-8")
+    for evidence in (
+        'parser.add_argument("--installed", action="store_true")',
+        'parser.add_argument("--hermes-home", type=Path)',
+        'parser.add_argument("--plugin-source", type=Path)',
+        'metadata.version("hermes-agent")',
+        'from plugins.memory import discover_memory_providers, load_memory_provider',
+        'load_memory_provider("memoryd")',
+        'plugin_target not in provider_path.parents',
+        '"hermes visa blocks personal_private"',
+        '"memoryd_search returns memory"',
+        '"memoryd_report_miss logged"',
+        '"builtin MEMORY.md write mirrored to canonical"',
+        '"subagent delegation captured on parent"',
+        '"subagent wrote nothing"',
+        '"session end triggered extraction"',
+        '"offline turns durably spooled"',
+        '"spool flushed on recovery"',
+    ):
+        assert evidence in source
 
 
 def test_postgres_and_hermes_pins_are_immutable_and_correctly_scoped() -> None:

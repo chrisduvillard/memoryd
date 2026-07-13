@@ -9,8 +9,6 @@ import json
 import os
 import shutil
 import site
-import stat
-import sys
 import tempfile
 import threading
 import time
