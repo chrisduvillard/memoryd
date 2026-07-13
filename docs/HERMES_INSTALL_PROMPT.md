@@ -18,10 +18,10 @@ Repository: https://github.com/chrisduvillard/memoryd
 memoryd release: v0.3.0
 
 Objective:
-Install a new authoritative memoryd instance, connect this Hermes profile to
-it, verify backup and recovery, and begin the production canary. The Windows
-installation and all Windows data are out of scope: do not inspect, repair,
-delete, or migrate them.
+Guide me while I install a new authoritative memoryd instance, connect this
+Hermes profile to it, verify backup and recovery, and begin the production
+canary. The Windows installation and all Windows data are out of scope: do not
+inspect, repair, delete, or migrate them.
 
 Authoritative instructions:
 1. Read the repository's docs/PRODUCTION_ROLLOUT.md in full.
@@ -30,12 +30,13 @@ Authoritative instructions:
    follow the runbook.
 
 Non-negotiable constraints:
-- Pin memoryd and its bundled plugin to v0.3.0.
-- Pin Hermes Agent to package 0.16.0, source tag v2026.6.5, resolved commit
+- Require me to pin memoryd and its bundled plugin to v0.3.0.
+- Require me to pin Hermes Agent to package 0.16.0, source tag v2026.6.5,
+  resolved commit
   3c231eb3979ab9c57d5cd6d02f1d577a3b718b43.
-- Use exactly ~/memory for production, Docker PostgreSQL 16 plus pgvector bound
+- Production must use exactly ~/memory, Docker PostgreSQL 16 plus pgvector bound
   to 127.0.0.1, and http://127.0.0.1:7437 for memoryd.
-- Configure MEMORYD_LLM=openrouter and MEMORYD_EMBED=voyage.
+- Require me to configure MEMORYD_LLM=openrouter and MEMORYD_EMBED=voyage.
 - Never ask me to paste an OpenRouter key or Voyage key into this chat. Never
   expose secret values in chat, shell history, logs, documentation, or backups.
   The only allowed persistence is the owner-private ~/memory/config.json that
@@ -51,20 +52,25 @@ Non-negotiable constraints:
   gateway, and start a new Hermes chat/TUI only after every check passes.
 - Never delete or overwrite an existing home, database, spool, archive, backup,
   Docker container, or volume. If ~/memory already exists, stop and report it.
-- Run integration and restore tests only against disposable homes, ports,
-  containers, and databases from the runbook.
+- Require me to run integration and restore tests only against disposable
+  homes, ports, containers, and databases from the runbook.
 - Do not claim production readiness until the entire 14-day, minimum-200-turn
   canary passes every scorecard gate.
 
 Workflow:
-1. Start with the runbook preflight and authoritative HERMES_HOME selection.
-2. Verify or remediate the exact Hermes version and commit.
-3. Clone memoryd tag v0.3.0 and require the contract checker to print COMPATIBLE.
-4. Install memoryd in its own pipx environment and pass the installed-Hermes
-   lifecycle validator.
-5. Guide interactive OpenRouter and Voyage secret entry, run memoryd install,
-   and verify permissions, systemd user services, timers, plugin location,
-   localhost bindings, memoryd status, and memoryd doctor.
+1. Present the runbook preflight and authoritative HERMES_HOME selection, require
+   me to perform them in the separate terminal, then validate my pasted output.
+2. Require me to verify or remediate the exact Hermes version and commit in the
+   separate terminal, then validate my pasted output.
+3. Require me to clone memoryd tag v0.3.0 and run the contract checker in the
+   separate terminal, then validate that its output prints COMPATIBLE.
+4. Require me to install memoryd in its own pipx environment and run the
+   installed-Hermes lifecycle validator in the separate terminal, then validate
+   my pasted output.
+5. Guide me through interactive OpenRouter and Voyage secret entry. Require me
+   to run memoryd install and the permissions, systemd user service, timer,
+   plugin location, localhost binding, memoryd status, and memoryd doctor checks
+   in the separate terminal, then validate my pasted output.
 6. Stop at the activation boundary. Give me the exact activation block and this
    resume sentence before I exit every active Hermes chat/TUI:
    "Resume the memoryd rollout after activation. I ran hermes memory status,
@@ -76,13 +82,16 @@ Workflow:
    may I start a new Hermes chat/TUI and use the resume sentence. In the new
    session, validate the recorded output, exact URL, zero dead letters, no
    durability fault, drained queue, and healthy restored gateway.
-8. Guide the disposable integration and restore drill without touching
-   production data.
-9. Create and verify the first production snapshot while guaranteeing daemon
-   restart after success or failure.
-10. Begin the canary using docs/CANARY_SCORECARD.md. If any gate fails, use the
-    runbook's evidence-preserving rollback and restart the canary from day zero
-    only after repair.
+8. Require me to perform the disposable integration and restore drill in the
+   separate terminal without touching production data, then validate my pasted
+   output and preserved evidence locations.
+9. Require me to create and verify the first production snapshot in the
+   separate terminal with the runbook's guaranteed daemon restart after success
+   or failure, then validate my pasted output.
+10. Guide me through the canary using docs/CANARY_SCORECARD.md. Present each
+    action for me to perform and validate my pasted output. If any gate fails,
+    require me to use the runbook's evidence-preserving rollback and restart the
+    canary from day zero only after repair.
 
 Stop immediately and preserve evidence if a command fails, a version drifts,
 the contract checker is not COMPATIBLE, a localhost binding is wrong, a status

@@ -74,8 +74,9 @@ handoff. The prompt will tell Hermes to:
 - use `https://github.com/chrisduvillard/memoryd` at tag `v0.3.0`;
 - treat `docs/PRODUCTION_ROLLOUT.md` and `docs/CANARY_SCORECARD.md` as
   authoritative;
-- verify Hermes Agent 0.16.0, source tag `v2026.6.5`, and resolved commit
-  `3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`;
+- require the operator to verify or remediate Hermes Agent 0.16.0, source tag
+  `v2026.6.5`, and resolved commit
+  `3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`, then validate the output;
 - preserve Windows data and stop if Linux `~/memory` already exists;
 - never expose secret values in chat, shell history, logs, documentation, or
   backups, while allowing `memoryd install` to write them only to the
@@ -87,11 +88,15 @@ handoff. The prompt will tell Hermes to:
   the operator to run the activation block and all four checks in a normal
   terminal, restore any previously active gateway, and start a new chat/TUI
   only after those checks pass;
-- verify `hermes memory status`, `hermes memoryd config`, `memoryd status`, and
-  `hermes memoryd status` before a new chat/TUI starts;
-- run integration and restore drills only in disposable homes and databases;
-- create and verify the first production snapshot;
-- begin the canary and use evidence-preserving rollback if a gate fails.
+- validate the operator's recorded output from `hermes memory status`, `hermes
+  memoryd config`, `memoryd status`, and `hermes memoryd status` before a new
+  chat/TUI starts;
+- require the operator to run integration and restore drills only in disposable
+  homes and databases, then validate the output and preserved evidence;
+- require the operator to create and verify the first production snapshot under
+  Hermes guidance, then validate the output;
+- guide the operator through the canary and require the operator to use
+  evidence-preserving rollback if a gate fails.
 
 The prompt will require concise progress reports with four states: completed,
 waiting for operator action, blocked, and failed with preserved evidence.
