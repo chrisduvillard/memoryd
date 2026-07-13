@@ -187,6 +187,18 @@ def test_symlinked_root_is_rejected(tmp_path: Path) -> None:
     assert linked_root.is_symlink()
 
 
+def test_symlink_loop_in_home_is_reported_as_compatibility_error(
+    tmp_path: Path,
+) -> None:
+    loop = tmp_path / ".hermes"
+    loop.symlink_to(loop, target_is_directory=True)
+
+    with pytest.raises(HermesCompatibilityError) as exc_info:
+        resolve_hermes_home({"HERMES_HOME": str(loop)})
+
+    _assert_safe_error(exc_info)
+
+
 def test_symlinked_named_profile_is_rejected(tmp_path: Path) -> None:
     root = _mkdir(tmp_path / ".hermes")
     profiles = _mkdir(root / "profiles")
@@ -236,6 +248,20 @@ def test_missing_hermes_command_is_rejected_without_creating_home(
     assert not root.exists()
 
 
+def test_symlink_loop_in_hermes_command_is_reported_as_compatibility_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = tmp_path / "bin" / "hermes"
+    loop.parent.mkdir()
+    loop.symlink_to(loop)
+    monkeypatch.setattr(shutil, "which", lambda command: str(loop))
+
+    with pytest.raises(HermesCompatibilityError) as exc_info:
+        resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
+
+    _assert_safe_error(exc_info)
+
+
 @pytest.mark.parametrize(
     "first_line",
     ["print('no shebang')", "#!/usr/bin/env python3"],
@@ -278,6 +304,21 @@ def test_missing_shebang_interpreter_is_rejected(
     _assert_safe_error(exc_info)
 
 
+def test_symlink_loop_in_python_interpreter_is_reported_as_compatibility_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = tmp_path / "bin" / "python3.13"
+    loop.parent.mkdir(parents=True)
+    loop.symlink_to(loop)
+    hermes = _write_executable(tmp_path / "bin" / "hermes", f"#!{loop}\n")
+    monkeypatch.setattr(shutil, "which", lambda command: str(hermes))
+
+    with pytest.raises(HermesCompatibilityError) as exc_info:
+        resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
+
+    _assert_safe_error(exc_info)
+
+
 def test_non_executable_shebang_interpreter_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -292,6 +333,29 @@ def test_non_executable_shebang_interpreter_is_rejected(
     assert stat.S_IMODE(python.stat().st_mode) == 0o600
 
 
+def test_python_interpreter_inaccessible_to_current_process_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python = _python_interpreter(tmp_path)
+    hermes = _write_executable(tmp_path / "bin" / "hermes", f"#!{python}\n")
+    monkeypatch.setattr(shutil, "which", lambda command: str(hermes))
+    monkeypatch.setattr(
+        os, "access", lambda path, mode: Path(path) != python.resolve()
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=f"{PINNED_HERMES_VERSION}\n", stderr=""
+        ),
+    )
+
+    with pytest.raises(HermesCompatibilityError) as exc_info:
+        resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
+
+    _assert_safe_error(exc_info)
+
+
 def test_non_executable_hermes_command_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -300,6 +364,29 @@ def test_non_executable_hermes_command_is_rejected(
     hermes.write_text(f"#!{python}\n", encoding="utf-8")
     hermes.chmod(0o600)
     monkeypatch.setattr(shutil, "which", lambda command: str(hermes))
+
+    with pytest.raises(HermesCompatibilityError) as exc_info:
+        resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
+
+    _assert_safe_error(exc_info)
+
+
+def test_hermes_command_inaccessible_to_current_process_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python = _python_interpreter(tmp_path)
+    hermes = _write_executable(tmp_path / "bin" / "hermes", f"#!{python}\n")
+    monkeypatch.setattr(shutil, "which", lambda command: str(hermes))
+    monkeypatch.setattr(
+        os, "access", lambda path, mode: Path(path) != hermes.resolve()
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=f"{PINNED_HERMES_VERSION}\n", stderr=""
+        ),
+    )
 
     with pytest.raises(HermesCompatibilityError) as exc_info:
         resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
@@ -328,6 +415,7 @@ def test_version_query_subprocess_failure_is_rejected(
 def test_version_mismatch_reports_pin_and_safe_remediation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    sentinel = "sensitive-subprocess-output"
     python = _python_interpreter(tmp_path)
     hermes = _write_executable(tmp_path / "bin" / "hermes", f"#!{python}\n")
     monkeypatch.setattr(shutil, "which", lambda command: str(hermes))
@@ -335,7 +423,7 @@ def test_version_mismatch_reports_pin_and_safe_remediation(
         subprocess,
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0], 0, stdout="0.15.0\n", stderr=""
+            args[0], 0, stdout=f"0.15.0\n{sentinel}\n", stderr=sentinel
         ),
     )
 
@@ -343,8 +431,9 @@ def test_version_mismatch_reports_pin_and_safe_remediation(
         resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
 
     message = _assert_safe_error(exc_info)
-    assert "0.15.0" in message
+    assert "detected hermes-agent version does not match" in message.lower()
     assert PINNED_HERMES_VERSION in message
+    assert sentinel not in message
 
 
 def test_success_resolves_real_command_interpreter_profile_and_pinned_version(

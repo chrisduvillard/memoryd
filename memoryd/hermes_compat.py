@@ -44,7 +44,7 @@ def _canonical_absolute(path: Path, description: str) -> Path:
         raise _error(f"{description} must be absolute")
     try:
         resolved = path.resolve(strict=False)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise _error(f"Could not resolve {description}") from exc
     if resolved != path:
         raise _error(f"{description} must not contain symlinks or ambiguous components")
@@ -111,7 +111,7 @@ def _is_executable(path: Path) -> bool:
         mode = path.stat().st_mode
     except OSError:
         return False
-    return path.is_file() and bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    return stat.S_ISREG(mode) and os.access(path, os.X_OK)
 
 
 def _resolve_command() -> Path:
@@ -120,7 +120,7 @@ def _resolve_command() -> Path:
         raise _error("The hermes command was not found")
     try:
         executable = Path(command).resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise _error("Could not resolve the hermes command") from exc
     if not _is_executable(executable):
         raise _error("The hermes command is not executable")
@@ -145,7 +145,7 @@ def _resolve_python(executable: Path) -> Path:
         raise _error("The hermes command must use an absolute Python shebang")
     try:
         python = interpreter.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise _error("The hermes Python interpreter does not exist") from exc
     if not _is_executable(python):
         raise _error("The hermes Python interpreter is not executable")
@@ -177,7 +177,7 @@ def resolve_hermes_target(
     version = _query_version(python)
     if version != PINNED_HERMES_VERSION:
         raise _error(
-            f"Installed hermes-agent version {version!r} does not match "
-            f"the required version {PINNED_HERMES_VERSION}"
+            "Detected hermes-agent version does not match the required version "
+            f"{PINNED_HERMES_VERSION}"
         )
     return HermesTarget(root=root, home=home, executable=executable, python=python)
