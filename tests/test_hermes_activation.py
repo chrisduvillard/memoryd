@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -33,6 +34,20 @@ def _move_job_under_plugin_lock(
         if not release.wait(5):
             return
         os.replace(source, destination)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _hold_plugin_lock(lock_path: str, locked, hold_seconds: float) -> None:
+    import fcntl
+
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked.set()
+        time.sleep(hold_seconds)
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
@@ -433,7 +448,7 @@ def test_spool_snapshot_rejects_unreadable_state_directory(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX advisory locks")
-def test_spool_snapshot_waits_for_plugin_lock_and_observes_atomic_move(tmp_path):
+def test_spool_snapshot_signals_busy_without_waiting_for_plugin_lock(tmp_path):
     target = _target(tmp_path, "legacy")
     root = _spool_root(target)
     source = root / "processing" / "000-job.json"
@@ -473,13 +488,47 @@ def test_spool_snapshot_waits_for_plugin_lock_and_observes_atomic_move(tmp_path)
     mover.join(5)
     reader.join(5)
 
-    assert not finished_while_move_locked
+    assert finished_while_move_locked
     assert mover.exitcode == 0
     assert not reader.is_alive()
-    assert failures == []
-    assert results == [1]
+    assert results == []
+    assert [failure.__class__.__name__ for failure in failures] == [
+        "_SpoolLockBusy"
+    ]
+    assert hermes._pending_spool_jobs(target) == 1
     assert destination.exists()
     assert not source.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory locks")
+def test_spool_drain_times_out_while_plugin_lock_is_held_without_mutating_job(
+    tmp_path,
+):
+    target = _target(tmp_path, "legacy")
+    root = _spool_root(target)
+    job = root / "incoming" / "000-job.json"
+    evidence = b"pending-secret-evidence"
+    job.write_bytes(evidence)
+    context = multiprocessing.get_context("fork")
+    locked = context.Event()
+    holder = context.Process(
+        target=_hold_plugin_lock,
+        args=(os.fspath(root / "spool.lock"), locked, 0.8),
+    )
+    holder.start()
+    assert locked.wait(5)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(hermes.HermesInstallError, match="spool.*drain"):
+            hermes._wait_for_spool_drain(target, timeout=0.2)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.join(5)
+
+    assert holder.exitcode == 0
+    assert 0.15 <= elapsed < 0.6
+    assert job.read_bytes() == evidence
 
 
 class FakeClock:
@@ -540,6 +589,26 @@ def test_activation_times_out_after_default_fifteen_seconds_without_requeue(
     assert clock.now == pytest.approx(15.0)
     assert incoming.read_bytes() == b"pending-secret-evidence"
     assert _read_provider(target.home) == "legacy"
+
+
+def test_spool_drain_rejects_zero_snapshot_completed_after_deadline(
+    monkeypatch, tmp_path,
+):
+    target = _target(tmp_path, "legacy")
+    clock = FakeClock()
+
+    def slow_zero_snapshot(_target):
+        clock.now += 0.3
+        return 0
+
+    monkeypatch.setattr(hermes.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(hermes.time, "sleep", clock.sleep)
+    monkeypatch.setattr(hermes, "_pending_spool_jobs", slow_zero_snapshot)
+
+    with pytest.raises(hermes.HermesInstallError, match="spool.*drain"):
+        hermes._wait_for_spool_drain(target, timeout=0.2)
+
+    assert clock.now == pytest.approx(0.3)
 
 
 @pytest.mark.parametrize(

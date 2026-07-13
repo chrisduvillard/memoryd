@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import getpass
 import json
 import math
@@ -24,6 +25,10 @@ from .llm import OpenAIChatClient
 
 class HermesInstallError(RuntimeError):
     """A safe, operator-facing guided-install error."""
+
+
+class _SpoolLockBusy(Exception):
+    """Signal transient provider ownership of the durable spool lock."""
 
 
 @dataclass(frozen=True)
@@ -271,22 +276,50 @@ def _locked_spool(lock_path: Path):
 
     descriptor = _open_spool_lock(lock_path)
     locked = False
+    primary: BaseException | None = None
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if isinstance(error, BlockingIOError) or error.errno in {
+                errno.EACCES,
+                errno.EAGAIN,
+            }:
+                raise _SpoolLockBusy from None
+            raise HermesInstallError(
+                "The Hermes durable spool lock failed."
+            ) from None
         locked = True
-        opened = os.fstat(descriptor)
+        try:
+            opened = os.fstat(descriptor)
+        except OSError:
+            raise HermesInstallError(
+                "The Hermes durable spool lock failed."
+            ) from None
         current = _optional_path_stat(lock_path, directory=False)
         if current is None or not _same_file(opened, current):
             raise HermesInstallError("The Hermes durable spool lock changed.")
         yield
-    except OSError:
-        raise HermesInstallError("The Hermes durable spool lock failed.") from None
+    except BaseException as error:
+        primary = error
+        raise
     finally:
+        cleanup_failed = False
         try:
             if locked:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    cleanup_failed = True
         finally:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                cleanup_failed = True
+        if cleanup_failed and primary is None:
+            raise HermesInstallError(
+                "The Hermes durable spool lock failed."
+            ) from None
 
 
 def _json_file_count(directory: Path) -> int:
@@ -406,11 +439,15 @@ def _wait_for_spool_drain(
 ) -> None:
     deadline = time.monotonic() + timeout
     while True:
-        if _pending_spool_jobs(target) == 0:
-            return
+        try:
+            pending = _pending_spool_jobs(target)
+        except _SpoolLockBusy:
+            pending = None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise HermesInstallError("The Hermes durable spool did not drain.")
+        if pending == 0:
+            return
         time.sleep(min(_SPOOL_POLL_INTERVAL, remaining))
 
 
