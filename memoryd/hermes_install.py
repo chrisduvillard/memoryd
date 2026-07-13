@@ -6,9 +6,11 @@ import getpass
 import json
 import math
 import os
+import re
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -24,6 +26,12 @@ class HermesInstallError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class HermesRuntimeState:
+    provider: str | None
+    gateway_running: bool
+
+
+@dataclass(frozen=True)
 class ProviderCredentials:
     openrouter_key: str
     voyage_key: str
@@ -35,6 +43,321 @@ class ProviderCredentials:
 _KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
 _VALIDATION_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *_KEY_NAMES)
 _INSTALL_ENV = ("HERMES_HOME", *_KEY_NAMES, "MEMORYD_LLM", "MEMORYD_EMBED")
+_PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_PLUGIN_URL = "http://127.0.0.1:7437"
+_SPOOL_DRAIN_TIMEOUT = 15.0
+_SPOOL_POLL_INTERVAL = 0.1
+_PROVIDER_PROBE = """\
+import json
+import os
+from pathlib import Path
+import yaml
+try:
+    loaded = yaml.safe_load(
+        (Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    config = {} if loaded is None else loaded
+    if not isinstance(config, dict):
+        raise ValueError
+    loaded_memory = config.get("memory")
+    memory = {} if loaded_memory is None else loaded_memory
+    if not isinstance(memory, dict):
+        raise ValueError
+    print(json.dumps(memory.get("provider")))
+except BaseException:
+    raise SystemExit(2)
+"""
+_GATEWAY_PROBE = """\
+try:
+    from hermes_cli.gateway import get_gateway_runtime_snapshot
+    running = get_gateway_runtime_snapshot().running
+    if type(running) is not bool:
+        raise ValueError
+except BaseException:
+    raise SystemExit(2)
+raise SystemExit(0 if running else 1)
+"""
+
+
+def _target_environment(target: HermesTarget) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["HERMES_HOME"] = os.fspath(target.home)
+    return environment
+
+
+def _capture_provider(target: HermesTarget) -> str | None:
+    command = [os.fspath(target.python), "-c", _PROVIDER_PROBE]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            env=_target_environment(target),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+        )
+    except BaseException:
+        raise HermesInstallError("The Hermes provider state probe failed.") from None
+    if result.returncode != 0 or type(result.stdout) is not str:
+        raise HermesInstallError("The Hermes provider state probe failed.")
+    try:
+        provider = json.loads(result.stdout)
+    except (TypeError, ValueError, RecursionError):
+        raise HermesInstallError("The Hermes provider state is malformed.") from None
+    if provider is not None and (
+        type(provider) is not str or _PROVIDER_NAME.fullmatch(provider) is None
+    ):
+        raise HermesInstallError("The Hermes provider state is malformed.")
+    return provider
+
+
+def _gateway_running(target: HermesTarget) -> bool:
+    command = [os.fspath(target.python), "-c", _GATEWAY_PROBE]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            env=_target_environment(target),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except BaseException:
+        raise HermesInstallError("The Hermes gateway state probe failed.") from None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise HermesInstallError("The Hermes gateway state probe failed.")
+
+
+def capture_runtime_state(target: HermesTarget) -> HermesRuntimeState:
+    """Capture the selected profile's provider and gateway state without mutation."""
+    return HermesRuntimeState(_capture_provider(target), _gateway_running(target))
+
+
+def _run_hermes(target: HermesTarget, arguments: list[str]) -> None:
+    command = [os.fspath(target.executable), *arguments]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            env=_target_environment(target),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except BaseException:
+        raise HermesInstallError("A required Hermes command could not run.") from None
+    if result.returncode != 0:
+        raise HermesInstallError("A required Hermes command failed.")
+
+
+def _verify_plugin_config(target: HermesTarget) -> None:
+    try:
+        config = _read_safe_json(target.home / "memoryd.json")
+    except BaseException:
+        raise HermesInstallError("The Hermes plugin config is invalid.") from None
+    if not isinstance(config, dict) or config.get("url") != _PLUGIN_URL:
+        raise HermesInstallError("The Hermes plugin config is invalid.")
+
+
+def _safe_json_file_count(directory: Path) -> int:
+    try:
+        if not os.path.lexists(directory):
+            return 0
+        directory_stat = directory.lstat()
+        if directory.is_symlink() or not stat.S_ISDIR(directory_stat.st_mode):
+            raise OSError
+        paths = list(directory.glob("*.json"))
+        for path in paths:
+            path_stat = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(path_stat.st_mode):
+                raise OSError
+        return len(paths)
+    except (OSError, RuntimeError):
+        raise HermesInstallError("The Hermes durable spool is unreadable.") from None
+
+
+def _read_safe_json(path: Path) -> object:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise OSError
+        stream = os.fdopen(descriptor, "r", encoding="utf-8")
+        descriptor = -1
+        with stream:
+            return json.load(stream)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        raise HermesInstallError("A required JSON state file is unreadable.") from None
+    finally:
+        if descriptor >= 0:
+            _close_descriptor(descriptor)
+
+
+def _pending_spool_jobs(target: HermesTarget) -> int:
+    root = target.home / "spool" / "memoryd"
+    try:
+        if os.path.lexists(root):
+            root_stat = root.lstat()
+            if root.is_symlink() or not stat.S_ISDIR(root_stat.st_mode):
+                raise OSError
+    except (OSError, RuntimeError):
+        raise HermesInstallError("The Hermes durable spool is unreadable.") from None
+
+    incoming = _safe_json_file_count(root / "incoming")
+    processing = _safe_json_file_count(root / "processing")
+    dead_letters = _safe_json_file_count(root / "dead-letter")
+    if dead_letters:
+        raise HermesInstallError("The Hermes durable spool has dead letters.")
+
+    state_path = root / "state.json"
+    try:
+        state_exists = os.path.lexists(state_path)
+    except OSError:
+        raise HermesInstallError("The Hermes durable spool state is unreadable.") from None
+    if state_exists:
+        state = _read_safe_json(state_path)
+        if not isinstance(state, dict):
+            raise HermesInstallError("The Hermes durable spool state is unreadable.")
+        fault = state.get("durability_fault")
+        if fault not in (None, ""):
+            if type(fault) is not str:
+                raise HermesInstallError("The Hermes durable spool state is unreadable.")
+            raise HermesInstallError("The Hermes durable spool has a durability fault.")
+    return incoming + processing
+
+
+def _wait_for_spool_drain(
+    target: HermesTarget, *, timeout: float = _SPOOL_DRAIN_TIMEOUT,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        if _pending_spool_jobs(target) == 0:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HermesInstallError("The Hermes durable spool did not drain.")
+        time.sleep(min(_SPOOL_POLL_INTERVAL, remaining))
+
+
+def _rollback_activation(
+    target: HermesTarget, original: HermesRuntimeState,
+) -> list[str]:
+    failures: list[str] = []
+    try:
+        running = _gateway_running(target)
+    except BaseException:
+        running = None
+        failures.append("gateway quiesce probe")
+    if running is not False:
+        try:
+            _run_hermes(target, ["gateway", "stop"])
+        except BaseException:
+            failures.append("gateway quiesce")
+        try:
+            if _gateway_running(target):
+                failures.append("gateway quiesce verification")
+        except BaseException:
+            failures.append("gateway quiesce verification")
+
+    try:
+        if original.provider is None:
+            _run_hermes(target, ["memory", "off"])
+        else:
+            _run_hermes(
+                target,
+                ["config", "set", "memory.provider", original.provider],
+            )
+    except BaseException:
+        failures.append("provider restore")
+    try:
+        if _capture_provider(target) != original.provider:
+            failures.append("provider restore verification")
+    except BaseException:
+        failures.append("provider restore verification")
+
+    if original.gateway_running:
+        try:
+            _run_hermes(target, ["gateway", "start"])
+        except BaseException:
+            failures.append("gateway restore")
+        try:
+            if not _gateway_running(target):
+                failures.append("gateway restore verification")
+        except BaseException:
+            failures.append("gateway restore verification")
+    else:
+        try:
+            if _gateway_running(target):
+                failures.append("gateway restore verification")
+        except BaseException:
+            failures.append("gateway restore verification")
+    return failures
+
+
+def activate_and_verify(target: HermesTarget) -> None:
+    """Activate memoryd transactionally and restore captured state on failure."""
+    original = capture_runtime_state(target)
+    stage = "transaction initialization"
+    try:
+        if original.gateway_running:
+            stage = "gateway stop"
+            _run_hermes(target, ["gateway", "stop"])
+            if _gateway_running(target):
+                raise HermesInstallError("The Hermes gateway did not stop.")
+
+        stage = "provider activation"
+        _run_hermes(target, ["config", "set", "memory.provider", "memoryd"])
+        stage = "provider verification"
+        if _capture_provider(target) != "memoryd":
+            raise HermesInstallError("The Hermes provider was not activated.")
+
+        stage = "Hermes memory status"
+        _run_hermes(target, ["memory", "status"])
+        stage = "Hermes memoryd config"
+        _run_hermes(target, ["memoryd", "config"])
+        stage = "plugin config"
+        _verify_plugin_config(target)
+        stage = "memoryd status"
+        if cli.status() != 0:
+            raise HermesInstallError("The memoryd status check failed.")
+        stage = "Hermes memoryd status"
+        _run_hermes(target, ["memoryd", "status"])
+        stage = "spool drain"
+        _wait_for_spool_drain(target)
+
+        if original.gateway_running:
+            stage = "gateway restore"
+            _run_hermes(target, ["gateway", "start"])
+            if not _gateway_running(target):
+                raise HermesInstallError("The Hermes gateway did not restart.")
+        else:
+            stage = "gateway state verification"
+            if _gateway_running(target):
+                raise HermesInstallError("The Hermes gateway state changed.")
+        stage = "final provider verification"
+        if _capture_provider(target) != "memoryd":
+            raise HermesInstallError("The Hermes provider state changed.")
+    except BaseException:
+        rollback_failures = _rollback_activation(target, original)
+        message = f"Hermes activation failed during {stage}."
+        if rollback_failures:
+            message += " Rollback incomplete at: " + ", ".join(rollback_failures) + "."
+        raise HermesInstallError(message) from None
 
 
 def require_guided_environment() -> None:
