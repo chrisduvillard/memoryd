@@ -868,12 +868,15 @@ def test_guided_plugin_interrupted_swap_restores_prior_without_partial_mix(
     (source / "__init__.py").write_text("VERSION = 'two'\n", encoding="utf-8")
     real_replace = hermes.os.replace
 
-    def interrupt_stage(source_path, destination_path):
+    def interrupt_stage(source_path, destination_path, *args, **kwargs):
         source_value = Path(source_path)
         destination_value = Path(destination_path)
-        if source_value.name.startswith(".memoryd-stage-") and destination_value == destination:
+        if (
+            source_value.name.startswith(".memoryd-stage-")
+            and destination_value.name == "memoryd"
+        ):
             raise KeyboardInterrupt
-        return real_replace(source_path, destination_path)
+        return real_replace(source_path, destination_path, *args, **kwargs)
 
     monkeypatch.setattr(hermes.os, "replace", interrupt_stage)
 
@@ -894,19 +897,294 @@ def test_guided_plugin_staging_manifest_mismatch_preserves_prior(
     destination = target.home / "plugins" / "memoryd"
     before = _file_manifest(destination)
     (source / "__init__.py").write_text("VERSION = 'two'\n", encoding="utf-8")
-    real_copy = hermes._copy_guided_plugin_tree
+    real_copy = hermes._copy_plugin_tree_fd
 
-    def tamper_after_copy(source_root: Path, stage_root: Path):
-        real_copy(source_root, stage_root)
-        (stage_root / "__init__.py").write_text("tampered\n", encoding="utf-8")
+    def tamper_after_copy(source_fd: int, stage_fd: int, prefix: Path = Path()):
+        real_copy(source_fd, stage_fd, prefix)
+        if prefix.parts:
+            return
+        descriptor = os.open(
+            "__init__.py", os.O_WRONLY | os.O_TRUNC, dir_fd=stage_fd,
+        )
+        try:
+            os.write(descriptor, b"tampered\n")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
-    monkeypatch.setattr(hermes, "_copy_guided_plugin_tree", tamper_after_copy)
+    monkeypatch.setattr(hermes, "_copy_plugin_tree_fd", tamper_after_copy)
 
     with pytest.raises(hermes.HermesInstallError, match="manifest|verify"):
         hermes.publish_guided_plugin(target)
 
     assert _file_manifest(destination) == before
     assert not list((target.home / "plugins").glob(".memoryd-*-*"))
+
+
+def _publication_pair(target: HermesTarget) -> tuple[dict[str, bytes], bytes | None, int | None]:
+    destination = target.home / "plugins" / "memoryd"
+    config = target.home / "memoryd.json"
+    return (
+        _file_manifest(destination),
+        config.read_bytes() if config.exists() else None,
+        stat.S_IMODE(config.stat().st_mode) if config.exists() else None,
+    )
+
+
+def _publication_rerun(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, prior_config: bool = True,
+) -> tuple[HermesTarget, Path, tuple[dict[str, bytes], bytes | None, int | None]]:
+    target = _hermes_target(tmp_path)
+    source = _plugin_source(tmp_path, "one")
+    monkeypatch.setattr(cli, "_resource_dir", lambda name: source)
+    hermes.publish_guided_plugin(target)
+    config = target.home / "memoryd.json"
+    if prior_config:
+        config.write_bytes(b'{"url":"http://127.0.0.1:7444","prior":true}\n')
+        os.chmod(config, 0o600)
+    else:
+        config.unlink()
+    before = _publication_pair(target)
+    (source / "__init__.py").write_text("VERSION = 'two'\n", encoding="utf-8")
+    (source / "nested" / "resource.txt").write_text("resource-two\n", encoding="utf-8")
+    return target, source, before
+
+
+def _fd_target(descriptor: int) -> Path | None:
+    try:
+        return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+    except OSError:
+        return None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fd publication is POSIX-only")
+@pytest.mark.parametrize("prior_config", [False, True])
+@pytest.mark.parametrize(
+    "fault", ["before-config-replace", "config-replace", "config-mode", "home-fsync"],
+)
+def test_guided_plugin_precommit_fault_restores_exact_plugin_and_config_pair(
+    monkeypatch, tmp_path, prior_config, fault,
+):
+    target, _source, before = _publication_rerun(
+        monkeypatch, tmp_path, prior_config=prior_config,
+    )
+    real_replace = os.replace
+    real_chmod = os.chmod
+    real_fchmod = os.fchmod
+    real_fsync = os.fsync
+    fired = False
+
+    def replace(source, destination, *args, **kwargs):
+        nonlocal fired
+        if (
+            not fired
+            and fault == "before-config-replace"
+            and Path(destination).name == "memoryd.json"
+        ):
+            fired = True
+            raise OSError("injected pre-config replace fault")
+        result = real_replace(source, destination, *args, **kwargs)
+        if fault == "config-replace" and Path(destination).name == "memoryd.json":
+            fired = True
+            raise OSError("injected config replace persistence fault")
+        return result
+
+    def chmod(path, mode, *args, **kwargs):
+        nonlocal fired
+        if fault == "config-mode" and "memoryd" in Path(path).name and Path(path).suffix in {".tmp", ".json"}:
+            fired = True
+            raise OSError("injected config mode fault")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    def fchmod(descriptor, mode):
+        nonlocal fired
+        path = _fd_target(descriptor)
+        result = real_fchmod(descriptor, mode)
+        if fault == "config-mode" and path is not None and "config" in path.name:
+            fired = True
+            raise OSError("injected config mode fault")
+        return result
+
+    def fsync(descriptor):
+        nonlocal fired
+        result = real_fsync(descriptor)
+        config = target.home / "memoryd.json"
+        if (
+            fault == "home-fsync"
+            and _fd_target(descriptor) == target.home
+            and config.exists()
+            and config.read_bytes() != before[1]
+        ):
+            fired = True
+            raise OSError("injected home fsync fault")
+        return result
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "chmod", chmod)
+    monkeypatch.setattr(os, "fchmod", fchmod)
+    monkeypatch.setattr(os, "fsync", fsync)
+
+    with pytest.raises(hermes.HermesInstallError):
+        hermes.publish_guided_plugin(target)
+
+    assert fired
+    assert _publication_pair(target) == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fd publication is POSIX-only")
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt(), SystemExit(143)])
+def test_guided_plugin_interrupt_after_config_replace_restores_exact_pair(
+    monkeypatch, tmp_path, interruption,
+):
+    target, _source, before = _publication_rerun(monkeypatch, tmp_path)
+    real_replace = os.replace
+    fired = False
+
+    def replace(source, destination, *args, **kwargs):
+        nonlocal fired
+        result = real_replace(source, destination, *args, **kwargs)
+        if not fired and Path(destination).name == "memoryd.json":
+            fired = True
+            raise interruption
+        return result
+
+    monkeypatch.setattr(os, "replace", replace)
+    with pytest.raises(type(interruption)):
+        hermes.publish_guided_plugin(target)
+
+    assert fired
+    assert _publication_pair(target) == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fd publication is POSIX-only")
+def test_guided_plugin_rollback_deletion_interrupt_is_deferred_until_pair_restored(
+    monkeypatch, tmp_path,
+):
+    target, _source, before = _publication_rerun(monkeypatch, tmp_path)
+    real_replace = os.replace
+    real_unlink = os.unlink
+    replaced = False
+    interrupted = False
+
+    def replace(source, destination, *args, **kwargs):
+        nonlocal replaced
+        result = real_replace(source, destination, *args, **kwargs)
+        if not replaced and Path(destination).name == "memoryd.json":
+            replaced = True
+            raise OSError("force rollback")
+        return result
+
+    def unlink(path, *args, **kwargs):
+        nonlocal interrupted
+        parent = _fd_target(kwargs.get("dir_fd", -1))
+        if not interrupted and parent is not None and "discard" in parent.name:
+            interrupted = True
+            raise KeyboardInterrupt
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "unlink", unlink)
+    with pytest.raises((KeyboardInterrupt, hermes.HermesInstallError)):
+        hermes.publish_guided_plugin(target)
+
+    assert replaced and interrupted
+    assert _publication_pair(target) == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fd publication is POSIX-only")
+def test_guided_plugin_postcommit_final_fsync_interrupt_keeps_coherent_new_pair(
+    monkeypatch, tmp_path,
+):
+    target, source, before = _publication_rerun(monkeypatch, tmp_path)
+    real_fsync = os.fsync
+    fired = False
+
+    def fsync(descriptor):
+        nonlocal fired
+        result = real_fsync(descriptor)
+        parent = _fd_target(descriptor)
+        siblings = list((target.home / "plugins").glob(".memoryd-*-*"))
+        config = target.home / "memoryd.json"
+        if (
+            not fired
+            and parent in {target.home, target.home / "plugins"}
+            and config.exists()
+            and config.read_bytes() != before[1]
+            and not siblings
+        ):
+            fired = True
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(KeyboardInterrupt):
+        hermes.publish_guided_plugin(target)
+
+    assert fired
+    assert _file_manifest(target.home / "plugins" / "memoryd") == _file_manifest(source)
+    assert json.loads((target.home / "memoryd.json").read_text(encoding="utf-8")) == {
+        "url": "http://127.0.0.1:7437",
+    }
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fd publication is POSIX-only")
+@pytest.mark.parametrize("race", ["source-root", "source-nested", "plugin-parent", "stage-nested"])
+def test_guided_plugin_fd_races_do_not_touch_external_or_mix_prior_pair(
+    monkeypatch, tmp_path, race,
+):
+    target, source, before = _publication_rerun(monkeypatch, tmp_path)
+    external = tmp_path / f"external-{race}"
+    external.mkdir(mode=0o700)
+    marker = external / "marker"
+    marker.write_bytes(b"external-unchanged")
+    detached: Path | None = None
+    real_open = os.open
+    injected = False
+
+    def open_file(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal injected, detached
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        name = Path(path).name if not isinstance(path, int) else ""
+        parent = _fd_target(dir_fd) if dir_fd is not None else None
+        opened = _fd_target(descriptor)
+        if injected or not (flags & getattr(os, "O_DIRECTORY", 0)):
+            return descriptor
+        if race == "source-root" and Path(path) == source:
+            detached = source.with_name("source-detached")
+            source.rename(detached)
+            source.mkdir(mode=0o700)
+            _plugin_source(tmp_path, "attacker")
+            injected = True
+        elif race == "source-nested" and name == "nested" and parent == source:
+            detached = source / "nested-detached"
+            os.rename("nested", "nested-detached", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.symlink(external, "nested", target_is_directory=True, dir_fd=dir_fd)
+            injected = True
+        elif race == "plugin-parent" and name == "plugins" and parent == target.home:
+            detached = target.home / "plugins-detached"
+            os.rename("plugins", "plugins-detached", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.symlink(external, "plugins", target_is_directory=True, dir_fd=dir_fd)
+            injected = True
+        elif race == "stage-nested" and name == "nested" and parent is not None and ".memoryd-stage-" in parent.name:
+            detached = parent / "nested-detached"
+            os.rename("nested", "nested-detached", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.symlink(external, "nested", target_is_directory=True, dir_fd=dir_fd)
+            injected = True
+        return descriptor
+
+    monkeypatch.setattr(os, "open", open_file)
+    with pytest.raises(hermes.HermesInstallError):
+        hermes.publish_guided_plugin(target)
+
+    assert injected
+    assert marker.read_bytes() == b"external-unchanged"
+    assert list(external.iterdir()) == [marker]
+    assert (target.home / "memoryd.json").read_bytes() == before[1]
+    if race == "plugin-parent":
+        assert detached is not None
+        assert _file_manifest(detached / "memoryd") == before[0]
+    else:
+        assert _publication_pair(target) == before
 
 
 def _backup_row(path: Path, *, ok: bool = True) -> backup.BackupListing:
@@ -1010,6 +1288,59 @@ def test_core_install_orders_revalidation_install_backup_verification_and_restar
         "verify-new",
         "restart-health",
     ]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="guided mode is Linux-only")
+def test_core_install_pins_home_for_real_autostart_and_default_backup_selection(
+    monkeypatch, tmp_path,
+):
+    target = _hermes_target(tmp_path)
+    operator = _operator_home(monkeypatch, tmp_path).resolve()
+    memory_home = operator / "memory"
+    hostile = tmp_path / "hostile-home"
+    hostile.mkdir(mode=0o700)
+    marker = hostile / "marker"
+    marker.write_bytes(b"untouched")
+    monkeypatch.setenv("HOME", str(hostile))
+    monkeypatch.setenv("HERMES_HOME", str(target.root))
+    monkeypatch.delenv("MEMORYD_HOME", raising=False)
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    monkeypatch.setattr(
+        hermes, "resolve_guided_hermes_home", lambda: (target.root, target.home),
+    )
+    monkeypatch.setattr(hermes, "classify_memory_home", lambda home: "fresh")
+    monkeypatch.setattr(hermes, "publish_guided_plugin", lambda _target: None)
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli, "_wait_for_healthy_daemon", lambda: True)
+    monkeypatch.setattr(backup, "verify_snapshot", lambda _path: backup.Verification(True))
+    calls: list[list[str]] = []
+
+    def run(command, timeout=120):
+        calls.append(list(command))
+        if command[-1] == "memoryd-backup-initial.service":
+            snapshot = memory_home / "backups" / "20260714T010203Z-v1"
+            snapshot.mkdir(parents=True)
+        return 0, ""
+
+    def install(options):
+        assert os.environ["HOME"] == str(operator)
+        assert cli._home() == memory_home
+        cli.install_autostart(_hermes_mode=True)
+        return 0
+
+    monkeypatch.setattr(cli, "_run", run)
+    monkeypatch.setattr(cli, "install", install)
+
+    snapshot = hermes.install_hermes_core(
+        target, hermes.ProviderCredentials("openrouter", "voyage"),
+    )
+
+    assert snapshot == memory_home / "backups" / "20260714T010203Z-v1"
+    assert (operator / ".config/systemd/user/memoryd.service").is_file()
+    assert not (hostile / ".config").exists()
+    assert not (hostile / "memory").exists()
+    assert marker.read_bytes() == b"untouched"
+    assert os.environ["HOME"] == str(hostile)
 
 
 def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_reruns(
