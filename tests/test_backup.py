@@ -6,7 +6,9 @@ import json
 import os
 import stat
 import tarfile
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -882,16 +884,26 @@ def test_posix_replace_failure_preserves_existing_empty_target(
 def test_local_pg_tools_keep_all_passwords_out_of_argv(
         monkeypatch, tmp_path, dsn):
     commands: list[tuple[list[str], dict[str, str]]] = []
+    service_files: list[tuple[Path, str, int, int]] = []
     dump = tmp_path / "dump"
 
     def run(command, **kwargs):
-        commands.append((command, kwargs["env"]))
+        env = kwargs["env"]
+        commands.append((command, env))
+        service_path = env.get("PGSERVICEFILE")
+        if service_path is not None:
+            path = Path(service_path)
+            service_files.append((
+                path, path.read_text(encoding="utf-8"),
+                stat.S_IMODE(path.stat().st_mode),
+                stat.S_IMODE(path.parent.stat().st_mode)))
         if "pg_dump" in command[0]:
             dump.write_bytes(b"PGDMPbinary\x00\xff")
         return types.SimpleNamespace(returncode=0, stderr=b"")
 
     monkeypatch.setattr(backup.shutil, "which", lambda name: f"/tools/{name}")
     monkeypatch.setattr(backup.subprocess, "run", run)
+    monkeypatch.setenv("PGPASSWORD", "inherited-password")
     backup._dump_database(dsn, dump)
     backup._restore_database(dump, dsn)
 
@@ -900,10 +912,22 @@ def test_local_pg_tools_keep_all_passwords_out_of_argv(
                for command, _env in commands)
     assert all("tls-secret" not in " ".join(command)
                for command, _env in commands)
-    assert all(env["PGPASSWORD"] == "super-secret"
+    assert all(command[command.index("--dbname") + 1] == "service=memoryd"
+               for command, _env in commands)
+    assert all("PGPASSWORD" not in env for _command, env in commands)
+    assert all("super-secret" not in env.values() and
+               "tls-secret" not in env.values()
                for _command, env in commands)
-    assert all(env["PGSSLPASSWORD"] == "tls-secret"
-               for _command, env in commands)
+    assert len(service_files) == 2
+    for path, text, mode, parent_mode in service_files:
+        assert "[memoryd]" in text
+        assert "password=super-secret" in text
+        assert "sslpassword=tls-secret" in text
+        if os.name != "nt":
+            assert mode == 0o600
+            assert parent_mode == 0o700
+        assert not path.exists()
+        assert not path.parent.exists()
     assert "--format=custom" in commands[0][0]
     assert "--exit-on-error" in commands[1][0]
     assert "--no-owner" in commands[1][0]
@@ -914,10 +938,18 @@ def test_local_pg_tools_keep_all_passwords_out_of_argv(
 def test_restore_tool_failure_redacts_secrets_and_keeps_mock_database_empty(
         monkeypatch, tmp_path):
     database_objects: list[str] = []
+    observed_service_files: list[Path] = []
     dump = tmp_path / "dump"
     dump.write_bytes(b"PGDMPmock")
 
-    def run(command, **_kwargs):
+    def run(command, **kwargs):
+        service_path = kwargs["env"].get("PGSERVICEFILE")
+        if service_path is not None:
+            path = Path(service_path)
+            text = path.read_text(encoding="utf-8")
+            assert "password=super-secret" in text
+            assert "sslpassword=tls-secret" in text
+            observed_service_files.append(path)
         if "--single-transaction" not in command:
             database_objects.append("partially-restored-table")
         return types.SimpleNamespace(
@@ -935,6 +967,9 @@ def test_restore_tool_failure_redacts_secrets_and_keeps_mock_database_empty(
     assert database_objects == []
     assert "super-secret" not in str(exc.value)
     assert "tls-secret" not in str(exc.value)
+    assert len(observed_service_files) == 1
+    assert not observed_service_files[0].exists()
+    assert not observed_service_files[0].parent.exists()
 
 
 def test_invalid_conninfo_diagnostic_does_not_echo_password_fields():
@@ -963,6 +998,83 @@ def test_docker_dump_fallback_refuses_mismatched_localhost_port(
             tmp_path / "dump")
 
     assert not any(call[0] in {"exec", "cp"} for call in calls)
+
+
+def test_concurrent_docker_dumps_use_and_clean_distinct_remote_paths(
+        monkeypatch, tmp_path):
+    started = threading.Barrier(2)
+    dump_paths: list[str] = []
+    copied_paths: list[str] = []
+    cleaned_paths: list[str] = []
+
+    def docker(*args):
+        if args[0] == "inspect":
+            return 0, "exists"
+        if args[:3] == ("exec", cli.CONTAINER, "pg_dump"):
+            dump_paths.append(args[-1])
+            started.wait(timeout=5)
+            return 0, ""
+        if args[0] == "cp":
+            copied_paths.append(args[1].split(":", 1)[1])
+            Path(args[2]).write_bytes(b"PGDMPconcurrent")
+            return 0, ""
+        if args[:4] == ("exec", cli.CONTAINER, "rm", "-f"):
+            cleaned_paths.append(args[4])
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(cli, "_container_port", lambda: "5432")
+    monkeypatch.setattr(cli, "_docker", docker)
+    destinations = [tmp_path / "one.dump", tmp_path / "two.dump"]
+    dsn = "postgresql://postgres:secret@127.0.0.1:5432/memoryd"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda path: backup._dump_database(dsn, path),
+                      destinations))
+
+    assert len(set(dump_paths)) == 2
+    assert set(copied_paths) == set(dump_paths)
+    assert set(cleaned_paths) == set(dump_paths)
+
+
+def test_interleaved_docker_restores_never_delete_peer_remote_path(
+        monkeypatch, tmp_path):
+    copied = threading.Barrier(2)
+    copy_paths: list[str] = []
+    restore_paths: list[str] = []
+    cleaned_paths: list[str] = []
+
+    def docker(*args):
+        if args[0] == "inspect":
+            return 0, "exists"
+        if args[0] == "cp":
+            remote = args[2].split(":", 1)[1]
+            copy_paths.append(remote)
+            copied.wait(timeout=5)
+            return 0, ""
+        if args[:3] == ("exec", cli.CONTAINER, "pg_restore"):
+            restore_paths.append(args[-1])
+            return 0, ""
+        if args[:4] == ("exec", cli.CONTAINER, "rm", "-f"):
+            cleaned_paths.append(args[4])
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(cli, "_container_port", lambda: "5432")
+    monkeypatch.setattr(cli, "_docker", docker)
+    dumps = [tmp_path / "one.dump", tmp_path / "two.dump"]
+    for path in dumps:
+        path.write_bytes(b"PGDMPconcurrent")
+    dsn = "postgresql://postgres:secret@127.0.0.1:5432/memoryd"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda path: backup._restore_database(path, dsn), dumps))
+
+    assert len(set(copy_paths)) == 2
+    assert set(restore_paths) == set(copy_paths)
+    assert set(cleaned_paths) == set(copy_paths)
 
 
 def test_cli_routes_backup_arguments_and_exit_code(monkeypatch):

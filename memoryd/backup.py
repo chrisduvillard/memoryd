@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -13,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -240,27 +242,54 @@ def _create_memory_tar(home: Path, destination: Path) -> None:
                 archive.addfile(_tar_filter(member))
 
 
-def _safe_conninfo(dsn: str) -> tuple[str, dict[str, str], dict[str, str]]:
+def _safe_conninfo(dsn: str) -> tuple[dict[str, str], tuple[str, ...]]:
     try:
-        from psycopg.conninfo import conninfo_to_dict, make_conninfo
+        from psycopg.conninfo import conninfo_to_dict
         values = conninfo_to_dict(dsn)
     except Exception as exc:  # noqa: BLE001
-        raise BackupError(f"invalid PostgreSQL DSN: {exc}") from exc
-    env = os.environ.copy()
-    for field, env_name in (
-            ("password", "PGPASSWORD"),
-            ("sslpassword", "PGSSLPASSWORD")):
-        secret = values.pop(field, None)
-        if secret:
-            env[env_name] = secret
+        raise BackupError("invalid PostgreSQL DSN") from exc
+    redactions = tuple(
+        values[name] for name in ("password", "sslpassword")
+        if values.get(name))
+    return values, redactions
+
+
+@contextmanager
+def _libpq_service(values: dict[str, str]):
+    directory = Path(tempfile.mkdtemp(prefix="memoryd-pg-service-"))
+    service_file = directory / "pg_service.conf"
     try:
-        safe = make_conninfo(**values)
-    except Exception as exc:  # noqa: BLE001
-        raise BackupError(f"invalid PostgreSQL DSN: {exc}") from exc
-    return safe, env, values
+        _chmod(directory, 0o700)
+        for value in values.values():
+            if "\n" in value or "\r" in value:
+                raise BackupError(
+                    "PostgreSQL connection values cannot contain newlines")
+        flags = (os.O_CREAT | os.O_EXCL | os.O_WRONLY |
+                 getattr(os, "O_BINARY", 0))
+        fd = os.open(service_file, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("[memoryd]\n")
+            for name, value in sorted(values.items()):
+                handle.write(f"{name}={value}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _chmod(service_file, 0o600)
+        env = os.environ.copy()
+        for name in ("PGPASSWORD", "PGSERVICE", "PGSERVICEFILE"):
+            env.pop(name, None)
+        env["PGSERVICEFILE"] = str(service_file)
+        yield "service=memoryd", env
+    finally:
+        service_file.unlink(missing_ok=True)
+        try:
+            directory.rmdir()
+        except FileNotFoundError:
+            pass
 
 
-def _run_tool(command: list[str], *, env: dict[str, str]) -> None:
+def _run_tool(
+        command: list[str], *, env: dict[str, str],
+        redactions: tuple[str, ...]) -> None:
     try:
         result = subprocess.run(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -269,10 +298,8 @@ def _run_tool(command: list[str], *, env: dict[str, str]) -> None:
         raise BackupError(f"database tool failed: {exc}") from exc
     if result.returncode:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        for env_name in ("PGPASSWORD", "PGSSLPASSWORD"):
-            secret = env.get(env_name)
-            if secret:
-                detail = detail.replace(secret, "***")
+        for secret in redactions:
+            detail = detail.replace(secret, "***")
         raise BackupError(
             f"database tool exited {result.returncode}: {detail or 'no diagnostic'}")
 
@@ -299,12 +326,18 @@ def _container_connection(values: dict[str, str]) -> tuple[str, str] | None:
     return values.get("user", "postgres"), values.get("dbname", "memoryd")
 
 
+def _remote_dump_path(operation: str) -> str:
+    return f"/tmp/memoryd-{operation}-{secrets.token_hex(16)}.dump"
+
+
 def _dump_database(dsn: str, destination: Path) -> None:
-    safe_dsn, env, values = _safe_conninfo(dsn)
+    values, redactions = _safe_conninfo(dsn)
     tool = shutil.which("pg_dump")
     if tool:
-        _run_tool([tool, "--format=custom", "--file", str(destination),
-                   "--dbname", safe_dsn], env=env)
+        with _libpq_service(values) as (safe_dsn, env):
+            _run_tool([tool, "--format=custom", "--file", str(destination),
+                       "--dbname", safe_dsn], env=env,
+                      redactions=redactions)
         return
     connection = _container_connection(values)
     if not connection or not _docker_available():
@@ -313,7 +346,7 @@ def _dump_database(dsn: str, destination: Path) -> None:
             "the installer-managed memoryd-pgvector container")
     from .cli import CONTAINER, _docker
     user, database = connection
-    remote = "/tmp/memoryd-backup.dump"
+    remote = _remote_dump_path("backup")
     try:
         _docker_tool(["pg_dump", "-U", user, "-d", database,
                       "--format=custom", "--file", remote])
@@ -325,12 +358,13 @@ def _dump_database(dsn: str, destination: Path) -> None:
 
 
 def _restore_database(dump: Path, dsn: str) -> None:
-    safe_dsn, env, values = _safe_conninfo(dsn)
+    values, redactions = _safe_conninfo(dsn)
     tool = shutil.which("pg_restore")
     if tool:
-        _run_tool([tool, "--exit-on-error", "--single-transaction",
-                   "--no-owner", "--no-privileges", "--dbname", safe_dsn,
-                   str(dump)], env=env)
+        with _libpq_service(values) as (safe_dsn, env):
+            _run_tool([tool, "--exit-on-error", "--single-transaction",
+                       "--no-owner", "--no-privileges", "--dbname", safe_dsn,
+                       str(dump)], env=env, redactions=redactions)
         return
     connection = _container_connection(values)
     if not connection or not _docker_available():
@@ -339,7 +373,7 @@ def _restore_database(dump: Path, dsn: str) -> None:
             "the installer-managed memoryd-pgvector container")
     from .cli import CONTAINER, _docker
     user, database = connection
-    remote = "/tmp/memoryd-restore.dump"
+    remote = _remote_dump_path("restore")
     code, detail = _docker("cp", str(dump), f"{CONTAINER}:{remote}")
     if code:
         raise BackupError(f"copying database dump into Docker failed: {detail}")

@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 CONTAINER = "memoryd-pgvector"
@@ -37,6 +38,7 @@ VOLUME = "memoryd_pgdata"
 IMAGE = "pgvector/pgvector:pg16"
 LEGACY_PG_PASSWORD = "memoryd"
 MANAGED_CREDENTIALS = ".managed-postgres.json"
+DOCKER_ENV_PREFIX = ".memoryd-docker-env-"
 HOOK_SENTINEL = "-m memoryd.hook"
 HOOK_EVENTS = {
     "UserPromptSubmit": ("recall", 5),
@@ -142,6 +144,10 @@ def _container_definitively_absent(code: int, detail: str) -> bool:
         "no such object", "no such container"))
 
 
+def _volume_definitively_absent(code: int, detail: str) -> bool:
+    return code != 0 and "no such volume" in detail.lower()
+
+
 def _managed_credential_value(port: int, password: str) -> dict:
     return {
         "schema_version": 1,
@@ -218,6 +224,55 @@ def _remove_managed_credentials(value: dict) -> None:
         _fsync_managed_credential_dir(path.parent)
 
 
+def _cleanup_stale_docker_env_files() -> None:
+    home = _home()
+    removed = False
+    try:
+        candidates = list(home.glob(f"{DOCKER_ENV_PREFIX}*.tmp"))
+    except OSError as exc:
+        raise SystemExit(f"cannot inspect stale Docker env files: {exc}") from exc
+    for path in candidates:
+        try:
+            mode = path.stat(follow_symlinks=False).st_mode
+            if (path.is_symlink() or not stat.S_ISREG(mode) or
+                    (os.name != "nt" and stat.S_IMODE(mode) != 0o600)):
+                continue
+            path.unlink()
+            removed = True
+        except OSError as exc:
+            raise SystemExit(
+                f"cannot remove stale owner-only Docker env file {path}: "
+                f"{exc}") from exc
+    if removed:
+        _fsync_managed_credential_dir(home)
+
+
+@contextmanager
+def _docker_env_file(password: str):
+    if "\n" in password or "\r" in password:
+        raise SystemExit("managed PostgreSQL credential contains a newline")
+    home = _home()
+    home.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(home, 0o700)
+    path = home / f"{DOCKER_ENV_PREFIX}{secrets.token_hex(16)}.tmp"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"POSTGRES_PASSWORD={password}\nPOSTGRES_DB=memoryd\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        yield path
+    finally:
+        existed = os.path.lexists(path)
+        path.unlink(missing_ok=True)
+        if existed:
+            _fsync_managed_credential_dir(home)
+
+
 def _pg_ready(admin_dsn: str, wait_s: int) -> bool:
     import psycopg
     deadline = time.monotonic() + wait_s
@@ -234,6 +289,7 @@ def _pg_ready(admin_dsn: str, wait_s: int) -> bool:
 def ensure_container() -> str:
     """Adopt or (re)create the pgvector container; return the memoryd DSN."""
     import psycopg
+    _cleanup_stale_docker_env_files()
     code, _ = _docker("info")
     if code != 0:
         raise SystemExit(
@@ -281,30 +337,71 @@ def ensure_container() -> str:
         return (f"postgresql://postgres:{password}"
                 f"@127.0.0.1:{port}/memoryd")
 
+    volume_code, volume_detail = _docker("volume", "inspect", VOLUME)
+    if volume_code != 0 and not _volume_definitively_absent(
+            volume_code, volume_detail):
+        raise SystemExit(
+            f"cannot determine whether Docker volume {VOLUME} exists. No "
+            "container changes were made; check Docker and re-run: memoryd "
+            "install")
+    prior_managed = _read_managed_credentials()
+    recovering_legacy = prior_managed is None and volume_code == 0
+    if prior_managed is not None:
+        password = prior_managed["password"]
+    elif recovering_legacy:
+        password = LEGACY_PG_PASSWORD
+    else:
+        password = secrets.token_urlsafe(32)
     port_n = _free_port()
-    password = secrets.token_urlsafe(32)
     managed = _managed_credential_value(port_n, password)
-    _write_managed_credentials(managed)
-    code, out = _docker(
-        "run", "-d", "--name", CONTAINER, "--restart", "unless-stopped",
-        "-v", f"{VOLUME}:/var/lib/postgresql/data",
-        "-e", f"POSTGRES_PASSWORD={password}", "-e", "POSTGRES_DB=memoryd",
-        "-p", f"127.0.0.1:{port_n}:5432", IMAGE)
+    if not recovering_legacy:
+        _write_managed_credentials(managed)
+    with _docker_env_file(password) as env_path:
+        code, out = _docker(
+            "run", "-d", "--name", CONTAINER, "--restart", "unless-stopped",
+            "-v", f"{VOLUME}:/var/lib/postgresql/data",
+            "--env-file", str(env_path),
+            "-p", f"127.0.0.1:{port_n}:5432", IMAGE)
     if code != 0:
         after_code, after_detail = _docker("inspect", CONTAINER)
         if _container_definitively_absent(after_code, after_detail):
-            _remove_managed_credentials(managed)
+            record_removed = False
+            if prior_managed is None and not recovering_legacy:
+                volume_after_code, volume_after_detail = _docker(
+                    "volume", "inspect", VOLUME)
+                if _volume_definitively_absent(
+                        volume_after_code, volume_after_detail):
+                    _remove_managed_credentials(managed)
+                    record_removed = True
+            if recovering_legacy or record_removed:
+                raise SystemExit(
+                    f"docker run failed: {out.replace(password, '***')}")
             raise SystemExit(
-                f"docker run failed: {out.replace(password, '***')}")
+                "docker run failed after the managed volume may have been "
+                "initialized; managed credentials retained. Check Docker and "
+                "re-run: memoryd install")
         state = ("the managed container now exists" if after_code == 0 else
                  "follow-up inspect was inconclusive")
+        if recovering_legacy:
+            raise SystemExit(
+                f"docker run reported failure, but {state}; legacy volume "
+                "credentials remain unproven and no credential record was "
+                "created. Check Docker and re-run: memoryd install")
         raise SystemExit(
             f"docker run reported failure, but {state}; managed credentials "
             "retained; follow-up inspect/recovery may be needed. Start Docker "
             "if necessary and re-run: memoryd install")
     admin = f"postgresql://postgres:{password}@127.0.0.1:{port_n}/postgres"
     if not _pg_ready(admin, 90):
+        if recovering_legacy:
+            raise SystemExit(
+                f"Docker volume {VOLUME} is initialized, but its credentials "
+                "are unknown. The volume and container were not removed. "
+                "Restore a working dsn in config.json or set MEMORYD_DSN, "
+                "then re-run.")
         raise SystemExit("postgres container did not become ready within 90s")
+    if recovering_legacy:
+        _write_managed_credentials(managed)
     with psycopg.connect(admin, autocommit=True) as c:
         if not c.execute("SELECT 1 FROM pg_database WHERE datname='memoryd'").fetchone():
             c.execute("CREATE DATABASE memoryd")  # pre-existing volume without it

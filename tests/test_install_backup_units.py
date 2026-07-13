@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import sys
 import types
 from pathlib import Path
@@ -49,12 +51,20 @@ def test_only_explicit_docker_absence_is_definitive():
 
 def test_fresh_container_uses_random_masked_password(monkeypatch, capsys):
     docker_calls: list[tuple[str, ...]] = []
+    env_observations: list[tuple[Path, str, int]] = []
     passwords = iter(("A" * 43, "B" * 43))
 
     def docker(*args):
         docker_calls.append(args)
         if args[0] == "inspect":
             return 1, "Error: No such object: memoryd-pgvector"
+        if args[:2] == ("volume", "inspect"):
+            return 1, "Error: No such volume: memoryd_pgdata"
+        if args[0] == "run" and "--env-file" in args:
+            path = Path(args[args.index("--env-file") + 1])
+            env_observations.append((
+                path, path.read_text(encoding="utf-8"),
+                stat.S_IMODE(path.stat().st_mode)))
         return 0, "container-id"
 
     monkeypatch.setattr(cli, "_docker", docker)
@@ -66,23 +76,33 @@ def test_fresh_container_uses_random_masked_password(monkeypatch, capsys):
     first = cli.ensure_container()
     run = next(call for call in docker_calls if call[0] == "run")
 
-    assert "POSTGRES_PASSWORD=" + "A" * 43 in run
+    assert "A" * 43 not in " ".join(run)
+    assert len(env_observations) == 1
+    env_path, env_text, env_mode = env_observations[0]
+    assert env_text == (
+        "POSTGRES_PASSWORD=" + "A" * 43 + "\nPOSTGRES_DB=memoryd\n")
+    if os.name != "nt":
+        assert env_mode == 0o600
+    assert not env_path.exists()
     assert "A" * 43 in first
     assert "A" * 43 not in capsys.readouterr().out
     assert cli._mask(first).endswith("postgres:***@127.0.0.1:5439/memoryd")
 
-    docker_calls.clear()
-    second = cli.ensure_container()
-    assert first != second
-
-
 def test_fresh_container_failure_never_exposes_generated_password(monkeypatch):
     password = "generated-super-secret-password"
+    observed_env_paths: list[Path] = []
 
     def docker(*args):
         if args[0] == "inspect":
             return 1, "Error: No such object: memoryd-pgvector"
+        if args[:2] == ("volume", "inspect"):
+            return 1, "Error: No such volume: memoryd_pgdata"
         if args[0] == "run":
+            assert password not in " ".join(args)
+            path = Path(args[args.index("--env-file") + 1])
+            assert path.read_text(encoding="utf-8").startswith(
+                f"POSTGRES_PASSWORD={password}\n")
+            observed_env_paths.append(path)
             return 1, f"failed command contained {password}"
         return 0, ""
 
@@ -96,6 +116,30 @@ def test_fresh_container_failure_never_exposes_generated_password(monkeypatch):
 
     assert password not in str(exc.value)
     assert "***" in str(exc.value)
+    assert len(observed_env_paths) == 1
+    assert not observed_env_paths[0].exists()
+
+
+def test_next_install_cleans_only_safe_stale_docker_env_files(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    home.mkdir()
+    stale = home / ".memoryd-docker-env-deadbeef.tmp"
+    stale.write_text("POSTGRES_PASSWORD=stale-secret\n", encoding="utf-8")
+    if os.name != "nt":
+        stale.chmod(0o600)
+    unrelated = home / ".memoryd-docker-env-deadbeef.tmp.keep"
+    unrelated.write_text("must remain", encoding="utf-8")
+    directory = home / ".memoryd-docker-env-directory.tmp"
+    directory.mkdir()
+    monkeypatch.setattr(cli, "_docker", lambda *_args: (1, "offline"))
+
+    with pytest.raises(SystemExit, match="Docker is not running"):
+        cli.ensure_container()
+
+    assert not stale.exists()
+    assert unrelated.is_file()
+    assert directory.is_dir()
 
 
 def test_crash_after_container_create_rerun_adopts_managed_credentials(
@@ -111,6 +155,8 @@ def test_crash_after_container_create_rerun_adopts_managed_credentials(
         if args[0] == "inspect":
             return ((0, "exists") if running else
                     (1, "Error: No such object: memoryd-pgvector"))
+        if args[:2] == ("volume", "inspect"):
+            return 1, "Error: No such volume: memoryd_pgdata"
         if args[0] == "run":
             record = tmp_path / "memory" / ".managed-postgres.json"
             assert record.is_file(), "credential record must precede docker run"
@@ -137,6 +183,107 @@ def test_crash_after_container_create_rerun_adopts_managed_credentials(
     assert all(password in dsn for dsn in readiness_dsns)
 
 
+def test_absent_container_reuses_record_for_initialized_volume(
+        monkeypatch, tmp_path):
+    stored_password = "credential-that-initialized-the-volume"
+    cli._write_managed_credentials(
+        cli._managed_credential_value(5439, stored_password))
+    running = False
+    run_calls: list[tuple[str, ...]] = []
+
+    def docker(*args):
+        nonlocal running
+        if args[0] == "info":
+            return 0, ""
+        if args[0] == "inspect":
+            return ((0, "exists") if running else
+                    (1, "Error: No such object: memoryd-pgvector"))
+        if args[:2] == ("volume", "inspect"):
+            return 0, "initialized-volume"
+        if args[0] == "run":
+            run_calls.append(args)
+            running = True
+            return 0, "container-id"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5440)
+    monkeypatch.setattr(
+        cli, "_pg_ready",
+        lambda dsn, _wait: stored_password in dsn)
+    monkeypatch.setattr(
+        "secrets.token_urlsafe",
+        lambda _size: pytest.fail("must not replace an established credential"))
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    dsn = cli.ensure_container()
+
+    assert stored_password in dsn
+    assert ":5440/" in dsn
+    assert len(run_calls) == 1
+    record = json.loads(
+        (tmp_path / "memory" / ".managed-postgres.json").read_text())
+    assert record["password"] == stored_password
+    assert record["port"] == 5440
+
+
+def test_initialized_legacy_volume_is_recovered_without_random_secret(
+        monkeypatch, tmp_path):
+    def docker(*args):
+        if args[0] == "info":
+            return 0, ""
+        if args[0] == "inspect":
+            return 1, "Error: No such object: memoryd-pgvector"
+        if args[:2] == ("volume", "inspect"):
+            return 0, "initialized-volume"
+        return 0, "container-id"
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    monkeypatch.setattr(
+        cli, "_pg_ready",
+        lambda dsn, _wait: f":{cli.LEGACY_PG_PASSWORD}@" in dsn)
+    monkeypatch.setattr(
+        "secrets.token_urlsafe",
+        lambda _size: pytest.fail("legacy recovery must not invent a password"))
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    dsn = cli.ensure_container()
+
+    assert f":{cli.LEGACY_PG_PASSWORD}@" in dsn
+    record = json.loads(
+        (tmp_path / "memory" / ".managed-postgres.json").read_text())
+    assert record["password"] == cli.LEGACY_PG_PASSWORD
+
+
+def test_initialized_unknown_volume_refuses_without_random_record(
+        monkeypatch, tmp_path):
+    generated: list[str] = []
+
+    def docker(*args):
+        if args[0] == "info":
+            return 0, ""
+        if args[0] == "inspect":
+            return 1, "Error: No such object: memoryd-pgvector"
+        if args[:2] == ("volume", "inspect"):
+            return 0, "initialized-volume"
+        return 0, "container-id"
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    monkeypatch.setattr(cli, "_pg_ready", lambda _dsn, _wait: False)
+    monkeypatch.setattr(
+        "secrets.token_urlsafe",
+        lambda _size: generated.append("fresh-random") or "fresh-random")
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    with pytest.raises(SystemExit, match="credentials are unknown"):
+        cli.ensure_container()
+
+    assert generated == []
+    assert not (tmp_path / "memory" / ".managed-postgres.json").exists()
+
+
 def test_definitive_docker_run_failure_removes_pending_credential_record(
         monkeypatch, tmp_path):
     observed_record = False
@@ -145,6 +292,8 @@ def test_definitive_docker_run_failure_removes_pending_credential_record(
         nonlocal observed_record
         if args[0] == "inspect":
             return 1, "Error: No such object: memoryd-pgvector"
+        if args[:2] == ("volume", "inspect"):
+            return 1, "Error: No such volume: memoryd_pgdata"
         if args[0] == "run":
             observed_record = (
                 tmp_path / "memory" / ".managed-postgres.json").is_file()
@@ -162,6 +311,37 @@ def test_definitive_docker_run_failure_removes_pending_credential_record(
     assert not (tmp_path / "memory" / ".managed-postgres.json").exists()
 
 
+def test_docker_run_failure_with_initialized_volume_retains_pending_record(
+        monkeypatch, tmp_path):
+    run_attempted = False
+    password = "volume-may-have-used-this-secret"
+
+    def docker(*args):
+        nonlocal run_attempted
+        if args[0] == "inspect":
+            return 1, "Error: No such object: memoryd-pgvector"
+        if args[:2] == ("volume", "inspect"):
+            if run_attempted:
+                return 0, "initialized-volume"
+            return 1, "Error: No such volume: memoryd_pgdata"
+        if args[0] == "run":
+            run_attempted = True
+            return 1, "container creation failed after volume initialization"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    monkeypatch.setattr("secrets.token_urlsafe", lambda _size: password)
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    with pytest.raises(SystemExit, match="credentials retained"):
+        cli.ensure_container()
+
+    record = json.loads(
+        (tmp_path / "memory" / ".managed-postgres.json").read_text())
+    assert record["password"] == password
+
+
 def test_docker_run_timeout_with_delayed_container_retains_credentials(
         monkeypatch, tmp_path):
     exists = False
@@ -172,6 +352,8 @@ def test_docker_run_timeout_with_delayed_container_retains_credentials(
         if args[0] == "inspect":
             return ((0, "exists") if exists else
                     (1, "Error: No such object: memoryd-pgvector"))
+        if args[:2] == ("volume", "inspect"):
+            return 1, "Error: No such volume: memoryd_pgdata"
         if args[0] == "run":
             exists = True
             return 1, f"timed out after creating with {password}"
@@ -200,6 +382,8 @@ def test_docker_run_failure_with_unknown_inspect_retains_credentials(
             if inspections == 1:
                 return 1, "Error: No such object: memoryd-pgvector"
             return 1, "daemon response was inconclusive"
+        if args[:2] == ("volume", "inspect"):
+            return 1, "Error: No such volume: memoryd_pgdata"
         if args[0] == "run":
             return 1, "connection reset"
         return 0, ""

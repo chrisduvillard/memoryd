@@ -40,9 +40,13 @@ legacy `memoryd-pgvector` containers using password `memoryd` remain
 adoptable without data deletion. Fresh credentials are atomically persisted to
 owner-only `~/memory/.managed-postgres.json` before Docker creation so a crash
 before migration/config publication remains recoverable. This secret record is
-not part of a backup snapshot. A failed or timed-out Docker client command does
-not by itself delete the record: deletion occurs only after a follow-up inspect
-definitively confirms that the managed container is absent.
+not part of a backup snapshot. If the container is absent but the named volume
+remains, its recorded credential is reused; without a record, only the legacy
+`memoryd` credential is attempted and is persisted only after readiness proves
+it. Docker receives these values through a short-lived owner-only env file, not
+argv. A failed or timed-out Docker command deletes a newly generated record
+only after follow-up inspection proves that both container and volume are
+absent.
 
 Manual path (bring your own Postgres 16 + pgvector; no Docker):
 
@@ -132,6 +136,11 @@ DSN/home and no API keys, then atomically publishes the home. If `pg_restore`
 fails, the snapshot remains intact and the target transaction rolls back. A
 restore drill should finish with `MEMORYD_HOME=<target> memoryd doctor`;
 re-enter API keys separately.
+
+Local `pg_dump`/`pg_restore` calls receive connection secrets through a private,
+per-operation libpq service file and use only `service=memoryd` on argv. Docker
+fallback transfers use an unpredictable remote path per operation and remove
+only that operation's path.
 
 Backups are local-only: memoryd does not upload snapshots. Linux installs a
 02:35 persistent systemd user timer that stops `memoryd.service`, creates and
