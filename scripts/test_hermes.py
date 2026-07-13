@@ -225,7 +225,7 @@ def main() -> int:
     check("is_available without network", prov.is_available() is True)
 
     print("== seed visa-test memories ==")
-    with pool().connection() as conn:
+    with _pool().connection() as conn:
         evt = append_event(conn, kind="user_message", session_id="hermes-seed",
                            payload={"text": "seed"})
         for mid, scope, text in (

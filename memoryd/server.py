@@ -21,7 +21,6 @@ import re
 import stat
 import sys
 import threading
-import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from http.server import (
