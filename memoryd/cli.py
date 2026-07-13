@@ -25,6 +25,7 @@ import os
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -35,6 +36,7 @@ CONTAINER = "memoryd-pgvector"
 VOLUME = "memoryd_pgdata"
 IMAGE = "pgvector/pgvector:pg16"
 LEGACY_PG_PASSWORD = "memoryd"
+MANAGED_CREDENTIALS = ".managed-postgres.json"
 HOOK_SENTINEL = "-m memoryd.hook"
 HOOK_EVENTS = {
     "UserPromptSubmit": ("recall", 5),
@@ -132,6 +134,82 @@ def _container_port() -> str | None:
     return out if code == 0 and out else None
 
 
+def _managed_credential_value(port: int, password: str) -> dict:
+    return {
+        "schema_version": 1,
+        "container": CONTAINER,
+        "port": port,
+        "password": password,
+        "dsn": f"postgresql://postgres:{password}@127.0.0.1:{port}/memoryd",
+    }
+
+
+def _managed_credential_path() -> Path:
+    return _home() / MANAGED_CREDENTIALS
+
+
+def _fsync_managed_credential_dir(path: Path) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_managed_credentials(value: dict) -> None:
+    path = _managed_credential_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        _fsync_managed_credential_dir(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_managed_credentials() -> dict | None:
+    path = _managed_credential_path()
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if (os.name != "nt" and
+                stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o600):
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(value, dict) or set(value) != {
+            "schema_version", "container", "port", "password", "dsn"}:
+        return None
+    if (type(value["schema_version"]) is not int or value["schema_version"] != 1 or
+            value["container"] != CONTAINER or
+            type(value["port"]) is not int or not 1 <= value["port"] <= 65535 or
+            not isinstance(value["password"], str) or not value["password"]):
+        return None
+    expected = _managed_credential_value(value["port"], value["password"])
+    return value if value == expected else None
+
+
+def _remove_managed_credentials(value: dict) -> None:
+    path = _managed_credential_path()
+    if _read_managed_credentials() == value:
+        path.unlink(missing_ok=True)
+        _fsync_managed_credential_dir(path.parent)
+
+
 def _pg_ready(admin_dsn: str, wait_s: int) -> bool:
     import psycopg
     deadline = time.monotonic() + wait_s
@@ -159,14 +237,25 @@ def ensure_container() -> str:
     if exists == 0:
         _docker("start", CONTAINER)
         port = _container_port() or "5432"
-        admin = (f"postgresql://postgres:{LEGACY_PG_PASSWORD}"
-                 f"@127.0.0.1:{port}/postgres")
-        if not _pg_ready(admin, 30):
+        managed = _read_managed_credentials()
+        passwords: list[str] = []
+        if (managed is not None and managed["container"] == CONTAINER and
+                str(managed["port"]) == port):
+            passwords.append(managed["password"])
+        if LEGACY_PG_PASSWORD not in passwords:
+            passwords.append(LEGACY_PG_PASSWORD)
+        password = next((candidate for candidate in passwords
+                         if _pg_ready(
+                             f"postgresql://postgres:{candidate}"
+                             f"@127.0.0.1:{port}/postgres", 30)), None)
+        if password is None:
             raise SystemExit(
                 f"container {CONTAINER} exists but postgres is not reachable on "
-                f"port {port} with the legacy credentials. Its credentials are "
+                f"port {port} with managed or legacy credentials. Its credentials are "
                 "unknown and it has not been removed. Restore a working dsn in "
                 f"{_home() / 'config.json'} or set MEMORYD_DSN, then re-run.")
+        admin = (f"postgresql://postgres:{password}"
+                 f"@127.0.0.1:{port}/postgres")
         with psycopg.connect(admin, autocommit=True) as c:
             has_db = c.execute(
                 "SELECT 1 FROM pg_database WHERE datname='memoryd'").fetchone()
@@ -175,17 +264,20 @@ def ensure_container() -> str:
         # Existing containers are never destroyed: the volume may contain data
         # outside memoryd that the installer cannot safely classify.
         _docker("update", "--restart", "unless-stopped", CONTAINER)
-        return (f"postgresql://postgres:{LEGACY_PG_PASSWORD}"
+        return (f"postgresql://postgres:{password}"
                 f"@127.0.0.1:{port}/memoryd")
 
     port_n = _free_port()
     password = secrets.token_urlsafe(32)
+    managed = _managed_credential_value(port_n, password)
+    _write_managed_credentials(managed)
     code, out = _docker(
         "run", "-d", "--name", CONTAINER, "--restart", "unless-stopped",
         "-v", f"{VOLUME}:/var/lib/postgresql/data",
         "-e", f"POSTGRES_PASSWORD={password}", "-e", "POSTGRES_DB=memoryd",
         "-p", f"127.0.0.1:{port_n}:5432", IMAGE)
     if code != 0:
+        _remove_managed_credentials(managed)
         raise SystemExit(f"docker run failed: {out.replace(password, '***')}")
     admin = f"postgresql://postgres:{password}@127.0.0.1:{port_n}/postgres"
     if not _pg_ready(admin, 90):
@@ -193,7 +285,7 @@ def ensure_container() -> str:
     with psycopg.connect(admin, autocommit=True) as c:
         if not c.execute("SELECT 1 FROM pg_database WHERE datname='memoryd'").fetchone():
             c.execute("CREATE DATABASE memoryd")  # pre-existing volume without it
-    return f"postgresql://postgres:{password}@127.0.0.1:{port_n}/memoryd"
+    return managed["dsn"]
 
 
 def apply_migrations(dsn: str) -> list[str]:
@@ -335,9 +427,9 @@ Description=memoryd daily verified backup
 
 [Service]
 Type=oneshot
-ExecStartPre=/usr/bin/systemctl --user stop memoryd.service
+ExecStartPre=systemctl --user stop memoryd.service
 ExecStart={python} -m memoryd backup create --retain 14
-ExecStopPost=/usr/bin/systemctl --user start memoryd.service
+ExecStopPost=systemctl --user start memoryd.service
 """
 
 _SYSTEMD_BACKUP_TIMER = """[Unit]
@@ -361,6 +453,11 @@ _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
   {extra}
 </dict></plist>
 """
+
+
+def _systemd_exec_arg(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
 
 
 def install_autostart() -> None:
@@ -387,14 +484,15 @@ def install_autostart() -> None:
     elif sys.platform.startswith("linux"):
         unit_dir = Path("~/.config/systemd/user").expanduser()
         unit_dir.mkdir(parents=True, exist_ok=True)
+        python = _systemd_exec_arg(sys.executable)
         (unit_dir / "memoryd.service").write_text(
-            _SYSTEMD_SERVICE.format(python=sys.executable), encoding="utf-8")
+            _SYSTEMD_SERVICE.format(python=python), encoding="utf-8")
         (unit_dir / "memoryd-microsleep.service").write_text(
-            _SYSTEMD_SLEEP_SERVICE.format(python=sys.executable), encoding="utf-8")
+            _SYSTEMD_SLEEP_SERVICE.format(python=python), encoding="utf-8")
         (unit_dir / "memoryd-microsleep.timer").write_text(
             _SYSTEMD_SLEEP_TIMER, encoding="utf-8")
         (unit_dir / "memoryd-backup.service").write_text(
-            _SYSTEMD_BACKUP_SERVICE.format(python=sys.executable),
+            _SYSTEMD_BACKUP_SERVICE.format(python=python),
             encoding="utf-8")
         (unit_dir / "memoryd-backup.timer").write_text(
             _SYSTEMD_BACKUP_TIMER, encoding="utf-8")

@@ -48,6 +48,9 @@ def _prepare(monkeypatch, home: Path) -> None:
     monkeypatch.setattr(backup, "_daemon_health", lambda: None)
     monkeypatch.setattr(backup, "_doctor_findings", lambda _home: [])
     monkeypatch.setattr(
+        backup, "_database_migrations",
+        lambda _dsn: ["001_init.sql", "002_extraction.sql"], raising=False)
+    monkeypatch.setattr(
         backup, "_dump_database",
         lambda _dsn, path: path.write_bytes(b"PGDMP\x00unit-test"))
 
@@ -166,6 +169,69 @@ def test_create_records_api_key_name_present_only_in_environment(
         snapshot / "manifest.json").read_text()
 
 
+@pytest.mark.parametrize("applied", [
+    ["001_init.sql"],
+    ["001_init.sql", "009_site_extension.sql"],
+])
+def test_create_manifest_uses_actual_database_migration_rows(
+        monkeypatch, tmp_path, applied):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    monkeypatch.setattr(backup, "_database_migrations", lambda _dsn: applied)
+
+    snapshot = backup.create_backup(output=tmp_path / "out", home=home)
+
+    assert _manifest(snapshot)["db_migrations"] == applied
+
+
+def test_create_refuses_missing_or_invalid_migration_ledger(monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    monkeypatch.setattr(
+        backup, "_database_migrations",
+        lambda _dsn: (_ for _ in ()).throw(
+            backup.BackupError("schema_migrations table missing")))
+
+    with pytest.raises(backup.BackupError, match="schema_migrations"):
+        backup.create_backup(output=tmp_path / "out", home=home)
+
+
+@pytest.mark.parametrize("rows", [
+    [],
+    [("001_init.sql",), ("001_init.sql",)],
+    [("../001_init.sql",)],
+    [("002_extraction.sql",), ("001_init.sql",)],
+])
+def test_database_migration_query_rejects_invalid_actual_rows(monkeypatch, rows):
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query):
+            assert query == "SELECT filename FROM schema_migrations ORDER BY filename"
+            return types.SimpleNamespace(fetchall=lambda: rows)
+
+    import psycopg
+    monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: Connection())
+
+    with pytest.raises(backup.BackupError, match="ledger"):
+        backup._database_migrations("postgresql:///memoryd")
+
+
+def test_database_migration_query_reports_missing_table(monkeypatch):
+    import psycopg
+    monkeypatch.setattr(
+        psycopg, "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("relation schema_migrations does not exist")))
+
+    with pytest.raises(backup.BackupError, match="schema_migrations"):
+        backup._database_migrations("postgresql:///memoryd")
+
+
 def test_create_refuses_doctor_errors_and_dead_letters(monkeypatch, tmp_path):
     home = _home(tmp_path)
     monkeypatch.setattr(backup, "_daemon_health", lambda: None)
@@ -174,6 +240,54 @@ def test_create_refuses_doctor_errors_and_dead_letters(monkeypatch, tmp_path):
 
     with pytest.raises(backup.BackupError, match="dead_letter_jobs"):
         backup.create_backup(output=tmp_path / "out", home=home)
+
+
+def test_create_refuses_symlinked_archive_source_root(monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    external = tmp_path / "external-archive"
+    (home / "archive").rename(external)
+    try:
+        (home / "archive").symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    _prepare(monkeypatch, home)
+
+    with pytest.raises(backup.BackupError, match="source root"):
+        backup.create_backup(output=tmp_path / "out", home=home)
+
+
+def test_child_swap_to_symlink_is_not_dereferenced_and_fails_verification(
+        monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    external = tmp_path / "external-secret"
+    external.write_bytes(b"must-not-enter-backup")
+    child = home / "archive" / "objects" / "one"
+    real_scan = backup._safe_source_tree
+    scans = 0
+
+    def swap_after_validation(root):
+        nonlocal scans
+        result = real_scan(root)
+        scans += 1
+        if scans == 2:
+            child.unlink()
+            try:
+                child.symlink_to(external)
+            except OSError as exc:
+                pytest.skip(f"file symlinks unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(backup, "_safe_source_tree", swap_after_validation)
+    tar_path = tmp_path / "memory.tar.gz"
+
+    backup._create_memory_tar(home, tar_path)
+
+    with tarfile.open(tar_path, "r:gz") as archive:
+        member = archive.getmember("archive/objects/one")
+        assert member.issym()
+        assert member.size == 0
+    with pytest.raises(backup.BackupError, match="unsafe tar member type"):
+        backup._validate_tar(tar_path)
 
 
 def test_posix_chmod_failure_aborts_create(monkeypatch, tmp_path):
@@ -469,6 +583,71 @@ def test_retention_removes_only_old_valid_generated_directories(
         assert link.is_symlink()
 
 
+def test_retention_uses_lightweight_metadata_without_full_verification(
+        monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    output = tmp_path / "out"
+    times = iter([
+        datetime(2026, 7, day, 1, tzinfo=timezone.utc)
+        for day in (10, 11, 12)
+    ])
+    monkeypatch.setattr(backup, "_utc_now", lambda: next(times))
+    snapshots = [
+        backup.create_backup(output=output, home=home, retain=14)
+        for _ in range(3)
+    ]
+    monkeypatch.setattr(
+        backup, "verify_snapshot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "retention must not hash or decompress snapshots"))
+
+    backup._apply_retention(output, 2)
+
+    assert not snapshots[0].exists()
+    assert snapshots[1].exists() and snapshots[2].exists()
+
+
+def test_create_does_not_fully_verify_new_snapshot_twice(monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    real_verify = backup.verify_snapshot
+    calls: list[Path] = []
+
+    def counted(snapshot, **kwargs):
+        calls.append(Path(snapshot))
+        return real_verify(snapshot, **kwargs)
+
+    monkeypatch.setattr(backup, "verify_snapshot", counted)
+
+    backup.create_backup(output=tmp_path / "out", home=home)
+
+    assert len(calls) == 1
+
+
+def test_retention_preserves_snapshot_with_inconsistent_size_metadata(
+        monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    output = tmp_path / "out"
+    times = iter([
+        datetime(2026, 7, day, 1, tzinfo=timezone.utc)
+        for day in (10, 11, 12)
+    ])
+    monkeypatch.setattr(backup, "_utc_now", lambda: next(times))
+    snapshots = [
+        backup.create_backup(output=output, home=home, retain=14)
+        for _ in range(3)
+    ]
+    manifest = _manifest(snapshots[0])
+    manifest["files"]["database.dump"]["bytes"] += 1
+    (snapshots[0] / "manifest.json").write_text(json.dumps(manifest))
+
+    backup._apply_retention(output, 2)
+
+    assert snapshots[0].exists()
+
+
 def test_restore_verifies_then_publishes_home_with_target_config(
         monkeypatch, tmp_path):
     source_home = _home(tmp_path)
@@ -664,7 +843,14 @@ def test_posix_replace_failure_preserves_existing_empty_target(
     assert not list(tmp_path.glob(".target.restore-*"))
 
 
-def test_local_pg_tools_keep_password_out_of_argv(monkeypatch, tmp_path):
+@pytest.mark.parametrize("dsn", [
+    ("postgresql://operator:super-secret@localhost:5432/memoryd"
+     "?sslpassword=tls-secret"),
+    ("host=localhost port=5432 dbname=memoryd user=operator "
+     "password=super-secret sslpassword=tls-secret"),
+])
+def test_local_pg_tools_keep_all_passwords_out_of_argv(
+        monkeypatch, tmp_path, dsn):
     commands: list[tuple[list[str], dict[str, str]]] = []
     dump = tmp_path / "dump"
 
@@ -676,19 +862,60 @@ def test_local_pg_tools_keep_password_out_of_argv(monkeypatch, tmp_path):
 
     monkeypatch.setattr(backup.shutil, "which", lambda name: f"/tools/{name}")
     monkeypatch.setattr(backup.subprocess, "run", run)
-    dsn = "postgresql://operator:super-secret@localhost:5432/memoryd"
-
     backup._dump_database(dsn, dump)
     backup._restore_database(dump, dsn)
 
     assert dump.read_bytes() == b"PGDMPbinary\x00\xff"
     assert all("super-secret" not in " ".join(command)
                for command, _env in commands)
+    assert all("tls-secret" not in " ".join(command)
+               for command, _env in commands)
     assert all(env["PGPASSWORD"] == "super-secret"
+               for _command, env in commands)
+    assert all(env["PGSSLPASSWORD"] == "tls-secret"
                for _command, env in commands)
     assert "--format=custom" in commands[0][0]
     assert "--exit-on-error" in commands[1][0]
     assert "--no-owner" in commands[1][0]
+    assert "--single-transaction" in commands[1][0]
+    assert "--no-privileges" in commands[1][0]
+
+
+def test_restore_tool_failure_redacts_secrets_and_keeps_mock_database_empty(
+        monkeypatch, tmp_path):
+    database_objects: list[str] = []
+    dump = tmp_path / "dump"
+    dump.write_bytes(b"PGDMPmock")
+
+    def run(command, **_kwargs):
+        if "--single-transaction" not in command:
+            database_objects.append("partially-restored-table")
+        return types.SimpleNamespace(
+            returncode=1,
+            stderr=b"password=super-secret sslpassword=tls-secret failure")
+
+    monkeypatch.setattr(backup.shutil, "which", lambda name: f"/tools/{name}")
+    monkeypatch.setattr(backup.subprocess, "run", run)
+    dsn = ("host=localhost dbname=memoryd user=operator "
+           "password=super-secret sslpassword=tls-secret")
+
+    with pytest.raises(backup.BackupError) as exc:
+        backup._restore_database(dump, dsn)
+
+    assert database_objects == []
+    assert "super-secret" not in str(exc.value)
+    assert "tls-secret" not in str(exc.value)
+
+
+def test_invalid_conninfo_diagnostic_does_not_echo_password_fields():
+    dsn = ("host=localhost password=super-secret sslpassword=tls-secret "
+           "unterminated='value")
+
+    with pytest.raises(backup.BackupError) as exc:
+        backup._safe_conninfo(dsn)
+
+    assert "super-secret" not in str(exc.value)
+    assert "tls-secret" not in str(exc.value)
 
 
 def test_docker_dump_fallback_refuses_mismatched_localhost_port(

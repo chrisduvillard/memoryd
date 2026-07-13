@@ -224,6 +224,10 @@ To run everything by hand instead: `memoryd serve` in the foreground, `memoryd m
 password, stores its DSN in owner-only `~/memory/config.json` on POSIX, and
 binds PostgreSQL to `127.0.0.1` only. Existing legacy containers using the old
 `memoryd` password remain adoptable without rotating or deleting their data.
+Before creating Docker resources, the installer atomically records fresh
+managed credentials in owner-only `~/memory/.managed-postgres.json`; this lets
+a rerun recover safely if installation stops before migrations or config write.
+The credential record is not included in backups.
 
 </details>
 

@@ -10,6 +10,11 @@ import pytest
 from memoryd import cli
 
 
+@pytest.fixture(autouse=True)
+def _isolated_memory_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "_home", lambda: tmp_path / "memory")
+
+
 class _Cursor:
     def __init__(self, row=(1,)):
         self._row = row
@@ -84,6 +89,69 @@ def test_fresh_container_failure_never_exposes_generated_password(monkeypatch):
     assert "***" in str(exc.value)
 
 
+def test_crash_after_container_create_rerun_adopts_managed_credentials(
+        monkeypatch, tmp_path):
+    running = False
+    calls: list[tuple[str, ...]] = []
+    readiness_dsns: list[str] = []
+    password = "persisted-random-secret"
+
+    def docker(*args):
+        nonlocal running
+        calls.append(args)
+        if args[0] == "inspect":
+            return (0, "exists") if running else (1, "not found")
+        if args[0] == "run":
+            record = tmp_path / "memory" / ".managed-postgres.json"
+            assert record.is_file(), "credential record must precede docker run"
+            running = True
+            return 0, "container-id"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_container_port", lambda: "5439")
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    monkeypatch.setattr(
+        cli, "_pg_ready",
+        lambda dsn, _wait: readiness_dsns.append(dsn) or True)
+    monkeypatch.setattr("secrets.token_urlsafe", lambda _size: password)
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    first = cli.ensure_container()  # caller crashes before migrations/config
+    second = cli.ensure_container()
+
+    assert first == second
+    assert password in second
+    assert sum(call[0] == "run" for call in calls) == 1
+    assert readiness_dsns
+    assert all(password in dsn for dsn in readiness_dsns)
+
+
+def test_definitive_docker_run_failure_removes_pending_credential_record(
+        monkeypatch, tmp_path):
+    observed_record = False
+
+    def docker(*args):
+        nonlocal observed_record
+        if args[0] == "inspect":
+            return 1, "not found"
+        if args[0] == "run":
+            observed_record = (
+                tmp_path / "memory" / ".managed-postgres.json").is_file()
+            return 1, "creation failed"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    with pytest.raises(SystemExit, match="docker run failed"):
+        cli.ensure_container()
+
+    assert observed_record
+    assert not (tmp_path / "memory" / ".managed-postgres.json").exists()
+
+
 def test_existing_legacy_container_is_adopted_without_deletion(monkeypatch):
     docker_calls: list[tuple[str, ...]] = []
 
@@ -154,6 +222,8 @@ def test_linux_installer_writes_backup_units_and_enables_timer(
         monkeypatch, tmp_path):
     calls: list[list[str]] = []
     monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(
+        cli.sys, "executable", "/opt/My Python/bin/python%worker")
     monkeypatch.setattr(Path, "expanduser", lambda self: (
         tmp_path if self.parts[:1] == ("~",) else self))
     monkeypatch.setattr(cli, "_run", lambda cmd, timeout=120: (
@@ -163,9 +233,13 @@ def test_linux_installer_writes_backup_units_and_enables_timer(
 
     service = (tmp_path / "memoryd-backup.service").read_text()
     timer = (tmp_path / "memoryd-backup.timer").read_text()
-    assert "ExecStartPre=/usr/bin/systemctl --user stop memoryd.service" in service
-    assert " -m memoryd backup create --retain 14" in service
-    assert "ExecStopPost=/usr/bin/systemctl --user start memoryd.service" in service
+    assert "ExecStartPre=systemctl --user stop memoryd.service" in service
+    assert ('ExecStart="/opt/My Python/bin/python%%worker" -m memoryd '
+            'backup create --retain 14') in service
+    assert "ExecStopPost=systemctl --user start memoryd.service" in service
+    daemon_service = (tmp_path / "memoryd.service").read_text()
+    assert ('ExecStart="/opt/My Python/bin/python%%worker" '
+            '-m memoryd serve') in daemon_service
     assert "OnCalendar=*-*-* 02:35:00" in timer
     assert "Persistent=true" in timer
     enable = next(call for call in calls if "enable" in call)

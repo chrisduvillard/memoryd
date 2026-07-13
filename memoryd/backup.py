@@ -185,31 +185,28 @@ def _file_entry(path: Path) -> dict[str, Any]:
     return {"sha256": _sha256(path), "bytes": path.stat().st_size}
 
 
-def _safe_source_tree(root: Path) -> None:
-    if not root.exists():
-        return
-    trusted = root.resolve()
+def _safe_source_tree(root: Path) -> set[str]:
+    try:
+        root_stat = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return set()
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise BackupError(f"backup source root must be a real directory: {root}")
     pending = [root]
+    links: set[str] = set()
     while pending:
         directory = pending.pop()
         with os.scandir(directory) as entries:
             for entry in entries:
                 path = Path(entry.path)
                 if entry.is_symlink():
-                    target = path.resolve(strict=True)
-                    try:
-                        target.relative_to(trusted)
-                    except ValueError as exc:
-                        raise BackupError(
-                            f"refusing external link in backup source: {path}") from exc
-                    if not target.is_file():
-                        raise BackupError(
-                            f"refusing non-file link in backup source: {path}")
+                    links.add(path.relative_to(root).as_posix())
                 elif entry.is_dir(follow_symlinks=False):
                     pending.append(path)
                 elif not entry.is_file(follow_symlinks=False):
                     raise BackupError(
                         f"refusing special file in backup source: {path}")
+    return links
 
 
 def _tar_filter(member: tarfile.TarInfo) -> tarfile.TarInfo:
@@ -220,14 +217,23 @@ def _tar_filter(member: tarfile.TarInfo) -> tarfile.TarInfo:
 
 
 def _create_memory_tar(home: Path, destination: Path) -> None:
+    skipped_links: set[str] = set()
     for name in ("archive", "spool"):
-        _safe_source_tree(home / name)
-    with tarfile.open(destination, "w:gz", dereference=True) as archive:
+        skipped_links.update(
+            f"{name}/{relative}"
+            for relative in _safe_source_tree(home / name))
+
+    def safe_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        if member.name in skipped_links:
+            return None
+        return _tar_filter(member)
+
+    with tarfile.open(destination, "w:gz", dereference=False) as archive:
         for name in ("archive", "spool"):
             source = home / name
             if source.is_dir():
                 archive.add(source, arcname=name, recursive=True,
-                            filter=_tar_filter)
+                            filter=safe_filter)
             else:
                 member = tarfile.TarInfo(name)
                 member.type = tarfile.DIRTYPE
@@ -240,10 +246,13 @@ def _safe_conninfo(dsn: str) -> tuple[str, dict[str, str], dict[str, str]]:
         values = conninfo_to_dict(dsn)
     except Exception as exc:  # noqa: BLE001
         raise BackupError(f"invalid PostgreSQL DSN: {exc}") from exc
-    password = values.pop("password", None)
     env = os.environ.copy()
-    if password:
-        env["PGPASSWORD"] = password
+    for field, env_name in (
+            ("password", "PGPASSWORD"),
+            ("sslpassword", "PGSSLPASSWORD")):
+        secret = values.pop(field, None)
+        if secret:
+            env[env_name] = secret
     try:
         safe = make_conninfo(**values)
     except Exception as exc:  # noqa: BLE001
@@ -260,9 +269,10 @@ def _run_tool(command: list[str], *, env: dict[str, str]) -> None:
         raise BackupError(f"database tool failed: {exc}") from exc
     if result.returncode:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        password = env.get("PGPASSWORD")
-        if password:
-            detail = detail.replace(password, "***")
+        for env_name in ("PGPASSWORD", "PGSSLPASSWORD"):
+            secret = env.get(env_name)
+            if secret:
+                detail = detail.replace(secret, "***")
         raise BackupError(
             f"database tool exited {result.returncode}: {detail or 'no diagnostic'}")
 
@@ -318,8 +328,9 @@ def _restore_database(dump: Path, dsn: str) -> None:
     safe_dsn, env, values = _safe_conninfo(dsn)
     tool = shutil.which("pg_restore")
     if tool:
-        _run_tool([tool, "--exit-on-error", "--no-owner", "--dbname",
-                   safe_dsn, str(dump)], env=env)
+        _run_tool([tool, "--exit-on-error", "--single-transaction",
+                   "--no-owner", "--no-privileges", "--dbname", safe_dsn,
+                   str(dump)], env=env)
         return
     connection = _container_connection(values)
     if not connection or not _docker_available():
@@ -333,15 +344,40 @@ def _restore_database(dump: Path, dsn: str) -> None:
     if code:
         raise BackupError(f"copying database dump into Docker failed: {detail}")
     try:
-        _docker_tool(["pg_restore", "--exit-on-error", "--no-owner",
-                      "-U", user, "-d", database, remote])
+        _docker_tool(["pg_restore", "--exit-on-error", "--single-transaction",
+                      "--no-owner", "--no-privileges", "-U", user, "-d",
+                      database, remote])
     finally:
         _docker("exec", CONTAINER, "rm", "-f", remote)
 
 
-def _migration_filenames() -> list[str]:
-    from .cli import _resource_dir
-    return sorted(path.name for path in _resource_dir("migrations").glob("*.sql"))
+def _valid_migration_names(value: object) -> bool:
+    return (
+        isinstance(value, list) and bool(value) and
+        all(isinstance(name, str) and MIGRATION_RE.fullmatch(name)
+            for name in value) and
+        value == sorted(set(value))
+    )
+
+
+def _database_migrations(dsn: str) -> list[str]:
+    try:
+        import psycopg
+        with psycopg.connect(dsn, connect_timeout=5) as connection:
+            rows = connection.execute(
+                "SELECT filename FROM schema_migrations ORDER BY filename"
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        raise BackupError(
+            f"cannot read source schema_migrations ledger: {exc}") from exc
+    try:
+        names = [row["filename"] if isinstance(row, dict) else row[0]
+                 for row in rows]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise BackupError("invalid source schema_migrations ledger rows") from exc
+    if not _valid_migration_names(names):
+        raise BackupError("source schema_migrations ledger is empty or invalid")
+    return names
 
 
 def _snapshot_name(created: datetime) -> str:
@@ -379,6 +415,7 @@ def create_backup(*, output: Path | str | None = None,
     }
     required = sorted(set(required) | set(environment_secrets))
     removed_values.update(environment_secrets.values())
+    migrations = _database_migrations(dsn)
 
     root = Path(output) if output is not None else _default_output()
     if os.path.lexists(root) and root.is_symlink():
@@ -406,7 +443,7 @@ def create_backup(*, output: Path | str | None = None,
             "created_at": created.astimezone(timezone.utc).isoformat().replace(
                 "+00:00", "Z"),
             "memoryd_version": __version__,
-            "db_migrations": _migration_filenames(),
+            "db_migrations": migrations,
             "required_secret_env_names": required,
             "files": {name: _file_entry(staging / name)
                       for name in sorted(PAYLOAD_FILES)},
@@ -567,10 +604,7 @@ def verify_snapshot(snapshot: Path | str, *,
                 required != sorted(set(required))):
             raise BackupError("invalid required_secret_env_names")
         migrations = manifest.get("db_migrations")
-        if (not isinstance(migrations, list) or not migrations or
-                any(not isinstance(name, str) or not MIGRATION_RE.fullmatch(name)
-                    for name in migrations) or
-                migrations != sorted(set(migrations))):
+        if not _valid_migration_names(migrations):
             raise BackupError("invalid db_migrations")
         try:
             config = json.loads(
@@ -614,13 +648,77 @@ def list_backups(output: Path | str | None = None) -> list[BackupListing]:
     return rows
 
 
+def _is_generated_snapshot_metadata(path: Path) -> bool:
+    """Classify retention candidates without hashing or opening payloads."""
+    try:
+        if (not SNAPSHOT_RE.fullmatch(path.name) or path.is_symlink() or
+                not path.is_dir()):
+            return False
+        _require_mode(path, 0o700)
+        children = list(path.iterdir())
+        if {child.name for child in children} != SNAPSHOT_FILES:
+            return False
+        children_by_name = {child.name: child for child in children}
+        for child in children:
+            mode = child.stat(follow_symlinks=False).st_mode
+            if child.is_symlink() or not stat.S_ISREG(mode):
+                return False
+            _require_mode(child, 0o600)
+        manifest = _load_manifest(path)
+        if (set(manifest) != MANIFEST_FIELDS or
+                type(manifest.get("schema_version")) is not int or
+                manifest["schema_version"] != SCHEMA_VERSION):
+            return False
+        created_at = manifest.get("created_at")
+        if not isinstance(created_at, str) or not created_at.endswith("Z"):
+            return False
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if (created.utcoffset() != timezone.utc.utcoffset(created) or
+                _snapshot_name(created) != path.name):
+            return False
+        if (not isinstance(manifest.get("memoryd_version"), str) or
+                not manifest["memoryd_version"]):
+            return False
+        files = manifest.get("files")
+        if not isinstance(files, dict) or set(files) != PAYLOAD_FILES:
+            return False
+        for name, entry in files.items():
+            if (not isinstance(entry, dict) or
+                    set(entry) != {"sha256", "bytes"} or
+                    not isinstance(entry.get("sha256"), str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) or
+                    type(entry.get("bytes")) is not int or entry["bytes"] < 0 or
+                    children_by_name[name].stat().st_size != entry["bytes"]):
+                return False
+        required = manifest.get("required_secret_env_names")
+        if (not isinstance(required, list) or
+                any(not isinstance(name, str) or not _is_secret_env(name)
+                    for name in required) or
+                required != sorted(set(required)) or
+                not _valid_migration_names(manifest.get("db_migrations"))):
+            return False
+        config = json.loads(
+            (path / "config.sanitized.json").read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            return False
+        _validate_config_secrets(config)
+        return True
+    except (BackupError, OSError, UnicodeError, ValueError):
+        return False
+
+
 def _apply_retention(output: Path, retain: int) -> None:
-    valid: list[Path] = []
-    for row in list_backups(output):
-        if row.ok and not row.path.is_symlink() and row.path.is_dir():
-            valid.append(row.path)
+    try:
+        valid = sorted(
+            (path for path in output.iterdir()
+             if _is_generated_snapshot_metadata(path)),
+            key=lambda path: path.name)
+    except OSError as exc:
+        raise BackupError(f"cannot apply retention in {output}: {exc}") from exc
     for old in valid[:-retain]:
-        shutil.rmtree(old)
+        mode = old.stat(follow_symlinks=False).st_mode
+        if stat.S_ISDIR(mode) and not old.is_symlink():
+            shutil.rmtree(old)
 
 
 def _target_db_has_tables(dsn: str) -> bool:

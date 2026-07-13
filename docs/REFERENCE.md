@@ -37,7 +37,10 @@ Fresh installer-managed Docker databases use a random high-entropy password.
 The password-bearing DSN is persisted to the config file (mode `0600` on
 POSIX) and is masked in command output. A working existing DSN is adopted;
 legacy `memoryd-pgvector` containers using password `memoryd` remain
-adoptable without data deletion.
+adoptable without data deletion. Fresh credentials are atomically persisted to
+owner-only `~/memory/.managed-postgres.json` before Docker creation so a crash
+before migration/config publication remains recoverable. This secret record is
+not part of a backup snapshot.
 
 Manual path (bring your own Postgres 16 + pgvector; no Docker):
 
@@ -101,7 +104,9 @@ endpoint and runs the read-only spool/archive doctor checks before writing.
 Each owner-only snapshot contains `database.dump` (PostgreSQL custom format),
 `memory.tar.gz` (`archive/` and `spool/` only), `config.sanitized.json`, and a
 checksummed v1 manifest. API keys and password-bearing DSNs are excluded. The
-manifest records the secret environment-variable names that must be re-entered.
+manifest records the secret environment-variable names that must be re-entered
+and the actual applied filenames queried from the database's
+`schema_migrations` ledger.
 POSIX creation, verification, and restore require snapshot/home directories to
 be mode `0700` and files to be `0600`; permission-setting failures abort.
 Windows chmod protection is best-effort, so operators should also use
@@ -118,13 +123,13 @@ Restore is deliberately out-of-place. Stop the daemon and provide an empty
 target PostgreSQL database plus a new, nonsymlink target home. POSIX also
 accepts an existing empty target directory and atomically replaces it. Windows
 requires the target path to be absent because replacing an existing directory
-is not atomic there. The command verifies first, stages beside the target,
-restores with `pg_restore --exit-on-error --no-owner`, writes a config containing
-the target DSN/home and no API keys, then atomically publishes the home. If
-`pg_restore` fails, the snapshot remains intact and the error warns that the
-otherwise empty target database may now be partially populated. A restore drill
-should finish with `MEMORYD_HOME=<target> memoryd doctor`; re-enter API keys
-separately.
+is not atomic there. The command verifies first, stages beside the target, then
+restores with `pg_restore` using `--exit-on-error`, `--single-transaction`,
+`--no-owner`, and `--no-privileges`. It writes a config containing the target
+DSN/home and no API keys, then atomically publishes the home. If `pg_restore`
+fails, the snapshot remains intact and the target transaction rolls back. A
+restore drill should finish with `MEMORYD_HOME=<target> memoryd doctor`;
+re-enter API keys separately.
 
 Backups are local-only: memoryd does not upload snapshots. Linux installs a
 02:35 persistent systemd user timer that stops `memoryd.service`, creates and
