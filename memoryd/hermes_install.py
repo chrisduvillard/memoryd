@@ -883,6 +883,7 @@ def guided_hermes_install() -> int:
     installed_handlers: set[int] = set()
     failure_message: str | None = None
     interruption_reported = False
+    committed_report: str | None = None
 
     def interrupt(signum: int, _frame: object) -> None:
         nonlocal interrupted_signal
@@ -951,7 +952,7 @@ def guided_hermes_install() -> int:
             restore_handlers()
             if interrupted_signal is not None:
                 raise KeyboardInterrupt
-        print(report_buffer.getvalue(), end="")
+            committed_report = report_buffer.getvalue()
     except KeyboardInterrupt:
         signal_can_interrupt = False
         if interrupted_signal is None:
@@ -989,6 +990,8 @@ def guided_hermes_install() -> int:
         return 128 + interrupted_signal
     if failure_message is not None:
         return 1
+    assert committed_report is not None
+    print(committed_report, end="")
     return 0
 
 

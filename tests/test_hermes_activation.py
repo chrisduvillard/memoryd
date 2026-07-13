@@ -941,3 +941,46 @@ def test_failure_report_oserror_preserves_result_and_always_restores_handlers(
     assert signals.current == signals.previous
     output = capsys.readouterr()
     assert SECRET not in output.out + output.err
+
+
+def test_sigint_during_committed_stdout_flush_propagates_without_rollback(
+    monkeypatch, tmp_path, capsys,
+):
+    target = _target(tmp_path, "legacy")
+    _spool_root(target)
+    boundary = _install_boundary(monkeypatch, target, gateway_running=True)
+    artifact = tmp_path / "memory" / "initial.snapshot"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"preserved installation evidence")
+    signals = _prepare_guided_activation(monkeypatch, target, artifact)
+    signals.previous[int(signal.SIGINT)] = signal.default_int_handler
+    signals.current[int(signal.SIGINT)] = signal.default_int_handler
+    real_print = builtins.print
+    delivered = False
+
+    def interrupt_final_stdout(*args, **kwargs):
+        nonlocal delivered
+        result = real_print(*args, **kwargs)
+        if (
+            not delivered
+            and kwargs.get("file") is None
+            and kwargs.get("end") == ""
+        ):
+            delivered = True
+            signals.deliver(signal.SIGINT)
+        return result
+
+    monkeypatch.setattr(builtins, "print", interrupt_final_stdout)
+
+    result, escaped = _guided_outcome()
+
+    assert result is None
+    assert isinstance(escaped, KeyboardInterrupt)
+    assert delivered
+    assert _read_provider(target.home) == "memoryd"
+    assert boundary.gateway_running is True
+    assert artifact.read_bytes() == b"preserved installation evidence"
+    assert signals.current == signals.previous
+    output = capsys.readouterr()
+    assert "Authoritative Hermes profile" in output.out
+    assert "14-day/200-turn canary" in output.out
