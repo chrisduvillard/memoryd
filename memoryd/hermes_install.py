@@ -46,17 +46,19 @@ def require_guided_environment() -> None:
     if not interactive:
         raise HermesInstallError("Run guided installation from an interactive terminal (TTY).")
 
+    probe = None
+    probe_failed = False
     try:
         probe = subprocess.run(
-            ["systemctl", "--user", "show-environment"],
+            ["systemctl", "--user", "is-system-running"],
             check=False,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        raise HermesInstallError("The systemd user manager is unavailable.") from None
-    if probe.returncode != 0:
+    except (OSError, subprocess.TimeoutExpired):
+        probe_failed = True
+    if probe_failed or probe is None or probe.returncode != 0:
         raise HermesInstallError("The systemd user manager is unavailable.")
 
 

@@ -104,7 +104,7 @@ def test_guided_environment_accepts_linux_ttys_and_read_only_systemd_probe(monke
 
     def run(argv, **kwargs):
         calls.append((list(argv), kwargs))
-        return subprocess.CompletedProcess(argv, 0, stdout="running\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(hermes.sys, "platform", "linux")
     monkeypatch.setattr(hermes.sys, "stdin", _tty())
@@ -115,9 +115,13 @@ def test_guided_environment_accepts_linux_ttys_and_read_only_systemd_probe(monke
 
     assert len(calls) == 1
     argv, kwargs = calls[0]
-    assert argv[:2] == ["systemctl", "--user"]
+    assert argv == ["systemctl", "--user", "is-system-running"]
     assert not ({"start", "stop", "restart", "enable", "disable"} & set(argv))
     assert kwargs.get("check") is False
+    assert kwargs.get("stdout") is subprocess.DEVNULL
+    assert kwargs.get("stderr") is subprocess.DEVNULL
+    assert "capture_output" not in kwargs
+    assert "text" not in kwargs
 
 
 def test_guided_environment_rejects_non_linux_before_systemd(monkeypatch):
@@ -139,16 +143,22 @@ def test_guided_environment_requires_both_interactive_streams(monkeypatch, non_t
         hermes.require_guided_environment()
 
 
-@pytest.mark.parametrize("failure", ["exit", "missing"])
+@pytest.mark.parametrize("failure", ["exit", "missing", "timeout"])
 def test_guided_environment_rejects_unavailable_systemd_user_manager(monkeypatch, failure):
     monkeypatch.setattr(hermes.sys, "platform", "linux")
     monkeypatch.setattr(hermes.sys, "stdin", _tty())
     monkeypatch.setattr(hermes.sys, "stdout", _tty())
 
+    calls: list[dict[str, object]] = []
+    secret = "SYSTEMD-PROBE-SECRET-SENTINEL"
+
     def run(argv, **kwargs):
+        calls.append(kwargs)
         if failure == "missing":
-            raise OSError("systemctl unavailable: remote-body-sentinel")
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="remote-body-sentinel")
+            raise OSError(secret)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(argv, 10, output=secret, stderr=secret)
+        return subprocess.CompletedProcess(argv, 1)
 
     monkeypatch.setattr(hermes.subprocess, "run", run)
 
@@ -156,7 +166,12 @@ def test_guided_environment_rejects_unavailable_systemd_user_manager(monkeypatch
         hermes.require_guided_environment()
 
     assert "systemd" in str(caught.value).lower()
-    assert "remote-body-sentinel" not in str(caught.value)
+    assert calls[0].get("stdout") is subprocess.DEVNULL
+    assert calls[0].get("stderr") is subprocess.DEVNULL
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = repr(caught.value) + "".join(traceback.format_exception(caught.value))
+    assert secret not in rendered
 
 
 def test_operator_confirmation_discloses_safety_consequences_without_secrets(monkeypatch, capsys):
