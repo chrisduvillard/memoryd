@@ -227,7 +227,9 @@ binds PostgreSQL to `127.0.0.1` only. Existing legacy containers using the old
 Before creating Docker resources, the installer atomically records fresh
 managed credentials in owner-only `~/memory/.managed-postgres.json`; this lets
 a rerun recover safely if installation stops before migrations or config write.
-The credential record is not included in backups.
+The credential record is not included in backups. If `docker run` times out or
+returns an ambiguous error, the installer retains the record unless a follow-up
+inspection definitively confirms that the container is absent.
 
 </details>
 

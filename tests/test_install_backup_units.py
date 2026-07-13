@@ -38,6 +38,15 @@ def _fake_psycopg(monkeypatch, connect):
     monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
 
 
+def test_only_explicit_docker_absence_is_definitive():
+    assert cli._container_definitively_absent(
+        1, "Error: No such object: memoryd-pgvector")
+    assert cli._container_definitively_absent(
+        1, "Error: No such container: memoryd-pgvector")
+    assert not cli._container_definitively_absent(
+        1, "docker executable was not found")
+
+
 def test_fresh_container_uses_random_masked_password(monkeypatch, capsys):
     docker_calls: list[tuple[str, ...]] = []
     passwords = iter(("A" * 43, "B" * 43))
@@ -45,7 +54,7 @@ def test_fresh_container_uses_random_masked_password(monkeypatch, capsys):
     def docker(*args):
         docker_calls.append(args)
         if args[0] == "inspect":
-            return 1, "not found"
+            return 1, "Error: No such object: memoryd-pgvector"
         return 0, "container-id"
 
     monkeypatch.setattr(cli, "_docker", docker)
@@ -72,7 +81,7 @@ def test_fresh_container_failure_never_exposes_generated_password(monkeypatch):
 
     def docker(*args):
         if args[0] == "inspect":
-            return 1, "not found"
+            return 1, "Error: No such object: memoryd-pgvector"
         if args[0] == "run":
             return 1, f"failed command contained {password}"
         return 0, ""
@@ -100,7 +109,8 @@ def test_crash_after_container_create_rerun_adopts_managed_credentials(
         nonlocal running
         calls.append(args)
         if args[0] == "inspect":
-            return (0, "exists") if running else (1, "not found")
+            return ((0, "exists") if running else
+                    (1, "Error: No such object: memoryd-pgvector"))
         if args[0] == "run":
             record = tmp_path / "memory" / ".managed-postgres.json"
             assert record.is_file(), "credential record must precede docker run"
@@ -134,7 +144,7 @@ def test_definitive_docker_run_failure_removes_pending_credential_record(
     def docker(*args):
         nonlocal observed_record
         if args[0] == "inspect":
-            return 1, "not found"
+            return 1, "Error: No such object: memoryd-pgvector"
         if args[0] == "run":
             observed_record = (
                 tmp_path / "memory" / ".managed-postgres.json").is_file()
@@ -150,6 +160,58 @@ def test_definitive_docker_run_failure_removes_pending_credential_record(
 
     assert observed_record
     assert not (tmp_path / "memory" / ".managed-postgres.json").exists()
+
+
+def test_docker_run_timeout_with_delayed_container_retains_credentials(
+        monkeypatch, tmp_path):
+    exists = False
+    password = "delayed-container-secret"
+
+    def docker(*args):
+        nonlocal exists
+        if args[0] == "inspect":
+            return ((0, "exists") if exists else
+                    (1, "Error: No such object: memoryd-pgvector"))
+        if args[0] == "run":
+            exists = True
+            return 1, f"timed out after creating with {password}"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    monkeypatch.setattr("secrets.token_urlsafe", lambda _size: password)
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    with pytest.raises(SystemExit, match="credentials retained.*re-run") as exc:
+        cli.ensure_container()
+
+    assert password not in str(exc.value)
+    assert (tmp_path / "memory" / ".managed-postgres.json").is_file()
+
+
+def test_docker_run_failure_with_unknown_inspect_retains_credentials(
+        monkeypatch, tmp_path):
+    inspections = 0
+
+    def docker(*args):
+        nonlocal inspections
+        if args[0] == "inspect":
+            inspections += 1
+            if inspections == 1:
+                return 1, "Error: No such object: memoryd-pgvector"
+            return 1, "daemon response was inconclusive"
+        if args[0] == "run":
+            return 1, "connection reset"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_docker", docker)
+    monkeypatch.setattr(cli, "_free_port", lambda: 5439)
+    _fake_psycopg(monkeypatch, lambda *_args, **_kwargs: _Connection())
+
+    with pytest.raises(SystemExit, match="credentials retained.*inspect"):
+        cli.ensure_container()
+
+    assert (tmp_path / "memory" / ".managed-postgres.json").is_file()
 
 
 def test_existing_legacy_container_is_adopted_without_deletion(monkeypatch):

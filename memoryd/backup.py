@@ -461,7 +461,7 @@ def create_backup(*, output: Path | str | None = None,
             raise BackupError(f"created snapshot failed verification: {result.reason}")
         _atomic_rename(staging, final)
         staging = None
-        _apply_retention(root, retain)
+        _apply_retention(root, retain, verified={final: result})
         return final
     except BackupError:
         raise
@@ -648,73 +648,26 @@ def list_backups(output: Path | str | None = None) -> list[BackupListing]:
     return rows
 
 
-def _is_generated_snapshot_metadata(path: Path) -> bool:
-    """Classify retention candidates without hashing or opening payloads."""
+def _apply_retention(
+        output: Path, retain: int, *,
+        verified: dict[Path, Verification] | None = None) -> None:
+    cached = verified or {}
     try:
-        if (not SNAPSHOT_RE.fullmatch(path.name) or path.is_symlink() or
-                not path.is_dir()):
-            return False
-        _require_mode(path, 0o700)
-        children = list(path.iterdir())
-        if {child.name for child in children} != SNAPSHOT_FILES:
-            return False
-        children_by_name = {child.name: child for child in children}
-        for child in children:
-            mode = child.stat(follow_symlinks=False).st_mode
-            if child.is_symlink() or not stat.S_ISREG(mode):
-                return False
-            _require_mode(child, 0o600)
-        manifest = _load_manifest(path)
-        if (set(manifest) != MANIFEST_FIELDS or
-                type(manifest.get("schema_version")) is not int or
-                manifest["schema_version"] != SCHEMA_VERSION):
-            return False
-        created_at = manifest.get("created_at")
-        if not isinstance(created_at, str) or not created_at.endswith("Z"):
-            return False
-        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-        if (created.utcoffset() != timezone.utc.utcoffset(created) or
-                _snapshot_name(created) != path.name):
-            return False
-        if (not isinstance(manifest.get("memoryd_version"), str) or
-                not manifest["memoryd_version"]):
-            return False
-        files = manifest.get("files")
-        if not isinstance(files, dict) or set(files) != PAYLOAD_FILES:
-            return False
-        for name, entry in files.items():
-            if (not isinstance(entry, dict) or
-                    set(entry) != {"sha256", "bytes"} or
-                    not isinstance(entry.get("sha256"), str) or
-                    not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) or
-                    type(entry.get("bytes")) is not int or entry["bytes"] < 0 or
-                    children_by_name[name].stat().st_size != entry["bytes"]):
-                return False
-        required = manifest.get("required_secret_env_names")
-        if (not isinstance(required, list) or
-                any(not isinstance(name, str) or not _is_secret_env(name)
-                    for name in required) or
-                required != sorted(set(required)) or
-                not _valid_migration_names(manifest.get("db_migrations"))):
-            return False
-        config = json.loads(
-            (path / "config.sanitized.json").read_text(encoding="utf-8"))
-        if not isinstance(config, dict):
-            return False
-        _validate_config_secrets(config)
-        return True
-    except (BackupError, OSError, UnicodeError, ValueError):
-        return False
-
-
-def _apply_retention(output: Path, retain: int) -> None:
-    try:
-        valid = sorted(
+        candidates = sorted(
             (path for path in output.iterdir()
-             if _is_generated_snapshot_metadata(path)),
+             if SNAPSHOT_RE.fullmatch(path.name)),
             key=lambda path: path.name)
     except OSError as exc:
         raise BackupError(f"cannot apply retention in {output}: {exc}") from exc
+    valid: list[Path] = []
+    for path in candidates:
+        if path.is_symlink() or not path.is_dir():
+            continue
+        result = cached.get(path)
+        if result is None:
+            result = verify_snapshot(path)
+        if result.ok:
+            valid.append(path)
     for old in valid[:-retain]:
         mode = old.stat(follow_symlinks=False).st_mode
         if stat.S_ISDIR(mode) and not old.is_symlink():

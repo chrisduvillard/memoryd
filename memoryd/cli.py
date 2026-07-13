@@ -134,6 +134,14 @@ def _container_port() -> str | None:
     return out if code == 0 and out else None
 
 
+def _container_definitively_absent(code: int, detail: str) -> bool:
+    if code == 0:
+        return False
+    lowered = detail.lower()
+    return any(marker in lowered for marker in (
+        "no such object", "no such container"))
+
+
 def _managed_credential_value(port: int, password: str) -> dict:
     return {
         "schema_version": 1,
@@ -233,7 +241,13 @@ def ensure_container() -> str:
             "you sign in'), then re-run: memoryd install\n"
             "Or point MEMORYD_DSN at your own PostgreSQL 16 + pgvector database.")
 
-    exists, _ = _docker("inspect", CONTAINER)
+    exists, inspect_detail = _docker("inspect", CONTAINER)
+    if exists != 0 and not _container_definitively_absent(
+            exists, inspect_detail):
+        raise SystemExit(
+            f"cannot determine whether container {CONTAINER} exists; Docker "
+            "inspect was inconclusive. No container changes were made; check "
+            "Docker and re-run: memoryd install")
     if exists == 0:
         _docker("start", CONTAINER)
         port = _container_port() or "5432"
@@ -277,8 +291,17 @@ def ensure_container() -> str:
         "-e", f"POSTGRES_PASSWORD={password}", "-e", "POSTGRES_DB=memoryd",
         "-p", f"127.0.0.1:{port_n}:5432", IMAGE)
     if code != 0:
-        _remove_managed_credentials(managed)
-        raise SystemExit(f"docker run failed: {out.replace(password, '***')}")
+        after_code, after_detail = _docker("inspect", CONTAINER)
+        if _container_definitively_absent(after_code, after_detail):
+            _remove_managed_credentials(managed)
+            raise SystemExit(
+                f"docker run failed: {out.replace(password, '***')}")
+        state = ("the managed container now exists" if after_code == 0 else
+                 "follow-up inspect was inconclusive")
+        raise SystemExit(
+            f"docker run reported failure, but {state}; managed credentials "
+            "retained; follow-up inspect/recovery may be needed. Start Docker "
+            "if necessary and re-run: memoryd install")
     admin = f"postgresql://postgres:{password}@127.0.0.1:{port_n}/postgres"
     if not _pg_ready(admin, 90):
         raise SystemExit("postgres container did not become ready within 90s")

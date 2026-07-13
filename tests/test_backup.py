@@ -583,7 +583,7 @@ def test_retention_removes_only_old_valid_generated_directories(
         assert link.is_symlink()
 
 
-def test_retention_uses_lightweight_metadata_without_full_verification(
+def test_retention_reuses_new_result_but_verifies_every_old_candidate(
         monkeypatch, tmp_path):
     home = _home(tmp_path)
     _prepare(monkeypatch, home)
@@ -597,15 +597,21 @@ def test_retention_uses_lightweight_metadata_without_full_verification(
         backup.create_backup(output=output, home=home, retain=14)
         for _ in range(3)
     ]
-    monkeypatch.setattr(
-        backup, "verify_snapshot",
-        lambda *_args, **_kwargs: pytest.fail(
-            "retention must not hash or decompress snapshots"))
+    real_verify = backup.verify_snapshot
+    checked: list[Path] = []
 
-    backup._apply_retention(output, 2)
+    def counted(path, **kwargs):
+        checked.append(Path(path))
+        return real_verify(path, **kwargs)
+
+    monkeypatch.setattr(backup, "verify_snapshot", counted)
+
+    backup._apply_retention(
+        output, 2, verified={snapshots[-1]: backup.Verification(True)})
 
     assert not snapshots[0].exists()
     assert snapshots[1].exists() and snapshots[2].exists()
+    assert checked == snapshots[:-1]
 
 
 def test_create_does_not_fully_verify_new_snapshot_twice(monkeypatch, tmp_path):
@@ -642,6 +648,30 @@ def test_retention_preserves_snapshot_with_inconsistent_size_metadata(
     manifest = _manifest(snapshots[0])
     manifest["files"]["database.dump"]["bytes"] += 1
     (snapshots[0] / "manifest.json").write_text(json.dumps(manifest))
+
+    backup._apply_retention(output, 2)
+
+    assert snapshots[0].exists()
+
+
+def test_retention_preserves_same_size_checksum_corruption(
+        monkeypatch, tmp_path):
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    output = tmp_path / "out"
+    times = iter([
+        datetime(2026, 7, day, 1, tzinfo=timezone.utc)
+        for day in (10, 11, 12)
+    ])
+    monkeypatch.setattr(backup, "_utc_now", lambda: next(times))
+    snapshots = [
+        backup.create_backup(output=output, home=home, retain=14)
+        for _ in range(3)
+    ]
+    dump = snapshots[0] / "database.dump"
+    original = dump.read_bytes()
+    dump.write_bytes(bytes([original[0] ^ 0xFF]) + original[1:])
+    assert dump.stat().st_size == len(original)
 
     backup._apply_retention(output, 2)
 

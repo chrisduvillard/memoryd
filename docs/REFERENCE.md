@@ -40,7 +40,9 @@ legacy `memoryd-pgvector` containers using password `memoryd` remain
 adoptable without data deletion. Fresh credentials are atomically persisted to
 owner-only `~/memory/.managed-postgres.json` before Docker creation so a crash
 before migration/config publication remains recoverable. This secret record is
-not part of a backup snapshot.
+not part of a backup snapshot. A failed or timed-out Docker client command does
+not by itself delete the record: deletion occurs only after a follow-up inspect
+definitively confirms that the managed container is absent.
 
 Manual path (bring your own Postgres 16 + pgvector; no Docker):
 
