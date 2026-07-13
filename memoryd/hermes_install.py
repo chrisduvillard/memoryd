@@ -31,7 +31,7 @@ class ProviderCredentials:
 
 
 _KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
-_VALIDATION_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", *_KEY_NAMES)
+_VALIDATION_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *_KEY_NAMES)
 
 
 def require_guided_environment() -> None:
@@ -132,27 +132,28 @@ def classify_memory_home(home: Path) -> Literal["fresh", "managed"]:
 
 def collect_provider_credentials(config_path: Path) -> ProviderCredentials:
     """Collect provider keys from process env, safe config, then hidden prompts."""
+    values = {key_name: os.environ.get(key_name, "") for key_name in _KEY_NAMES}
     config_env: dict[str, object] = {}
-    try:
-        config_path_stat = Path(config_path).lstat()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        raise HermesInstallError("The provider config cannot be inspected safely.") from None
-    else:
-        if not stat.S_ISREG(config_path_stat.st_mode) or stat.S_IMODE(config_path_stat.st_mode) != 0o600:
-            raise HermesInstallError("The provider config is not owner-only.")
-        config = _read_owner_only_config(Path(config_path))
-        if not isinstance(config, dict):
-            raise HermesInstallError("The provider config JSON must be an object.")
-        env = config.get("env", {})
-        if not isinstance(env, dict):
-            raise HermesInstallError("The provider config env must be an object.")
-        config_env = env
+    if not all(values.values()):
+        try:
+            config_path_stat = Path(config_path).lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise HermesInstallError("The provider config cannot be inspected safely.") from None
+        else:
+            if not stat.S_ISREG(config_path_stat.st_mode) or stat.S_IMODE(config_path_stat.st_mode) != 0o600:
+                raise HermesInstallError("The provider config is not owner-only.")
+            config = _read_owner_only_config(Path(config_path))
+            if not isinstance(config, dict):
+                raise HermesInstallError("The provider config JSON must be an object.")
+            env = config.get("env", {})
+            if not isinstance(env, dict):
+                raise HermesInstallError("The provider config env must be an object.")
+            config_env = env
 
-    values: list[str] = []
     for key_name, label in zip(_KEY_NAMES, ("OpenRouter", "Voyage")):
-        value = os.environ.get(key_name, "")
+        value = values[key_name]
         config_value = config_env.get(key_name)
         if not value and isinstance(config_value, str) and config_value:
             value = config_value
@@ -163,9 +164,9 @@ def collect_provider_credentials(config_path: Path) -> ProviderCredentials:
                 raise HermesInstallError("A required provider credential is missing.") from None
         if not value:
             raise HermesInstallError("A required provider credential is missing.")
-        values.append(value)
+        values[key_name] = value
 
-    return ProviderCredentials(values[0], values[1])
+    return ProviderCredentials(values["OPENROUTER_API_KEY"], values["VOYAGE_API_KEY"])
 
 
 def validate_provider_credentials(credentials: ProviderCredentials) -> None:
@@ -180,18 +181,24 @@ def validate_provider_credentials(credentials: ProviderCredentials) -> None:
 
     previous = {name: os.environ[name] for name in _VALIDATION_ENV if name in os.environ}
     try:
+        environment_failed = False
         try:
             os.environ.update(
                 {
                     "MEMORYD_LLM": "openrouter",
                     "MEMORYD_EMBED": "voyage",
+                    "MEMORYD_LLM_BASE": "https://openrouter.ai/api/v1",
                     "OPENROUTER_API_KEY": credentials.openrouter_key,
                     "VOYAGE_API_KEY": credentials.voyage_key,
                 }
             )
         except (TypeError, ValueError):
-            raise HermesInstallError("Provider credential validation could not start.") from None
+            environment_failed = True
+        if environment_failed:
+            raise HermesInstallError("Provider credential validation could not start.")
 
+        completion: object = None
+        chat_failed = False
         try:
             chat = OpenAIChatClient("openrouter")
             completion = chat.complete(
@@ -200,19 +207,30 @@ def validate_provider_credentials(credentials: ProviderCredentials) -> None:
                 max_tokens=8,
             )
         except Exception:
-            raise HermesInstallError("Chat completion credential validation failed.") from None
+            chat_failed = True
+        if chat_failed:
+            raise HermesInstallError("Chat completion credential validation failed.")
         if type(completion) is not str or not completion.strip():
             raise HermesInstallError("Chat completion credential validation returned no result.")
 
+        embedding: object = None
+        embed_failed = False
         try:
             embedder = VoyageEmbedder()
             embedding = embedder.embed(["credential validation"])
         except Exception:
-            raise HermesInstallError("The embed credential validation failed.") from None
+            embed_failed = True
+        if embed_failed:
+            raise HermesInstallError("The embed credential validation failed.")
+
+        embedding_check_failed = False
         try:
             valid_embedding = _valid_embedding(embedding)
         except Exception:
-            raise HermesInstallError("The embed credential validation failed.") from None
+            embedding_check_failed = True
+            valid_embedding = False
+        if embedding_check_failed:
+            raise HermesInstallError("The embed credential validation failed.")
         if not valid_embedding:
             raise HermesInstallError("The embed credential validation returned no valid result.")
     finally:
@@ -224,34 +242,60 @@ def validate_provider_credentials(credentials: ProviderCredentials) -> None:
 def _read_owner_only_config(config_path: Path) -> object:
     """Read JSON only from a real owner-only regular file."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = -1
+    open_failed = False
     try:
         descriptor = os.open(config_path, flags)
-        try:
-            opened_stat = os.fstat(descriptor)
-            if not stat.S_ISREG(opened_stat.st_mode) or stat.S_IMODE(opened_stat.st_mode) != 0o600:
-                raise HermesInstallError("The config is not an owner-only regular file.")
-            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
-                descriptor = -1
-                return json.load(stream)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-    except HermesInstallError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        raise HermesInstallError("The config JSON cannot be read safely.") from None
+    except OSError:
+        open_failed = True
+    if open_failed:
+        raise HermesInstallError("The config JSON cannot be read safely.")
+
+    stat_failed = False
+    try:
+        opened_stat = os.fstat(descriptor)
+    except OSError:
+        stat_failed = True
+    if stat_failed:
+        _close_descriptor(descriptor)
+        raise HermesInstallError("The config JSON cannot be read safely.")
+    if not stat.S_ISREG(opened_stat.st_mode) or stat.S_IMODE(opened_stat.st_mode) != 0o600:
+        _close_descriptor(descriptor)
+        raise HermesInstallError("The config is not an owner-only regular file.")
+
+    parsed: object = None
+    read_failed = False
+    try:
+        stream = os.fdopen(descriptor, "r", encoding="utf-8")
+        descriptor = -1
+        with stream:
+            parsed = json.load(stream)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        read_failed = True
+    finally:
+        if descriptor >= 0:
+            _close_descriptor(descriptor)
+    if read_failed:
+        raise HermesInstallError("The config JSON cannot be read safely.")
+    return parsed
+
+
+def _close_descriptor(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 def _valid_embedding(value: object) -> bool:
-    if not isinstance(value, (list, tuple)) or not value:
+    if not isinstance(value, (list, tuple)) or len(value) != 1:
         return False
-    vectors = value if isinstance(value[0], (list, tuple)) else (value,)
-    for vector in vectors:
-        if not isinstance(vector, (list, tuple)) or not vector:
+    vector = value[0]
+    if not isinstance(vector, (list, tuple)) or not vector:
+        return False
+    for component in vector:
+        if isinstance(component, bool) or not isinstance(component, (int, float)):
             return False
-        for component in vector:
-            if isinstance(component, bool) or not isinstance(component, (int, float)):
-                return False
-            if not math.isfinite(component):
-                return False
+        if not math.isfinite(component):
+            return False
     return True

@@ -5,6 +5,8 @@ import getpass
 import json
 import os
 import subprocess
+import traceback
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +16,7 @@ import memoryd.hermes_install as hermes
 
 
 KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
-AFFECTED_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", *KEY_NAMES)
+AFFECTED_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *KEY_NAMES)
 
 
 def _tty(value: bool = True) -> SimpleNamespace:
@@ -43,38 +45,57 @@ def _managed_payload(home: Path, *, include_env: bool = True) -> dict[str, objec
     return payload
 
 
-def _provider_fakes(
+def _provider_http(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    chat_result: object = "ok",
-    embedding_result: object = (0.25, 0.75),
-    chat_error: BaseException | None = None,
-    embedding_error: BaseException | None = None,
-) -> list[tuple[object, ...]]:
-    events: list[tuple[object, ...]] = []
+    chat_content: str = "ok",
+    voyage_data: object = None,
+    chat_raw: bytes | None = None,
+    voyage_raw: bytes | None = None,
+    chat_error: Exception | None = None,
+    embedding_error: Exception | None = None,
+) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
 
-    class Chat:
-        def __init__(self, provider: str) -> None:
-            events.append(("chat-init", provider, {name: os.environ.get(name) for name in AFFECTED_ENV}))
+    class Response:
+        def __init__(self, payload: object) -> None:
+            self.payload = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
 
-        def complete(self, *args: object, **kwargs: object) -> object:
-            events.append(("chat-complete", args, kwargs))
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.payload
+
+    def urlopen(request, timeout):
+        url = request.full_url
+        event = {
+            "url": url,
+            "authorization": request.get_header("Authorization"),
+            "body": json.loads(request.data),
+            "timeout": timeout,
+            "environment": {name: os.environ.get(name) for name in AFFECTED_ENV},
+        }
+        events.append(event)
+        if url.endswith("/chat/completions"):
             if chat_error is not None:
                 raise chat_error
-            return chat_result
-
-    class Embedder:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            events.append(("embed-init", args, kwargs, {name: os.environ.get(name) for name in AFFECTED_ENV}))
-
-        def embed(self, *args: object, **kwargs: object) -> object:
-            events.append(("embed", args, kwargs))
+            if chat_raw is not None:
+                return Response(chat_raw)
+            return Response({"choices": [{"message": {"content": chat_content}}]})
+        if url == "https://api.voyageai.com/v1/embeddings":
             if embedding_error is not None:
                 raise embedding_error
-            return embedding_result
+            if voyage_raw is not None:
+                return Response(voyage_raw)
+            data = voyage_data if voyage_data is not None else [{"embedding": [0.25, 0.75]}]
+            return Response({"data": data})
+        pytest.fail(f"unexpected provider URL: {url}")
 
-    monkeypatch.setattr(hermes, "OpenAIChatClient", Chat)
-    monkeypatch.setattr(hermes, "VoyageEmbedder", Embedder)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     return events
 
 
@@ -257,13 +278,53 @@ def test_managed_home_rejects_non_regular_symlinked_or_unsafe_config(tmp_path):
 def test_managed_home_rejects_malformed_json_without_rewriting_it(tmp_path):
     home = tmp_path / "memoryd"
     config = _safe_config(home / "config.json", {})
-    config.write_bytes(b"{ definitely not json")
+    secret = "CONFIG-SECRET-SENTINEL"
+    config.write_text(f'{{"env": {{"key": "{secret}"}}, definitely not json', encoding="utf-8")
     before = config.read_bytes()
 
-    with pytest.raises(hermes.HermesInstallError, match="config|JSON"):
+    with pytest.raises(hermes.HermesInstallError, match="config|JSON") as caught:
         hermes.classify_memory_home(home)
 
     assert config.read_bytes() == before
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = repr(caught.value) + "".join(traceback.format_exception(caught.value))
+    assert secret not in rendered
+
+
+@pytest.mark.parametrize("parse_error", [OSError, ValueError, RecursionError])
+def test_config_parser_failures_are_sanitized_without_exception_context(tmp_path, monkeypatch, parse_error):
+    home = tmp_path / "memoryd"
+    _safe_config(home / "config.json", _managed_payload(home))
+    secret = "PARSER-CONFIG-SECRET-SENTINEL"
+
+    def fail_parse(stream):
+        raise parse_error(secret)
+
+    monkeypatch.setattr(hermes.json, "load", fail_parse)
+
+    with pytest.raises(hermes.HermesInstallError, match="config|JSON") as caught:
+        hermes.classify_memory_home(home)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = repr(caught.value) + "".join(traceback.format_exception(caught.value))
+    assert secret not in rendered
+
+
+def test_config_decode_failure_is_sanitized_without_exception_context(tmp_path):
+    home = tmp_path / "memoryd"
+    config = _safe_config(home / "config.json", {})
+    secret = "DECODE-CONFIG-SECRET-SENTINEL"
+    config.write_bytes(b"\xff" + secret.encode())
+
+    with pytest.raises(hermes.HermesInstallError, match="config|JSON") as caught:
+        hermes.classify_memory_home(home)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = repr(caught.value) + "".join(traceback.format_exception(caught.value))
+    assert secret not in rendered
 
 
 @pytest.mark.parametrize("field", ["home", "port"])
@@ -299,12 +360,13 @@ def test_managed_home_rejects_invalid_required_schema(tmp_path, patch):
 
 def test_credentials_use_nonempty_process_values_before_config_or_prompt(tmp_path, monkeypatch):
     config = _safe_config(tmp_path / "config.json", {"env": {
-        "OPENROUTER_API_KEY": "config-openrouter",
-        "VOYAGE_API_KEY": "config-voyage",
+        "OPENROUTER_API_KEY": "UNSAFE-CONFIG-SECRET",
+        "VOYAGE_API_KEY": "UNSAFE-CONFIG-SECRET",
     }})
+    os.chmod(config, 0o644)
     monkeypatch.setenv("OPENROUTER_API_KEY", "process-openrouter")
     monkeypatch.setenv("VOYAGE_API_KEY", "process-voyage")
-    monkeypatch.setattr(getpass, "getpass", lambda prompt: pytest.fail("must not prompt"))
+    monkeypatch.setattr(getpass, "getpass", lambda prompt: pytest.fail("must not inspect config or prompt"))
 
     credentials = hermes.collect_provider_credentials(config)
 
@@ -378,30 +440,37 @@ def test_credentials_never_read_secrets_from_non_owner_only_config(tmp_path, mon
     assert secret not in str(caught.value)
 
 
-def test_validation_calls_both_providers_minimally_and_restores_environment(monkeypatch):
-    for name, value in zip(AFFECTED_ENV, ("old-llm", "old-embed", "old-open", "old-voyage")):
+def test_validation_uses_canonical_provider_endpoints_minimally_and_restores_environment(monkeypatch):
+    old_values = ("old-llm", "old-embed", "https://attacker.invalid/collect", "old-open", "old-voyage")
+    for name, value in zip(AFFECTED_ENV, old_values):
         monkeypatch.setenv(name, value)
     before = dict(os.environ)
-    events = _provider_fakes(monkeypatch)
+    events = _provider_http(monkeypatch)
     credentials = hermes.ProviderCredentials("new-open", "new-voyage")
 
     hermes.validate_provider_credentials(credentials)
 
     assert dict(os.environ) == before
-    chat_init = next(event for event in events if event[0] == "chat-init")
-    assert chat_init[1] == "openrouter"
-    assert chat_init[2] == {
+    assert [event["url"] for event in events] == [
+        "https://openrouter.ai/api/v1/chat/completions",
+        "https://api.voyageai.com/v1/embeddings",
+    ]
+    expected_environment = {
         "MEMORYD_LLM": "openrouter",
         "MEMORYD_EMBED": "voyage",
+        "MEMORYD_LLM_BASE": "https://openrouter.ai/api/v1",
         "OPENROUTER_API_KEY": "new-open",
         "VOYAGE_API_KEY": "new-voyage",
     }
-    complete = [event for event in events if event[0] == "chat-complete"]
-    embeddings = [event for event in events if event[0] == "embed"]
-    assert len(complete) == len(embeddings) == 1
-    assert 0 < complete[0][2]["max_tokens"] <= 8
-    embed_payload = embeddings[0][1] or tuple(embeddings[0][2].values())
-    assert embed_payload
+    assert all(event["environment"] == expected_environment for event in events)
+    assert events[0]["authorization"] == "Bearer new-open"
+    assert events[1]["authorization"] == "Bearer new-voyage"
+    chat_body = events[0]["body"]
+    embed_body = events[1]["body"]
+    assert 0 < chat_body["max_tokens"] <= 8
+    assert len(chat_body["messages"]) == 2
+    assert embed_body["input"] == ["credential validation"]
+    assert embed_body["output_dimension"] == 1024
 
 
 def test_validation_redacts_keys_and_remote_body_and_restores_environment_on_chat_failure(monkeypatch, capsys):
@@ -412,45 +481,99 @@ def test_validation_redacts_keys_and_remote_body_and_restores_environment_on_cha
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setenv("VOYAGE_API_KEY", "previous-voyage")
     before = dict(os.environ)
-    _provider_fakes(monkeypatch, chat_error=ValueError(remote))
+    _provider_http(monkeypatch, chat_error=ValueError(remote))
+    voyage_key = "voyage-secret"
+    credentials = hermes.ProviderCredentials(key, voyage_key)
 
     with pytest.raises(hermes.HermesInstallError, match="chat|completion") as caught:
-        hermes.validate_provider_credentials(hermes.ProviderCredentials(key, "voyage-secret"))
+        hermes.validate_provider_credentials(credentials)
 
     assert dict(os.environ) == before
-    rendered = str(caught.value) + repr(caught.value) + capsys.readouterr().out
-    assert key not in rendered and "voyage-secret" not in rendered and remote not in rendered
+    rendered = (
+        str(caught.value)
+        + repr(caught.value)
+        + "".join(traceback.format_exception(caught.value))
+        + capsys.readouterr().out
+    )
+    assert key not in rendered and voyage_key not in rendered and remote not in rendered
     assert caught.value.__cause__ is None
-    assert caught.value.__suppress_context__
+    assert caught.value.__context__ is None
 
 
 def test_validation_wraps_embedding_failure_as_generic_stage_error(monkeypatch):
     remote = "EMBEDDING-REMOTE-BODY-SENTINEL"
     before = dict(os.environ)
-    _provider_fakes(monkeypatch, embedding_error=RuntimeError(remote))
+    _provider_http(monkeypatch, embedding_error=RuntimeError(remote))
+    openrouter_key = "open-secret"
+    voyage_key = "voyage-secret"
+    credentials = hermes.ProviderCredentials(openrouter_key, voyage_key)
 
     with pytest.raises(hermes.HermesInstallError, match="embed") as caught:
-        hermes.validate_provider_credentials(hermes.ProviderCredentials("open-secret", "voyage-secret"))
+        hermes.validate_provider_credentials(credentials)
 
     assert dict(os.environ) == before
-    assert remote not in str(caught.value)
-    assert "open-secret" not in str(caught.value)
-    assert "voyage-secret" not in str(caught.value)
+    rendered = repr(caught.value) + "".join(traceback.format_exception(caught.value))
+    assert remote not in rendered
+    assert openrouter_key not in rendered
+    assert voyage_key not in rendered
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("stage", ["chat", "embed"])
+def test_validation_sanitizes_malformed_provider_responses_without_exception_context(monkeypatch, stage):
+    remote = "MALFORMED-PROVIDER-RESPONSE-SENTINEL"
+    raw = f'{{"secret": "{remote}"'.encode()
+    kwargs = {"chat_raw": raw} if stage == "chat" else {"voyage_raw": raw}
+    _provider_http(monkeypatch, **kwargs)
+    openrouter_key = "open-secret"
+    voyage_key = "voyage-secret"
+    credentials = hermes.ProviderCredentials(openrouter_key, voyage_key)
+    error_pattern = "chat|completion" if stage == "chat" else "embed"
+
+    with pytest.raises(hermes.HermesInstallError, match=error_pattern) as caught:
+        hermes.validate_provider_credentials(credentials)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = repr(caught.value) + "".join(traceback.format_exception(caught.value))
+    assert remote not in rendered
+    assert openrouter_key not in rendered
+    assert voyage_key not in rendered
 
 
 def test_validation_rejects_empty_completion(monkeypatch):
-    _provider_fakes(monkeypatch, chat_result="")
+    _provider_http(monkeypatch, chat_content="")
 
     with pytest.raises(hermes.HermesInstallError, match="chat|completion"):
         hermes.validate_provider_credentials(hermes.ProviderCredentials("open", "voyage"))
 
 
-@pytest.mark.parametrize("invalid_embedding", [None, (), [], [float("nan")]])
-def test_validation_rejects_empty_or_invalid_embedding(monkeypatch, invalid_embedding):
-    _provider_fakes(monkeypatch, embedding_result=invalid_embedding)
+@pytest.mark.parametrize(
+    "voyage_data",
+    [
+        [],
+        [{"embedding": [0.25]}, {"embedding": [0.75]}],
+        [{"embedding": [float("nan")]}],
+    ],
+)
+def test_validation_rejects_empty_multiple_or_nonfinite_voyage_results(monkeypatch, voyage_data):
+    _provider_http(monkeypatch, voyage_data=voyage_data)
 
     with pytest.raises(hermes.HermesInstallError, match="embed"):
         hermes.validate_provider_credentials(hermes.ProviderCredentials("open", "voyage"))
+
+
+@pytest.mark.parametrize(
+    "invalid_embedding",
+    [None, (), [], [0.25, 0.75], [[0.25], [0.75]], [[float("nan")]]],
+)
+def test_embedding_result_contract_rejects_flat_multiple_empty_or_nonfinite_values(invalid_embedding):
+    assert not hermes._valid_embedding(invalid_embedding)
+
+
+def test_embedding_result_contract_accepts_exactly_one_finite_nonempty_vector():
+    assert hermes._valid_embedding([[0.25, 0.75]])
 
 
 def test_failed_validation_never_mutates_target_filesystem(tmp_path, monkeypatch):
@@ -460,7 +583,7 @@ def test_failed_validation_never_mutates_target_filesystem(tmp_path, monkeypatch
     marker = home / "operator-owned"
     marker.write_bytes(b"unchanged")
     before = (tuple(path.name for path in home.iterdir()), marker.read_bytes(), marker.stat().st_mode)
-    _provider_fakes(monkeypatch, chat_error=ConnectionError("provider unavailable"))
+    _provider_http(monkeypatch, chat_error=ConnectionError("provider unavailable"))
 
     with pytest.raises(hermes.HermesInstallError):
         hermes.validate_provider_credentials(hermes.ProviderCredentials("open", "voyage"))
