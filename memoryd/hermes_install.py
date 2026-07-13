@@ -513,8 +513,9 @@ def _rollback_activation(
     return failures
 
 
-def activate_and_verify(target: HermesTarget) -> None:
-    """Activate memoryd transactionally and restore captured state on failure."""
+@contextlib.contextmanager
+def _activation_transaction(target: HermesTarget):
+    """Activate memoryd and retain rollback ownership through the caller scope."""
     original = capture_runtime_state(target)
     stage = "transaction initialization"
     try:
@@ -556,12 +557,20 @@ def activate_and_verify(target: HermesTarget) -> None:
         stage = "final provider verification"
         if _capture_provider(target) != "memoryd":
             raise HermesInstallError("The Hermes provider state changed.")
+        stage = "post-activation workflow"
+        yield
     except BaseException:
         rollback_failures = _rollback_activation(target, original)
         message = f"Hermes activation failed during {stage}."
         if rollback_failures:
             message += " Rollback incomplete at: " + ", ".join(rollback_failures) + "."
         raise HermesInstallError(message) from None
+
+
+def activate_and_verify(target: HermesTarget) -> None:
+    """Activate memoryd transactionally and restore captured state on failure."""
+    with _activation_transaction(target):
+        pass
 
 
 def require_guided_environment() -> None:
@@ -868,25 +877,47 @@ def guided_hermes_install() -> int:
     """Run the complete interactive Hermes installation workflow."""
     credentials: ProviderCredentials | None = None
     interrupted_signal: int | None = None
+    signal_can_interrupt = True
     previous_handlers: dict[int, object] = {}
-    installed_handlers: list[int] = []
+    installed_handlers: set[int] = set()
+    failure_message: str | None = None
+    interruption_reported = False
 
     def interrupt(signum: int, _frame: object) -> None:
         nonlocal interrupted_signal
-        interrupted_signal = int(signum)
-        raise KeyboardInterrupt
+        if interrupted_signal is None:
+            interrupted_signal = int(signum)
+        if signal_can_interrupt:
+            raise KeyboardInterrupt
 
-    def interruption_result(signum: int) -> int:
+    def report_interruption(signum: int) -> None:
         name = signal.Signals(signum).name
         print(f"Hermes guided installation interrupted ({name}).", file=sys.stderr)
-        return 128 + signum
+
+    def restore_handlers() -> None:
+        nonlocal signal_can_interrupt
+        signal_can_interrupt = False
+        interrupt_number = int(signal.SIGINT)
+        terminate_number = int(signal.SIGTERM)
+        try:
+            if terminate_number in installed_handlers:
+                signal.signal(
+                    terminate_number, previous_handlers[terminate_number],
+                )
+                installed_handlers.remove(terminate_number)
+        finally:
+            if interrupt_number in installed_handlers:
+                signal.signal(
+                    interrupt_number, previous_handlers[interrupt_number],
+                )
+                installed_handlers.remove(interrupt_number)
 
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             numeric = int(signum)
             previous_handlers[numeric] = signal.getsignal(signum)
             signal.signal(signum, interrupt)
-            installed_handlers.append(numeric)
+            installed_handlers.add(numeric)
 
         require_guided_environment()
         target = resolve_hermes_target()
@@ -899,7 +930,6 @@ def guided_hermes_install() -> int:
         credentials = collect_provider_credentials(memory_home / "config.json")
         validate_provider_credentials(credentials)
         snapshot = install_hermes_core(target, credentials)
-        activate_and_verify(target)
 
         report = "\n".join(
             (
@@ -914,27 +944,44 @@ def guided_hermes_install() -> int:
         )
         for secret in (credentials.openrouter_key, credentials.voyage_key):
             report = report.replace(secret, "<redacted>")
-        print(report)
-        return 0
+        with _activation_transaction(target):
+            print(report)
+            restore_handlers()
+            if interrupted_signal is not None:
+                raise KeyboardInterrupt
     except KeyboardInterrupt:
-        return interruption_result(
-            int(signal.SIGINT) if interrupted_signal is None else interrupted_signal
-        )
+        signal_can_interrupt = False
+        if interrupted_signal is None:
+            interrupted_signal = int(signal.SIGINT)
     except (HermesInstallError, HermesCompatibilityError) as error:
-        if interrupted_signal is not None:
-            return interruption_result(interrupted_signal)
-        message = str(error)
+        signal_can_interrupt = False
+        failure_message = str(error)
         if credentials is not None:
             for secret in (credentials.openrouter_key, credentials.voyage_key):
-                message = message.replace(secret, "<redacted>")
-        message = " ".join(message.splitlines()).strip()
-        if not message:
-            message = "A required installation stage failed."
-        print(f"Hermes guided installation failed: {message}", file=sys.stderr)
-        return 1
+                failure_message = failure_message.replace(secret, "<redacted>")
+        failure_message = " ".join(failure_message.splitlines()).strip()
+        if not failure_message:
+            failure_message = "A required installation stage failed."
     finally:
-        for signum in reversed(installed_handlers):
-            signal.signal(signum, previous_handlers[signum])
+        signal_can_interrupt = False
+        if installed_handlers:
+            if interrupted_signal is not None:
+                report_interruption(interrupted_signal)
+                interruption_reported = True
+            elif failure_message is not None:
+                print(
+                    f"Hermes guided installation failed: {failure_message}",
+                    file=sys.stderr,
+                )
+            restore_handlers()
+
+    if interrupted_signal is not None:
+        if not interruption_reported:
+            report_interruption(interrupted_signal)
+        return 128 + interrupted_signal
+    if failure_message is not None:
+        return 1
+    return 0
 
 
 def _read_owner_only_config(config_path: Path) -> object:

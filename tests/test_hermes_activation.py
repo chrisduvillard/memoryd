@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import builtins
 import json
 import multiprocessing
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -734,3 +736,163 @@ def test_failed_transaction_preserves_all_memoryd_artifacts(
 
     assert {path: path.read_bytes() for path in evidence} == before
     assert _read_provider(target.home) == "legacy"
+
+
+class GuidedSignalBoundary:
+    def __init__(self, *, signal_during_restore: int | None = None) -> None:
+        self.previous = {
+            int(signal.SIGINT): object(),
+            int(signal.SIGTERM): object(),
+        }
+        self.current = dict(self.previous)
+        self.signal_during_restore = signal_during_restore
+        self.restore_signal_delivered = False
+
+    def getsignal(self, signum: int) -> object:
+        return self.current[int(signum)]
+
+    def set_signal(self, signum: int, handler: object) -> object:
+        numeric = int(signum)
+        old = self.current[numeric]
+        if (
+            handler is self.previous[numeric]
+            and self.signal_during_restore == numeric
+            and not self.restore_signal_delivered
+        ):
+            self.restore_signal_delivered = True
+            assert callable(old)
+            old(signum, None)
+        self.current[numeric] = handler
+        return old
+
+    def deliver(self, signum: int) -> None:
+        handler = self.current[int(signum)]
+        assert callable(handler)
+        handler(signum, None)
+
+
+def _prepare_guided_activation(
+    monkeypatch: pytest.MonkeyPatch,
+    target: HermesTarget,
+    artifact: Path,
+) -> GuidedSignalBoundary:
+    credentials = hermes.ProviderCredentials("openrouter-key", "voyage-key")
+    monkeypatch.setattr(hermes, "require_guided_environment", lambda: None)
+    monkeypatch.setattr(hermes, "resolve_hermes_target", lambda: target)
+    monkeypatch.setattr(hermes, "validate_hermes_compatibility", lambda *_args: None)
+    monkeypatch.setattr(hermes.cli, "_resource_dir", lambda _name: target.home)
+    monkeypatch.setattr(hermes.cli, "_home", lambda: artifact.parent)
+    monkeypatch.setattr(hermes, "classify_memory_home", lambda _home: "managed")
+    monkeypatch.setattr(hermes, "confirm_operator", lambda: None)
+    monkeypatch.setattr(
+        hermes, "collect_provider_credentials", lambda _config: credentials,
+    )
+    monkeypatch.setattr(hermes, "validate_provider_credentials", lambda _value: None)
+    monkeypatch.setattr(
+        hermes, "install_hermes_core", lambda _target, _credentials: artifact,
+    )
+    signals = GuidedSignalBoundary()
+    monkeypatch.setattr(hermes.signal, "getsignal", signals.getsignal)
+    monkeypatch.setattr(hermes.signal, "signal", signals.set_signal)
+    return signals
+
+
+def _guided_outcome() -> tuple[int | None, BaseException | None]:
+    try:
+        return hermes.guided_hermes_install(), None
+    except BaseException as error:
+        return None, error
+
+
+def test_signal_during_post_activation_report_rolls_back_provider_and_gateway(
+    monkeypatch, tmp_path,
+):
+    target = _target(tmp_path, "legacy")
+    _spool_root(target)
+    boundary = _install_boundary(monkeypatch, target, gateway_running=True)
+    artifact = tmp_path / "memory" / "initial.snapshot"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"preserved installation evidence")
+    signals = _prepare_guided_activation(monkeypatch, target, artifact)
+    real_print = builtins.print
+    delivered = False
+
+    def interrupt_success_report(*args, **kwargs):
+        nonlocal delivered
+        if not delivered and kwargs.get("file") is None:
+            delivered = True
+            signals.deliver(signal.SIGTERM)
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", interrupt_success_report)
+
+    result, escaped = _guided_outcome()
+
+    assert escaped is None
+    assert result == 143
+    assert delivered
+    assert _read_provider(target.home) == "legacy"
+    assert boundary.gateway_running is True
+    assert artifact.read_bytes() == b"preserved installation evidence"
+    assert signals.current == signals.previous
+
+
+def test_signal_during_failure_reporting_cannot_escape_or_leak_handlers(
+    monkeypatch, tmp_path,
+):
+    target = _target(tmp_path, "legacy")
+    boundary = _install_boundary(
+        monkeypatch,
+        target,
+        gateway_running=True,
+        failures={"hermes memory status": [7]},
+    )
+    artifact = tmp_path / "memory" / "initial.snapshot"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"preserved installation evidence")
+    signals = _prepare_guided_activation(monkeypatch, target, artifact)
+    real_print = builtins.print
+    delivered = False
+
+    def interrupt_failure_report(*args, **kwargs):
+        nonlocal delivered
+        if not delivered and kwargs.get("file") is sys.stderr:
+            delivered = True
+            signals.deliver(signal.SIGTERM)
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", interrupt_failure_report)
+
+    result, escaped = _guided_outcome()
+
+    assert escaped is None
+    assert result == 143
+    assert delivered
+    assert _read_provider(target.home) == "legacy"
+    assert boundary.gateway_running is True
+    assert artifact.read_bytes() == b"preserved installation evidence"
+    assert signals.current == signals.previous
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_signal_during_each_handler_restore_rolls_back_and_restores_both(
+    monkeypatch, tmp_path, signum,
+):
+    target = _target(tmp_path, "legacy")
+    _spool_root(target)
+    boundary = _install_boundary(monkeypatch, target, gateway_running=True)
+    artifact = tmp_path / "memory" / "initial.snapshot"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"preserved installation evidence")
+    signals = _prepare_guided_activation(monkeypatch, target, artifact)
+    signals.signal_during_restore = int(signum)
+
+    result, escaped = _guided_outcome()
+
+    assert escaped is None
+    assert result == 128 + int(signum)
+    assert signals.restore_signal_delivered
+    assert _read_provider(target.home) == "legacy"
+    assert boundary.gateway_running is True
+    assert artifact.read_bytes() == b"preserved installation evidence"
+    assert signals.current == signals.previous

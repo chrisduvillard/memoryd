@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import signal
 from pathlib import Path
 import pytest
@@ -87,9 +88,11 @@ def _workflow(
         observe("core install")
         return snapshot
 
-    def activate(actual_target: HermesTarget) -> None:
+    @contextlib.contextmanager
+    def activate(actual_target: HermesTarget):
         assert actual_target == target
         observe("activation")
+        yield
 
     monkeypatch.setattr(hermes, "require_guided_environment", require_environment)
     monkeypatch.setattr(hermes, "resolve_hermes_target", resolve_target, raising=False)
@@ -103,7 +106,7 @@ def _workflow(
     monkeypatch.setattr(hermes, "collect_provider_credentials", collect)
     monkeypatch.setattr(hermes, "validate_provider_credentials", validate_credentials)
     monkeypatch.setattr(hermes, "install_hermes_core", install)
-    monkeypatch.setattr(hermes, "activate_and_verify", activate)
+    monkeypatch.setattr(hermes, "_activation_transaction", activate)
 
     previous = {
         int(signal.SIGINT): object(),
@@ -269,18 +272,20 @@ def test_sigterm_during_activation_returns_143_after_activation_cleanup_and_rest
 ):
     events, target, _snapshot, previous, current = _workflow(monkeypatch, tmp_path)
 
-    def activation_with_cleanup(actual_target: HermesTarget) -> None:
+    @contextlib.contextmanager
+    def activation_with_cleanup(actual_target: HermesTarget):
         assert actual_target == target
         events.append("activation")
         try:
             handler = current[int(signal.SIGTERM)]
             assert callable(handler)
             handler(signal.SIGTERM, None)
+            yield
         except BaseException:
             events.append("activation rollback")
             raise hermes.HermesInstallError("activation interrupted after rollback") from None
 
-    monkeypatch.setattr(hermes, "activate_and_verify", activation_with_cleanup)
+    monkeypatch.setattr(hermes, "_activation_transaction", activation_with_cleanup)
 
     result = hermes.guided_hermes_install()
 
