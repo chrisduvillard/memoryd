@@ -37,7 +37,7 @@ jobs:
       - name: Run pinned AST/byte contract and trusted plugin checks
         run: |
           python scripts/check_hermes_contract.py --source-root _hermes-agent --require-pinned-bytes
-          python scripts/test_hermes_contract.py
+          python -m scripts.test_hermes_contract
       - name: Run durable-spool suite against trusted vendored contract
         run: python scripts/test_hermes_spool.py
 
@@ -210,6 +210,7 @@ jobs:
       - name: Run checkout unit and fault-injection suites
         run: |
           VENV_PYTHON="$RUNNER_TEMP/venv-test/bin/python"
+          unset MEMORYD_DSN MEMORYD_HOME
           "$VENV_PYTHON" -m compileall -q memoryd hermes_plugin scripts tests
           "$VENV_PYTHON" -m pytest -q tests
           "$VENV_PYTHON" scripts/test_durable_capture.py

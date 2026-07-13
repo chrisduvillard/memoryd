@@ -113,6 +113,7 @@ def test_structured_source_and_installed_suites_are_separate() -> None:
     source = steps["Run checkout unit and fault-injection suites"]["run"]
     installed = steps["Run installed-wheel DB-backed regression matrix"]["run"]
     assert 'VENV_PYTHON="$RUNNER_TEMP/venv-test/bin/python"' in source
+    assert "unset MEMORYD_DSN MEMORYD_HOME" in source
     invocations = [
         line.strip() for line in source.splitlines()
         if line.strip().startswith(('python ', '"$VENV_PYTHON" '))
@@ -209,6 +210,8 @@ def test_postgres_and_hermes_pins_are_immutable_and_correctly_scoped() -> None:
     assert "pgvector/pgvector:pg16" in matrix
     assert "v2026.6.5" in blocking
     assert "3c231eb3979ab9c57d5cd6d02f1d577a3b718b43" in blocking
+    assert "python -m scripts.test_hermes_contract" in blocking
+    assert "python scripts/test_hermes_contract.py" not in blocking
     assert "ref: main" in advisory
     assert "schedule/manual only" in advisory
     assert "github.event_name == 'schedule'" in advisory
