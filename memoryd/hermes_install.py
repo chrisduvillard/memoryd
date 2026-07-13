@@ -966,6 +966,52 @@ def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
+def _parse_fdinfo_mount_id(payload: bytes) -> int:
+    if not payload or len(payload) > 16 * 1024 or b"\x00" in payload:
+        raise HermesInstallError("The filesystem mount identity is unavailable.")
+    values: list[int] = []
+    for line in payload.splitlines():
+        if not line.startswith(b"mnt_id"):
+            continue
+        match = re.fullmatch(rb"mnt_id:\t([1-9][0-9]*)", line)
+        if match is None:
+            raise HermesInstallError("The filesystem mount identity is malformed.")
+        values.append(int(match.group(1)))
+    if len(values) != 1:
+        raise HermesInstallError("The filesystem mount identity is unavailable.")
+    return values[0]
+
+
+def _fd_mount_id(descriptor: int) -> int:
+    fdinfo = -1
+    payload = bytearray()
+    try:
+        fdinfo = os.open(
+            f"/proc/self/fdinfo/{descriptor}",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        while True:
+            chunk = os.read(fdinfo, 4096)
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > 16 * 1024:
+                raise HermesInstallError("The filesystem mount identity is unavailable.")
+    except HermesInstallError:
+        raise
+    except OSError:
+        raise HermesInstallError("The filesystem mount identity is unavailable.") from None
+    finally:
+        if fdinfo >= 0:
+            _close_fd(fdinfo)
+    return _parse_fdinfo_mount_id(bytes(payload))
+
+
+def _require_fd_mount(descriptor: int, mount_id: int) -> None:
+    if _fd_mount_id(descriptor) != mount_id:
+        raise HermesInstallError("The plugin tree crosses a filesystem mount boundary.")
+
+
 def _fd_entry_stat(parent_fd: int, name: str) -> os.stat_result | None:
     try:
         return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -975,7 +1021,11 @@ def _fd_entry_stat(parent_fd: int, name: str) -> os.stat_result | None:
         raise HermesInstallError("The plugin publication topology cannot be inspected safely.") from None
 
 
-def _open_directory_at(parent_fd: int, name: str) -> int:
+def _open_directory_at(
+    parent_fd: int, name: str, mount_id: int | None = None,
+) -> int:
+    trusted_mount = _fd_mount_id(parent_fd) if mount_id is None else mount_id
+    _require_fd_mount(parent_fd, trusted_mount)
     try:
         descriptor = os.open(name, _DIR_FLAGS, 0o700, dir_fd=parent_fd)
     except OSError:
@@ -985,6 +1035,11 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
     if current is None or not stat.S_ISDIR(opened.st_mode) or not _same_inode(opened, current):
         _close_fd(descriptor)
         raise HermesInstallError("The plugin publication directory changed during inspection.")
+    try:
+        _require_fd_mount(descriptor, trusted_mount)
+    except BaseException:
+        _close_fd(descriptor)
+        raise
     return descriptor
 
 
@@ -1007,21 +1062,47 @@ def _open_directory_root(path: Path, expected: os.stat_result) -> int:
     return descriptor
 
 
-def _require_root_still_open(path: Path, descriptor: int) -> None:
+def _require_root_still_open(
+    path: Path, descriptor: int, mount_id: int | None = None,
+) -> None:
+    trusted_mount = _fd_mount_id(descriptor) if mount_id is None else mount_id
+    _require_fd_mount(descriptor, trusted_mount)
+    probe = -1
     try:
         current = path.stat(follow_symlinks=False)
         opened = os.fstat(descriptor)
+        probe = os.open(path, _DIR_FLAGS, 0o700)
+        probe_stat = os.fstat(probe)
+        _require_fd_mount(probe, trusted_mount)
     except OSError:
         raise HermesInstallError("The plugin publication root changed during publication.") from None
-    if not stat.S_ISDIR(current.st_mode) or not _same_inode(current, opened):
+    finally:
+        if probe >= 0:
+            _close_fd(probe)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or not _same_inode(current, opened)
+        or not _same_inode(probe_stat, opened)
+    ):
         raise HermesInstallError("The plugin publication root changed during publication.")
 
 
-def _require_directory_entry(parent_fd: int, name: str, descriptor: int) -> None:
+def _require_directory_entry(
+    parent_fd: int, name: str, descriptor: int, mount_id: int | None = None,
+) -> None:
+    trusted_mount = _fd_mount_id(parent_fd) if mount_id is None else mount_id
+    _require_fd_mount(parent_fd, trusted_mount)
+    _require_fd_mount(descriptor, trusted_mount)
     current = _fd_entry_stat(parent_fd, name)
     opened = os.fstat(descriptor)
     if current is None or not stat.S_ISDIR(current.st_mode) or not _same_inode(current, opened):
         raise HermesInstallError("The plugin publication directory changed during publication.")
+    probe = _open_directory_at(parent_fd, name, trusted_mount)
+    try:
+        if not _same_inode(os.fstat(probe), opened):
+            raise HermesInstallError("The plugin publication directory changed during publication.")
+    finally:
+        _close_fd(probe)
 
 
 def _require_private_directory(descriptor: int) -> None:
@@ -1046,7 +1127,10 @@ def _read_fd(descriptor: int) -> bytes:
 
 def _fd_manifest(
     root_fd: int, *, require_private: bool, prefix: Path = Path(),
+    mount_id: int | None = None,
 ) -> dict[str, tuple[str, str]]:
+    trusted_mount = _fd_mount_id(root_fd) if mount_id is None else mount_id
+    _require_fd_mount(root_fd, trusted_mount)
     if require_private:
         _require_private_directory(root_fd)
     manifest: dict[str, tuple[str, str]] = {}
@@ -1057,25 +1141,31 @@ def _fd_manifest(
         raise HermesInstallError("The plugin tree cannot be inspected safely.") from None
     for name in names:
         relative = prefix / name
-        if _plugin_entry_ignored(relative):
-            continue
+        ignored = _plugin_entry_ignored(relative)
         value = _fd_entry_stat(root_fd, name)
         if value is None:
             raise HermesInstallError("The plugin tree changed during inspection.")
         key = relative.as_posix()
         if stat.S_ISDIR(value.st_mode):
-            child = _open_directory_at(root_fd, name)
+            child = _open_directory_at(root_fd, name, trusted_mount)
             try:
+                if ignored:
+                    continue
                 if require_private:
                     _require_private_directory(child)
                 manifest[key] = ("directory", "")
                 manifest.update(
-                    _fd_manifest(child, require_private=require_private, prefix=relative)
+                    _fd_manifest(
+                        child, require_private=require_private, prefix=relative,
+                        mount_id=trusted_mount,
+                    )
                 )
-                _require_directory_entry(root_fd, name, child)
+                _require_directory_entry(root_fd, name, child, trusted_mount)
             finally:
                 _close_fd(child)
         elif stat.S_ISREG(value.st_mode):
+            if ignored:
+                continue
             descriptor = -1
             try:
                 descriptor = os.open(name, _READ_FLAGS, 0o600, dir_fd=root_fd)
@@ -1083,6 +1173,7 @@ def _fd_manifest(
                 current = _fd_entry_stat(root_fd, name)
                 if current is None or not _same_inode(opened, value) or not _same_inode(opened, current):
                     raise HermesInstallError("The plugin file changed during inspection.")
+                _require_fd_mount(descriptor, trusted_mount)
                 if require_private and (
                     opened.st_uid != os.geteuid() or stat.S_IMODE(opened.st_mode) != 0o600
                 ):
@@ -1110,7 +1201,19 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def _copy_plugin_tree_fd(source_fd: int, destination_fd: int, prefix: Path = Path()) -> None:
+def _copy_plugin_tree_fd(
+    source_fd: int, destination_fd: int, prefix: Path = Path(),
+    source_mount_id: int | None = None, destination_mount_id: int | None = None,
+) -> None:
+    trusted_source_mount = (
+        _fd_mount_id(source_fd) if source_mount_id is None else source_mount_id
+    )
+    trusted_destination_mount = (
+        _fd_mount_id(destination_fd)
+        if destination_mount_id is None else destination_mount_id
+    )
+    _require_fd_mount(source_fd, trusted_source_mount)
+    _require_fd_mount(destination_fd, trusted_destination_mount)
     try:
         with os.scandir(source_fd) as scanner:
             names = sorted(entry.name for entry in scanner)
@@ -1118,21 +1221,32 @@ def _copy_plugin_tree_fd(source_fd: int, destination_fd: int, prefix: Path = Pat
         raise HermesInstallError("The bundled plugin cannot be copied safely.") from None
     for name in names:
         relative = prefix / name
-        if _plugin_entry_ignored(relative):
-            continue
+        ignored = _plugin_entry_ignored(relative)
         value = _fd_entry_stat(source_fd, name)
         if value is None:
             raise HermesInstallError("The bundled plugin changed during copying.")
         if stat.S_ISDIR(value.st_mode):
-            source_child = _open_directory_at(source_fd, name)
+            source_child = _open_directory_at(source_fd, name, trusted_source_mount)
             destination_child = -1
             try:
+                if ignored:
+                    continue
                 os.mkdir(name, 0o700, dir_fd=destination_fd)
-                destination_child = _open_directory_at(destination_fd, name)
+                destination_child = _open_directory_at(
+                    destination_fd, name, trusted_destination_mount,
+                )
                 os.fchmod(destination_child, 0o700)
-                _copy_plugin_tree_fd(source_child, destination_child, relative)
-                _require_directory_entry(source_fd, name, source_child)
-                _require_directory_entry(destination_fd, name, destination_child)
+                _copy_plugin_tree_fd(
+                    source_child, destination_child, relative,
+                    trusted_source_mount, trusted_destination_mount,
+                )
+                _require_directory_entry(
+                    source_fd, name, source_child, trusted_source_mount,
+                )
+                _require_directory_entry(
+                    destination_fd, name, destination_child,
+                    trusted_destination_mount,
+                )
                 os.fsync(destination_child)
             except HermesInstallError:
                 raise
@@ -1145,6 +1259,8 @@ def _copy_plugin_tree_fd(source_fd: int, destination_fd: int, prefix: Path = Pat
             continue
         if not stat.S_ISREG(value.st_mode):
             raise HermesInstallError("The bundled plugin contains a symlink or special file.")
+        if ignored:
+            continue
         source_file = -1
         destination_file = -1
         try:
@@ -1153,6 +1269,7 @@ def _copy_plugin_tree_fd(source_fd: int, destination_fd: int, prefix: Path = Pat
             current = _fd_entry_stat(source_fd, name)
             if current is None or not _same_inode(opened, value) or not _same_inode(opened, current):
                 raise HermesInstallError("The bundled plugin changed during copying.")
+            _require_fd_mount(source_file, trusted_source_mount)
             destination_file = os.open(
                 name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -1161,6 +1278,7 @@ def _copy_plugin_tree_fd(source_fd: int, destination_fd: int, prefix: Path = Pat
                 dir_fd=destination_fd,
             )
             os.fchmod(destination_file, 0o600)
+            _require_fd_mount(destination_file, trusted_destination_mount)
             _write_all(destination_file, _read_fd(source_file))
             os.fsync(destination_file)
             current = _fd_entry_stat(source_fd, name)
@@ -1177,26 +1295,50 @@ def _copy_plugin_tree_fd(source_fd: int, destination_fd: int, prefix: Path = Pat
                 _close_fd(source_file)
 
 
-def _remove_tree_at(parent_fd: int, name: str) -> None:
+def _remove_tree_at(
+    parent_fd: int, name: str, mount_id: int | None = None,
+) -> None:
+    trusted_mount = _fd_mount_id(parent_fd) if mount_id is None else mount_id
+    _require_fd_mount(parent_fd, trusted_mount)
     value = _fd_entry_stat(parent_fd, name)
     if value is None:
         return
     if not stat.S_ISDIR(value.st_mode):
+        if stat.S_ISLNK(value.st_mode):
+            os.unlink(name, dir_fd=parent_fd)
+            return
+        if not stat.S_ISREG(value.st_mode):
+            raise HermesInstallError("Plugin cleanup found unsafe topology.")
+        descriptor = -1
+        try:
+            descriptor = os.open(name, _READ_FLAGS, 0o600, dir_fd=parent_fd)
+            opened = os.fstat(descriptor)
+            current = _fd_entry_stat(parent_fd, name)
+            if current is None or not _same_inode(opened, value) or not _same_inode(opened, current):
+                raise HermesInstallError("Plugin cleanup found changed topology.")
+            _require_fd_mount(descriptor, trusted_mount)
+        finally:
+            if descriptor >= 0:
+                _close_fd(descriptor)
         os.unlink(name, dir_fd=parent_fd)
         return
-    directory = _open_directory_at(parent_fd, name)
+    directory = _open_directory_at(parent_fd, name, trusted_mount)
     try:
         with os.scandir(directory) as scanner:
             names = sorted(entry.name for entry in scanner)
         for child_name in names:
-            _remove_tree_at(directory, child_name)
-        _require_directory_entry(parent_fd, name, directory)
+            _remove_tree_at(directory, child_name, trusted_mount)
+        _require_directory_entry(parent_fd, name, directory, trusted_mount)
     finally:
         _close_fd(directory)
     os.rmdir(name, dir_fd=parent_fd)
 
 
-def _write_config_stage(home_fd: int, name: str) -> bytes:
+def _write_config_stage(
+    home_fd: int, name: str, mount_id: int | None = None,
+) -> bytes:
+    trusted_mount = _fd_mount_id(home_fd) if mount_id is None else mount_id
+    _require_fd_mount(home_fd, trusted_mount)
     payload = (json.dumps({"url": _PLUGIN_URL}, indent=2) + "\n").encode("utf-8")
     descriptor = -1
     try:
@@ -1208,6 +1350,7 @@ def _write_config_stage(home_fd: int, name: str) -> bytes:
             dir_fd=home_fd,
         )
         os.fchmod(descriptor, 0o600)
+        _require_fd_mount(descriptor, trusted_mount)
         _write_all(descriptor, payload)
         os.fsync(descriptor)
     except OSError:
@@ -1218,7 +1361,12 @@ def _write_config_stage(home_fd: int, name: str) -> bytes:
     return payload
 
 
-def _require_config_entry(home_fd: int, name: str, expected: bytes | None = None) -> os.stat_result:
+def _require_config_entry(
+    home_fd: int, name: str, expected: bytes | None = None,
+    mount_id: int | None = None,
+) -> os.stat_result:
+    trusted_mount = _fd_mount_id(home_fd) if mount_id is None else mount_id
+    _require_fd_mount(home_fd, trusted_mount)
     value = _fd_entry_stat(home_fd, name)
     if value is None or not stat.S_ISREG(value.st_mode):
         raise HermesInstallError("The Hermes plugin config is unsafe.")
@@ -1231,6 +1379,7 @@ def _require_config_entry(home_fd: int, name: str, expected: bytes | None = None
         current = _fd_entry_stat(home_fd, name)
         if current is None or not _same_inode(opened, value) or not _same_inode(opened, current):
             raise HermesInstallError("The Hermes plugin config changed during inspection.")
+        _require_fd_mount(descriptor, trusted_mount)
         if expected is not None and _read_fd(descriptor) != expected:
             raise HermesInstallError("The Hermes plugin config did not verify.")
     except OSError:
@@ -1241,7 +1390,11 @@ def _require_config_entry(home_fd: int, name: str, expected: bytes | None = None
     return value
 
 
-def _unlink_config_at(home_fd: int, name: str) -> None:
+def _unlink_config_at(
+    home_fd: int, name: str, mount_id: int | None = None,
+) -> None:
+    trusted_mount = _fd_mount_id(home_fd) if mount_id is None else mount_id
+    _require_fd_mount(home_fd, trusted_mount)
     value = _fd_entry_stat(home_fd, name)
     if value is None:
         return
@@ -1274,7 +1427,10 @@ def publish_guided_plugin(target: HermesTarget) -> None:
     with contextlib.ExitStack() as descriptors:
         source_fd = _open_directory_root(source, source_stat)
         descriptors.callback(_close_fd, source_fd)
-        source_manifest = _fd_manifest(source_fd, require_private=False)
+        source_mount_id = _fd_mount_id(source_fd)
+        source_manifest = _fd_manifest(
+            source_fd, require_private=False, mount_id=source_mount_id,
+        )
         if not _PLUGIN_REQUIRED <= source_manifest.keys() or any(
             source_manifest[name][0] != "file" for name in _PLUGIN_REQUIRED
         ):
@@ -1282,6 +1438,7 @@ def publish_guided_plugin(target: HermesTarget) -> None:
 
         home_fd = _open_directory_root(target.home, home_stat)
         descriptors.callback(_close_fd, home_fd)
+        home_mount_id = _fd_mount_id(home_fd)
         _require_private_directory(home_fd)
 
         plugins_value = _fd_entry_stat(home_fd, "plugins")
@@ -1291,7 +1448,7 @@ def publish_guided_plugin(target: HermesTarget) -> None:
                 os.fsync(home_fd)
             except OSError:
                 raise HermesInstallError("The Hermes plugin parent could not be created safely.") from None
-        plugins_fd = _open_directory_at(home_fd, "plugins")
+        plugins_fd = _open_directory_at(home_fd, "plugins", home_mount_id)
         descriptors.callback(_close_fd, plugins_fd)
         try:
             os.fchmod(plugins_fd, 0o700)
@@ -1299,25 +1456,31 @@ def publish_guided_plugin(target: HermesTarget) -> None:
         except OSError:
             raise HermesInstallError("The Hermes plugin parent could not be made owner-only.") from None
         _require_private_directory(plugins_fd)
-        _require_directory_entry(home_fd, "plugins", plugins_fd)
+        _require_directory_entry(home_fd, "plugins", plugins_fd, home_mount_id)
 
         old_plugin_stat = _fd_entry_stat(plugins_fd, "memoryd")
         old_plugin_manifest: dict[str, tuple[str, str]] | None = None
         if old_plugin_stat is not None:
             if not stat.S_ISDIR(old_plugin_stat.st_mode):
                 raise HermesInstallError("The Hermes plugin destination has unsafe topology.")
-            old_plugin_fd = _open_directory_at(plugins_fd, "memoryd")
+            old_plugin_fd = _open_directory_at(
+                plugins_fd, "memoryd", home_mount_id,
+            )
             try:
                 # A recognized rerun may be repairing stale/mode-tampered plugin
                 # files. Retain their exact manifest for rollback without
                 # treating the old tree as the new trusted publication.
-                old_plugin_manifest = _fd_manifest(old_plugin_fd, require_private=False)
+                old_plugin_manifest = _fd_manifest(
+                    old_plugin_fd, require_private=False, mount_id=home_mount_id,
+                )
             finally:
                 _close_fd(old_plugin_fd)
 
         old_config_stat = _fd_entry_stat(home_fd, "memoryd.json")
         if old_config_stat is not None:
-            old_config_stat = _require_config_entry(home_fd, "memoryd.json")
+            old_config_stat = _require_config_entry(
+                home_fd, "memoryd.json", mount_id=home_mount_id,
+            )
 
         token = secrets.token_hex(16)
         plugin_stage = f".memoryd-stage-{token}"
@@ -1363,21 +1526,38 @@ def publish_guided_plugin(target: HermesTarget) -> None:
         try:
             try:
                 os.mkdir(plugin_stage, 0o700, dir_fd=plugins_fd)
-                stage_fd = _open_directory_at(plugins_fd, plugin_stage)
+                stage_fd = _open_directory_at(
+                    plugins_fd, plugin_stage, home_mount_id,
+                )
                 descriptors.callback(_close_fd, stage_fd)
                 os.fchmod(stage_fd, 0o700)
-                _copy_plugin_tree_fd(source_fd, stage_fd)
+                _copy_plugin_tree_fd(
+                    source_fd, stage_fd, source_mount_id=source_mount_id,
+                    destination_mount_id=home_mount_id,
+                )
                 os.fsync(stage_fd)
-                if _fd_manifest(stage_fd, require_private=True) != source_manifest:
+                if _fd_manifest(
+                    stage_fd, require_private=True, mount_id=home_mount_id,
+                ) != source_manifest:
                     raise HermesInstallError("The staged plugin manifest did not verify.")
-                _require_directory_entry(plugins_fd, plugin_stage, stage_fd)
-                _require_root_still_open(source, source_fd)
-                if _fd_manifest(source_fd, require_private=False) != source_manifest:
+                _require_directory_entry(
+                    plugins_fd, plugin_stage, stage_fd, home_mount_id,
+                )
+                _require_root_still_open(source, source_fd, source_mount_id)
+                if _fd_manifest(
+                    source_fd, require_private=False, mount_id=source_mount_id,
+                ) != source_manifest:
                     raise HermesInstallError("The bundled plugin changed during staging.")
-                config_payload = _write_config_stage(home_fd, config_stage)
-                _require_config_entry(home_fd, config_stage, config_payload)
-                _require_root_still_open(target.home, home_fd)
-                _require_directory_entry(home_fd, "plugins", plugins_fd)
+                config_payload = _write_config_stage(
+                    home_fd, config_stage, home_mount_id,
+                )
+                _require_config_entry(
+                    home_fd, config_stage, config_payload, home_mount_id,
+                )
+                _require_root_still_open(target.home, home_fd, home_mount_id)
+                _require_directory_entry(
+                    home_fd, "plugins", plugins_fd, home_mount_id,
+                )
 
                 # Once the first visible name can move, kernel-defer SIGINT and
                 # SIGTERM until the pair is either committed/cleaned or exactly
@@ -1408,16 +1588,25 @@ def publish_guided_plugin(target: HermesTarget) -> None:
                     src_dir_fd=home_fd, dst_dir_fd=home_fd,
                 )
 
-                published_fd = _open_directory_at(plugins_fd, "memoryd")
+                published_fd = _open_directory_at(
+                    plugins_fd, "memoryd", home_mount_id,
+                )
                 try:
-                    if _fd_manifest(published_fd, require_private=True) != source_manifest:
+                    if _fd_manifest(
+                        published_fd, require_private=True,
+                        mount_id=home_mount_id,
+                    ) != source_manifest:
                         raise HermesInstallError("The published plugin manifest did not verify.")
                 finally:
                     _close_fd(published_fd)
-                _require_config_entry(home_fd, "memoryd.json", config_payload)
-                _require_root_still_open(source, source_fd)
-                _require_root_still_open(target.home, home_fd)
-                _require_directory_entry(home_fd, "plugins", plugins_fd)
+                _require_config_entry(
+                    home_fd, "memoryd.json", config_payload, home_mount_id,
+                )
+                _require_root_still_open(source, source_fd, source_mount_id)
+                _require_root_still_open(target.home, home_fd, home_mount_id)
+                _require_directory_entry(
+                    home_fd, "plugins", plugins_fd, home_mount_id,
+                )
                 os.fsync(plugins_fd)
                 os.fsync(home_fd)
                 committed = True
@@ -1480,10 +1669,18 @@ def publish_guided_plugin(target: HermesTarget) -> None:
                     complete(restore_config)
                     complete(lambda: os.fsync(plugins_fd))
                     complete(lambda: os.fsync(home_fd))
-                    complete(lambda: _remove_tree_at(plugins_fd, plugin_discard))
-                    complete(lambda: _remove_tree_at(plugins_fd, plugin_stage))
-                    complete(lambda: _unlink_config_at(home_fd, config_discard))
-                    complete(lambda: _unlink_config_at(home_fd, config_stage))
+                    complete(lambda: _remove_tree_at(
+                        plugins_fd, plugin_discard, home_mount_id,
+                    ))
+                    complete(lambda: _remove_tree_at(
+                        plugins_fd, plugin_stage, home_mount_id,
+                    ))
+                    complete(lambda: _unlink_config_at(
+                        home_fd, config_discard, home_mount_id,
+                    ))
+                    complete(lambda: _unlink_config_at(
+                        home_fd, config_stage, home_mount_id,
+                    ))
                     complete(lambda: os.fsync(plugins_fd))
                     complete(lambda: os.fsync(home_fd))
 
@@ -1495,9 +1692,14 @@ def publish_guided_plugin(target: HermesTarget) -> None:
                         elif restored_plugin is None or not _same_inode(old_plugin_stat, restored_plugin):
                             raise HermesInstallError("The exact prior plugin was not restored.")
                         else:
-                            restored_fd = _open_directory_at(plugins_fd, "memoryd")
+                            restored_fd = _open_directory_at(
+                                plugins_fd, "memoryd", home_mount_id,
+                            )
                             try:
-                                if _fd_manifest(restored_fd, require_private=False) != old_plugin_manifest:
+                                if _fd_manifest(
+                                    restored_fd, require_private=False,
+                                    mount_id=home_mount_id,
+                                ) != old_plugin_manifest:
                                     raise HermesInstallError("The exact prior plugin was not restored.")
                             finally:
                                 _close_fd(restored_fd)
@@ -1507,8 +1709,12 @@ def publish_guided_plugin(target: HermesTarget) -> None:
                                 raise HermesInstallError("The new plugin config was not removed during rollback.")
                         elif restored_config is None or not _same_inode(old_config_stat, restored_config):
                             raise HermesInstallError("The exact prior plugin config was not restored.")
-                        _require_root_still_open(target.home, home_fd)
-                        _require_directory_entry(home_fd, "plugins", plugins_fd)
+                        _require_root_still_open(
+                            target.home, home_fd, home_mount_id,
+                        )
+                        _require_directory_entry(
+                            home_fd, "plugins", plugins_fd, home_mount_id,
+                        )
                     except BaseException as verification_error:
                         cleanup_failures.append(verification_error)
 
@@ -1525,8 +1731,12 @@ def publish_guided_plugin(target: HermesTarget) -> None:
                     ) from None
 
             assert committed
-            complete(lambda: _remove_tree_at(plugins_fd, plugin_rollback))
-            complete(lambda: _unlink_config_at(home_fd, config_rollback))
+            complete(lambda: _remove_tree_at(
+                plugins_fd, plugin_rollback, home_mount_id,
+            ))
+            complete(lambda: _unlink_config_at(
+                home_fd, config_rollback, home_mount_id,
+            ))
             complete(lambda: os.fsync(plugins_fd))
             complete(lambda: os.fsync(home_fd))
             if cleanup_failures:

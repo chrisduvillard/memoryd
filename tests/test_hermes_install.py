@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -901,8 +902,14 @@ def test_guided_plugin_staging_manifest_mismatch_preserves_prior(
     (source / "__init__.py").write_text("VERSION = 'two'\n", encoding="utf-8")
     real_copy = hermes._copy_plugin_tree_fd
 
-    def tamper_after_copy(source_fd: int, stage_fd: int, prefix: Path = Path()):
-        real_copy(source_fd, stage_fd, prefix)
+    def tamper_after_copy(
+        source_fd: int, stage_fd: int, prefix: Path = Path(),
+        source_mount_id: int | None = None,
+        destination_mount_id: int | None = None,
+    ):
+        real_copy(
+            source_fd, stage_fd, prefix, source_mount_id, destination_mount_id,
+        )
         if prefix.parts:
             return
         descriptor = os.open(
@@ -957,6 +964,17 @@ def _fd_target(descriptor: int) -> Path | None:
         return Path(os.readlink(f"/proc/self/fd/{descriptor}"))
     except OSError:
         return None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fdinfo is Linux-only")
+def test_fdinfo_mount_id_parser_is_strict_and_fail_closed():
+    assert hermes._parse_fdinfo_mount_id(b"pos:\t0\nmnt_id:\t82\nino:\t1\n") == 82
+    for invalid in (
+        b"", b"pos:\t0\n", b"mnt_id: 82\n", b"mnt_id:\t0\n",
+        b"mnt_id:\t82\nmnt_id:\t83\n", b"mnt_id:\t82x\n", b"mnt_id:\t82\x00\n",
+    ):
+        with pytest.raises(hermes.HermesInstallError, match="mount"):
+            hermes._parse_fdinfo_mount_id(invalid)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fd publication is POSIX-only")
@@ -1140,7 +1158,7 @@ def _real_sigint_publication_child(root: str) -> None:
     lines, start_line = inspect.getsourcelines(hermes.publish_guided_plugin)
     cleanup_line = start_line + next(
         index for index, line in enumerate(lines)
-        if "_unlink_config_at(home_fd, config_rollback)" in line
+        if "_unlink_config_at(" in line and "config_rollback" in lines[index + 1]
     )
     sent = False
 
@@ -1190,6 +1208,117 @@ def test_guided_plugin_real_sigint_during_postcommit_cleanup_is_deferred(tmp_pat
         timeout=30,
         check=False,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _signal_mask_publication_child(root: str, mode: str) -> None:
+    class DeferredTermination(BaseException):
+        pass
+
+    tmp_path = Path(root)
+    target = _hermes_target(tmp_path)
+    source = _plugin_source(tmp_path, "one")
+    original_resource_dir = cli._resource_dir
+    cli._resource_dir = lambda _name: source
+    original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    prior_mask = set(original_mask) | {signal.SIGUSR1}
+    signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+    original_handler = signal.getsignal(signal.SIGTERM)
+    try:
+        if mode == "mask":
+            hermes.publish_guided_plugin(target)
+            assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == prior_mask
+            return
+
+        hermes.publish_guided_plugin(target)
+        (source / "__init__.py").write_text("VERSION = 'two'\n", encoding="utf-8")
+        lines, start_line = inspect.getsourcelines(hermes.publish_guided_plugin)
+        cleanup_line = start_line + next(
+            index for index, line in enumerate(lines)
+            if "_unlink_config_at(" in line and "config_rollback" in lines[index + 1]
+        )
+        sent = False
+        faulted = False
+        original_remove = hermes._remove_tree_at
+
+        def terminate(_signum, _frame):
+            raise DeferredTermination
+
+        def remove(parent_fd, name, mount_id=None):
+            nonlocal faulted
+            if mode == "sigterm-fault" and not faulted and "rollback" in name:
+                faulted = True
+                raise hermes.HermesInstallError("injected cleanup fault")
+            return original_remove(parent_fd, name, mount_id)
+
+        def trace(frame, event, _argument):
+            nonlocal sent
+            if (
+                not sent and event == "line"
+                and frame.f_code is hermes.publish_guided_plugin.__code__
+                and frame.f_lineno == cleanup_line
+            ):
+                sent = True
+                os.kill(os.getpid(), signal.SIGTERM)
+            return trace
+
+        signal.signal(signal.SIGTERM, terminate)
+        hermes._remove_tree_at = remove
+        sys.settrace(trace)
+        try:
+            hermes.publish_guided_plugin(target)
+        except DeferredTermination:
+            pass
+        else:
+            raise AssertionError("pending SIGTERM was not delivered")
+        finally:
+            sys.settrace(None)
+            hermes._remove_tree_at = original_remove
+
+        assert sent
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == prior_mask
+        assert _file_manifest(target.home / "plugins" / "memoryd") == _file_manifest(source)
+        config = json.loads((target.home / "memoryd.json").read_text(encoding="utf-8"))
+        assert config == {"url": "http://127.0.0.1:7437"}
+        rollbacks = list((target.home / "plugins").glob(".memoryd-rollback-*"))
+        if mode == "sigterm-fault":
+            assert faulted and len(rollbacks) == 1
+        else:
+            assert not faulted and rollbacks == []
+        assert not list(target.home.glob(".memoryd-config-rollback-*"))
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+        cli._resource_dir = original_resource_dir
+
+
+def _run_signal_mask_child(tmp_path: Path, mode: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable, "-c",
+            "import runpy; ns=runpy.run_path(" + repr(str(Path(__file__)))
+            + "); ns['_signal_mask_publication_child']("
+            + repr(str(tmp_path)) + ", " + repr(mode) + ")",
+        ],
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="pthread masks are Linux-only")
+def test_guided_plugin_restores_exact_nonempty_prior_signal_mask(tmp_path):
+    result = _run_signal_mask_child(tmp_path, "mask")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="pthread masks are Linux-only")
+def test_guided_plugin_real_sigterm_is_delivered_after_coherent_cleanup(tmp_path):
+    result = _run_signal_mask_child(tmp_path, "sigterm")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="pthread masks are Linux-only")
+def test_guided_plugin_pending_signal_plus_cleanup_fault_preserves_evidence_and_mask(tmp_path):
+    result = _run_signal_mask_child(tmp_path, "sigterm-fault")
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -1251,6 +1380,197 @@ def test_guided_plugin_fd_races_do_not_touch_external_or_mix_prior_pair(
         assert _file_manifest(detached / "memoryd") == before[0]
     else:
         assert _publication_pair(target) == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="mount IDs are Linux-only")
+@pytest.mark.parametrize("location", ["source", "ignored-old", "stage", "final"])
+def test_guided_plugin_rejects_cross_mount_before_commit_and_preserves_pair(
+    monkeypatch, tmp_path, location,
+):
+    target, source, before = _publication_rerun(monkeypatch, tmp_path)
+    destination = target.home / "plugins" / "memoryd"
+    external_marker = source / "nested" / "external-marker"
+    external_marker.write_bytes(b"external-unchanged")
+    os.chmod(external_marker, 0o600)
+    if location == "ignored-old":
+        ignored = destination / "__pycache__"
+        ignored.mkdir(mode=0o700)
+        external_marker = ignored / "external-marker"
+        external_marker.write_bytes(b"external-unchanged")
+        os.chmod(external_marker, 0o600)
+        before = _publication_pair(target)
+
+    real_mount_id = hermes._fd_mount_id
+    real_replace = os.replace
+    final_visible = False
+    injected = False
+    mismatched_inodes: set[tuple[int, int]] = set()
+
+    def replace(source_name, destination_name, *args, **kwargs):
+        nonlocal final_visible
+        result = real_replace(source_name, destination_name, *args, **kwargs)
+        if (
+            Path(source_name).name.startswith(".memoryd-stage-")
+            and Path(destination_name).name == "memoryd"
+        ):
+            final_visible = True
+        return result
+
+    def mount_id(descriptor):
+        nonlocal injected
+        actual = real_mount_id(descriptor)
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino)
+        path = _fd_target(descriptor)
+        mismatch = False
+        if path is not None and path.name == "nested":
+            mismatch = (
+                (location == "source" and source in path.parents)
+                or (location == "stage" and any(
+                    part.startswith(".memoryd-stage-") for part in path.parts
+                ))
+                or (
+                    location == "final" and final_visible
+                    and path.parent == target.home / "plugins" / "memoryd"
+                )
+            )
+        if (
+            path is not None
+            and location == "ignored-old"
+            and path.name == "__pycache__"
+            and destination in path.parents
+        ):
+            mismatch = True
+        if mismatch:
+            injected = True
+            mismatched_inodes.add(identity)
+        if identity in mismatched_inodes:
+            return actual + 100_000
+        return actual
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(hermes, "_fd_mount_id", mount_id)
+    with pytest.raises(hermes.HermesInstallError, match="(?i)mount|plugin|evidence"):
+        hermes.publish_guided_plugin(target)
+
+    assert injected
+    assert external_marker.read_bytes() == b"external-unchanged"
+    assert _publication_pair(target) == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="mount IDs are Linux-only")
+def test_guided_plugin_cleanup_cross_mount_preserves_named_evidence(
+    monkeypatch, tmp_path,
+):
+    target, source, _before = _publication_rerun(monkeypatch, tmp_path)
+    marker = target.home / "plugins" / "memoryd" / "nested" / "external-marker"
+    marker.write_bytes(b"external-unchanged")
+    os.chmod(marker, 0o600)
+    real_mount_id = hermes._fd_mount_id
+    injected = False
+
+    def mount_id(descriptor):
+        nonlocal injected
+        actual = real_mount_id(descriptor)
+        path = _fd_target(descriptor)
+        if (
+            path is not None
+            and path.name == "nested"
+            and any(part.startswith(".memoryd-rollback-") for part in path.parts)
+        ):
+            injected = True
+            return actual + 100_000
+        return actual
+
+    monkeypatch.setattr(hermes, "_fd_mount_id", mount_id)
+    with pytest.raises(hermes.HermesInstallError, match="published|evidence"):
+        hermes.publish_guided_plugin(target)
+
+    assert injected
+    assert _file_manifest(target.home / "plugins" / "memoryd") == _file_manifest(source)
+    rollback = list((target.home / "plugins").glob(".memoryd-rollback-*"))
+    assert len(rollback) == 1
+    assert (rollback[0] / "nested" / "external-marker").read_bytes() == b"external-unchanged"
+
+
+def _bind_mount_publication_child(root: str, source_value: str) -> None:
+    tmp_path = Path(root)
+    target = HermesTarget(
+        root=(tmp_path / "hermes").resolve(),
+        home=(tmp_path / "hermes" / "profiles" / "work").resolve(),
+        executable=tmp_path / "bin" / "hermes",
+        python=tmp_path / "venv" / "bin" / "python",
+    )
+    source = Path(source_value)
+    original_resource_dir = cli._resource_dir
+    cli._resource_dir = lambda _name: source
+    try:
+        try:
+            hermes.publish_guided_plugin(target)
+        except hermes.HermesInstallError as error:
+            assert "mount" in str(error).lower()
+        else:
+            raise AssertionError("bind-mounted source subtree was accepted")
+    finally:
+        cli._resource_dir = original_resource_dir
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="mount namespaces are Linux-only")
+def test_guided_plugin_rejects_real_bind_mount_in_disposable_user_namespace(
+    monkeypatch, tmp_path,
+):
+    unshare = shutil.which("unshare")
+    mount = shutil.which("mount")
+    umount = shutil.which("umount")
+    if not unshare or not mount or not umount:
+        pytest.skip(
+            "user+mount namespace capability unavailable: "
+            f"unshare={unshare!r}, mount={mount!r}, umount={umount!r}"
+        )
+
+    probe_source = tmp_path / "probe-source"
+    probe_target = tmp_path / "probe-target"
+    probe_source.mkdir()
+    probe_target.mkdir()
+    probe = subprocess.run(
+        [
+            unshare, "--user", "--map-root-user", "--mount", "sh", "-c",
+            'mount --bind "$1" "$2" && umount "$2"',
+            "memoryd-mount-probe", str(probe_source), str(probe_target),
+        ],
+        text=True, capture_output=True, timeout=15, check=False,
+    )
+    if probe.returncode != 0:
+        evidence = (probe.stderr or probe.stdout).strip().splitlines()
+        detail = evidence[0][:200] if evidence else "no diagnostic"
+        pytest.skip(
+            "user+mount namespace capability denied: "
+            f"rc={probe.returncode}; {detail}"
+        )
+
+    target, source, before = _publication_rerun(monkeypatch, tmp_path)
+    external = tmp_path / "external-bind"
+    external.mkdir(mode=0o700)
+    marker = external / "external-marker"
+    marker.write_bytes(b"external-unchanged")
+    os.chmod(marker, 0o600)
+    code = (
+        "import runpy; ns=runpy.run_path(" + repr(str(Path(__file__)))
+        + "); ns['_bind_mount_publication_child']("
+        + repr(str(tmp_path)) + ", " + repr(str(source)) + ")"
+    )
+    result = subprocess.run(
+        [
+            unshare, "--user", "--map-root-user", "--mount", "sh", "-c",
+            'mount --bind "$1" "$2" && exec "$3" -c "$4"',
+            "memoryd-bind-test", str(external), str(source / "nested"),
+            sys.executable, code,
+        ],
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.read_bytes() == b"external-unchanged"
+    assert _publication_pair(target) == before
 
 
 def _backup_row(path: Path, *, ok: bool = True) -> backup.BackupListing:
