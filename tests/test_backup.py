@@ -404,6 +404,49 @@ def test_database_migration_query_reports_missing_table(monkeypatch):
         backup._database_migrations("postgresql:///memoryd")
 
 
+@pytest.mark.parametrize("row, expected", [
+    (None, None),
+    (("view",), "view"),
+])
+def test_target_database_user_object_query_is_catalog_wide(
+        monkeypatch, row, expected):
+    queries: list[str] = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query):
+            queries.append(query)
+            return types.SimpleNamespace(fetchone=lambda: row)
+
+    import psycopg
+    monkeypatch.setattr(
+        psycopg, "connect",
+        lambda dsn, **kwargs: Connection()
+        if dsn == "postgresql:///target" and kwargs == {"connect_timeout": 5}
+        else pytest.fail((dsn, kwargs)))
+
+    assert backup._target_db_user_object_kind(
+        "postgresql:///target") == expected
+    assert len(queries) == 1
+    query = queries[0]
+    for catalog in (
+        "pg_namespace", "pg_class", "pg_proc", "pg_type", "pg_extension",
+        "pg_collation", "pg_conversion", "pg_operator", "pg_opclass",
+        "pg_opfamily", "pg_ts_config", "pg_ts_dict", "pg_ts_parser",
+        "pg_ts_template", "pg_statistic_ext", "pg_language",
+        "pg_event_trigger", "pg_foreign_data_wrapper", "pg_foreign_server",
+        "pg_user_mapping", "pg_publication", "pg_subscription",
+        "pg_largeobject_metadata", "pg_default_acl", "pg_db_role_setting",
+        "pg_transform", "pg_seclabel", "pg_shdescription", "pg_shseclabel",
+    ):
+        assert catalog in query
+
+
 def test_create_refuses_doctor_errors_and_dead_letters(monkeypatch, tmp_path):
     home = _home(tmp_path)
     _prepare(monkeypatch, home)
@@ -485,7 +528,7 @@ def test_posix_chmod_failure_aborts_restore_and_cleans_staging(
     os.chmod(snapshot, 0o700)
     for path in snapshot.iterdir():
         os.chmod(path, 0o600)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "POSIX_MODE_ENFORCED", True, raising=False)
     monkeypatch.setattr(backup, "_require_mode", lambda _path, _mode: None)
     monkeypatch.setattr(
@@ -857,7 +900,7 @@ def test_restore_verifies_then_publishes_home_with_target_config(
     snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
     target_home = tmp_path / "restored"
     restored: list[tuple[Path, str]] = []
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(
         backup, "_restore_database",
         lambda dump, dsn: restored.append((dump, dsn)))
@@ -899,7 +942,7 @@ def test_restore_consumes_private_snapshot_after_original_is_swapped(
         restored.append((dump.read_bytes(), dump.parent.name))
 
     monkeypatch.setattr(backup, "verify_snapshot", verify_then_swap)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", restore)
 
     backup.restore_backup(
@@ -929,7 +972,7 @@ def test_restore_rejects_corruption_in_private_snapshot_copy(
 
     monkeypatch.setattr(
         backup, "_copy_snapshot_file", corrupt_copy, raising=False)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(
         backup, "_restore_database",
         lambda *_args: pytest.fail("corrupt staged snapshot reached database"))
@@ -964,7 +1007,7 @@ def test_restore_detects_source_file_replacement_during_private_copy(
 
     monkeypatch.setattr(
         backup, "_copy_snapshot_file", replacing_copy, raising=False)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", lambda *_args: None)
 
     with pytest.raises(backup.BackupError, match="changed during copy"):
@@ -989,7 +1032,7 @@ def test_restore_operation_error_cleans_private_snapshot_and_preserves_primary(
         saw_private_snapshot = dump.parent.name.startswith(".target.snapshot-")
         raise backup.BackupError("injected primary restore failure")
 
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", fail_restore)
 
     with pytest.raises(backup.BackupError, match="primary restore failure"):
@@ -1017,7 +1060,7 @@ def test_restore_stage_initialization_failure_cleans_all_private_directories(
         return real_chmod(path, mode)
 
     monkeypatch.setattr(backup, "_chmod", fail_staging_chmod)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", lambda *_args: None)
 
     with pytest.raises((backup.BackupError, OSError),
@@ -1034,7 +1077,7 @@ def test_restore_checks_staged_home_and_config_modes(monkeypatch, tmp_path):
     source_home = _home(tmp_path)
     _prepare(monkeypatch, source_home)
     snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
     checked: list[tuple[Path, int]] = []
     monkeypatch.setattr(
@@ -1059,7 +1102,7 @@ def test_restore_refuses_nonempty_home_and_nonempty_db_but_not_health(
     target = tmp_path / "target"
     target.mkdir()
     (target / "keep").write_text("data")
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
 
     with pytest.raises(backup.BackupError, match="not empty"):
         backup.restore_backup(snapshot, target_dsn="postgresql:///db",
@@ -1067,8 +1110,9 @@ def test_restore_refuses_nonempty_home_and_nonempty_db_but_not_health(
     assert (target / "keep").read_text() == "data"
 
     target = tmp_path / "other"
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: True)
-    with pytest.raises(backup.BackupError, match="user tables"):
+    monkeypatch.setattr(
+        backup, "_target_db_user_object_kind", lambda _dsn: "relation")
+    with pytest.raises(backup.BackupError, match="user objects.*relation"):
         backup.restore_backup(snapshot, target_dsn="postgresql:///db",
                               target_home=target)
     assert not target.exists()
@@ -1076,7 +1120,7 @@ def test_restore_refuses_nonempty_home_and_nonempty_db_but_not_health(
     monkeypatch.setattr(
         cli, "_health",
         lambda: pytest.fail("HTTP health must not decide offline ownership"))
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
     third = backup.restore_backup(
         snapshot, target_dsn="postgresql:///db2",
@@ -1172,7 +1216,7 @@ def test_restore_error_releases_home_and_database_ownership(
         sys.modules, "psycopg", types.SimpleNamespace(
             connect=lambda value, **_kwargs: Connection(value)))
     monkeypatch.setattr(backup, "offline_ownership", ownership.offline_ownership)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(
         backup, "_restore_database",
         lambda *_args: (_ for _ in ()).throw(backup.BackupError("injected")))
@@ -1193,7 +1237,7 @@ def test_restore_command_failure_removes_only_staging_and_warns_db_risk(
     _prepare(monkeypatch, source_home)
     snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
     target = tmp_path / "target"
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(
         backup, "_restore_database",
         lambda _dump, _dsn: (_ for _ in ()).throw(backup.BackupError("pg failed")))
@@ -1216,7 +1260,7 @@ def test_posix_existing_empty_target_publishes_with_one_replace(
     target.mkdir()
     monkeypatch.setattr(
         backup, "WINDOWS_RESTORE_REQUIRES_ABSENT_HOME", False, raising=False)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
     real_replace = backup.os.replace
     calls: list[tuple[Path, Path]] = []
@@ -1250,8 +1294,8 @@ def test_windows_existing_empty_target_refuses_before_database_access(
     monkeypatch.setattr(
         backup, "WINDOWS_RESTORE_REQUIRES_ABSENT_HOME", True, raising=False)
     monkeypatch.setattr(
-        backup, "_target_db_has_tables",
-        lambda dsn: database_calls.append(dsn) or False)
+        backup, "_target_db_user_object_kind",
+        lambda dsn: database_calls.append(dsn) or None)
     monkeypatch.setattr(
         backup, "_restore_database",
         lambda _dump, _dsn: database_calls.append("restore"))
@@ -1271,7 +1315,7 @@ def test_windows_absent_target_publishes_atomically(monkeypatch, tmp_path):
     target = tmp_path / "target"
     monkeypatch.setattr(
         backup, "WINDOWS_RESTORE_REQUIRES_ABSENT_HOME", True, raising=False)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
 
     backup.restore_backup(snapshot, target_dsn="postgresql:///empty",
@@ -1289,7 +1333,7 @@ def test_posix_replace_failure_preserves_existing_empty_target(
     target.mkdir()
     monkeypatch.setattr(
         backup, "WINDOWS_RESTORE_REQUIRES_ABSENT_HOME", False, raising=False)
-    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_target_db_user_object_kind", lambda _dsn: None)
     monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
     calls: list[tuple[Path, Path]] = []
 

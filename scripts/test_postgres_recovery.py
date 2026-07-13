@@ -21,7 +21,7 @@ import psycopg
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
-from memoryd.backup import create_backup, restore_backup, verify_snapshot
+from memoryd.backup import BackupError, create_backup, restore_backup, verify_snapshot
 
 
 DSN = os.environ.get("MEMORYD_DSN", "")
@@ -169,6 +169,57 @@ def _write_source_config() -> None:
         path.chmod(0o700)
 
 
+def _create_database(admin_dsn: str, database: str) -> None:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(
+            sql.Identifier(database)))
+
+
+def _drop_database(admin_dsn: str, database: str) -> None:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+        admin.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname=%s AND pid <> pg_backend_pid()",
+            (database,),
+        )
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(
+            sql.Identifier(database)))
+
+
+def _assert_restore_refuses_user_objects(
+        snapshot: Path, admin_dsn: str) -> None:
+    assert HOME is not None
+    cases = {
+        "schema": "CREATE SCHEMA preexisting",
+        "view": "CREATE VIEW preexisting_view AS SELECT 1 AS value",
+        "sequence": "CREATE SEQUENCE preexisting_sequence",
+        "function": (
+            "CREATE FUNCTION preexisting_function() RETURNS integer "
+            "LANGUAGE sql AS 'SELECT 1'"),
+        "type": "CREATE TYPE preexisting_type AS ENUM ('value')",
+        "extension": "CREATE EXTENSION vector",
+    }
+    for label, statement in cases.items():
+        database = f"memoryd_nonempty_{label}_{uuid.uuid4().hex}"
+        target_dsn = make_conninfo(DSN, dbname=database)
+        target_home = HOME.parent / f"restore-refusal-{label}-{uuid.uuid4().hex}"
+        _create_database(admin_dsn, database)
+        try:
+            with psycopg.connect(target_dsn) as connection:
+                connection.execute(statement)
+            try:
+                restore_backup(
+                    snapshot, target_dsn=target_dsn, target_home=target_home)
+            except BackupError as exc:
+                assert "target database already has user objects" in str(exc), exc
+            else:
+                raise AssertionError(
+                    f"restore accepted non-empty target containing {label}")
+            assert not target_home.exists()
+        finally:
+            _drop_database(admin_dsn, database)
+
+
 def run_real_backup_restore() -> None:
     assert HOME is not None
     assert _migration_inventory(DSN) == EXPECTED_MIGRATIONS
@@ -184,8 +235,8 @@ def run_real_backup_restore() -> None:
     database = f"memoryd_restore_{uuid.uuid4().hex}"
     admin_dsn = make_conninfo(DSN, dbname="postgres")
     target_dsn = make_conninfo(DSN, dbname=database)
-    with psycopg.connect(admin_dsn, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    _assert_restore_refuses_user_objects(snapshot, admin_dsn)
+    _create_database(admin_dsn, database)
     try:
         restored = restore_backup(
             snapshot, target_dsn=target_dsn, target_home=target_home)
@@ -202,14 +253,7 @@ def run_real_backup_restore() -> None:
         assert restored_events == source_events
         assert restored_requests == source_requests
     finally:
-        with psycopg.connect(admin_dsn, autocommit=True) as admin:
-            admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname=%s AND pid <> pg_backend_pid()",
-                (database,),
-            )
-            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(
-                sql.Identifier(database)))
+        _drop_database(admin_dsn, database)
     print(f"real backup/verify/restore drill passed: {snapshot}")
 
 

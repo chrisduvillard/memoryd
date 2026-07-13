@@ -1181,14 +1181,110 @@ def _apply_retention(
             shutil.rmtree(old)
 
 
-def _target_db_has_tables(dsn: str) -> bool:
+def _target_db_user_object_kind(dsn: str) -> str | None:
+    # PostgreSQL 16 spreads dumpable objects across many catalogs.  A fresh
+    # database is allowed to contain only system schemas, the public schema,
+    # built-in languages, and the plpgsql extension.  Shared catalogs are
+    # always filtered to the current database so state belonging to another
+    # database in the cluster cannot create a false positive.
+    query = """
+        WITH current_db AS (
+            SELECT oid FROM pg_catalog.pg_database
+            WHERE datname = pg_catalog.current_database()
+        ), user_namespaces AS (
+            SELECT oid, nspname FROM pg_catalog.pg_namespace
+            WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+              AND nspname !~ '^pg_(toast($|_)|temp_)'
+        ), user_objects(kind) AS (
+            SELECT 'schema' FROM user_namespaces WHERE nspname <> 'public'
+            UNION ALL
+            SELECT 'relation' FROM pg_catalog.pg_class
+             WHERE relnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'function' FROM pg_catalog.pg_proc
+             WHERE pronamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'type' FROM pg_catalog.pg_type
+             WHERE typnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'collation' FROM pg_catalog.pg_collation
+             WHERE collnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'conversion' FROM pg_catalog.pg_conversion
+             WHERE connamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'operator' FROM pg_catalog.pg_operator
+             WHERE oprnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'operator class' FROM pg_catalog.pg_opclass
+             WHERE opcnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'operator family' FROM pg_catalog.pg_opfamily
+             WHERE opfnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'text search configuration' FROM pg_catalog.pg_ts_config
+             WHERE cfgnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'text search dictionary' FROM pg_catalog.pg_ts_dict
+             WHERE dictnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'text search parser' FROM pg_catalog.pg_ts_parser
+             WHERE prsnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'text search template' FROM pg_catalog.pg_ts_template
+             WHERE tmplnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'extended statistics' FROM pg_catalog.pg_statistic_ext
+             WHERE stxnamespace IN (SELECT oid FROM user_namespaces)
+            UNION ALL
+            SELECT 'extension' FROM pg_catalog.pg_extension
+             WHERE extname <> 'plpgsql'
+            UNION ALL
+            SELECT 'language' FROM pg_catalog.pg_language
+             WHERE lanname NOT IN ('internal', 'c', 'sql', 'plpgsql')
+            UNION ALL
+            SELECT 'event trigger' FROM pg_catalog.pg_event_trigger
+            UNION ALL
+            SELECT 'foreign-data wrapper'
+              FROM pg_catalog.pg_foreign_data_wrapper
+            UNION ALL
+            SELECT 'foreign server' FROM pg_catalog.pg_foreign_server
+            UNION ALL
+            SELECT 'user mapping' FROM pg_catalog.pg_user_mapping
+            UNION ALL
+            SELECT 'publication' FROM pg_catalog.pg_publication
+            UNION ALL
+            SELECT 'subscription' FROM pg_catalog.pg_subscription
+             WHERE subdbid IN (SELECT oid FROM current_db)
+            UNION ALL
+            SELECT 'large object' FROM pg_catalog.pg_largeobject_metadata
+            UNION ALL
+            SELECT 'default privileges' FROM pg_catalog.pg_default_acl
+            UNION ALL
+            SELECT 'database role setting' FROM pg_catalog.pg_db_role_setting
+             WHERE setdatabase IN (SELECT oid FROM current_db)
+            UNION ALL
+            SELECT 'transform' FROM pg_catalog.pg_transform
+            UNION ALL
+            SELECT 'security label' FROM pg_catalog.pg_seclabel
+            UNION ALL
+            SELECT 'database privileges' FROM pg_catalog.pg_database
+             WHERE oid IN (SELECT oid FROM current_db) AND datacl IS NOT NULL
+            UNION ALL
+            SELECT 'database comment' FROM pg_catalog.pg_shdescription
+             WHERE classoid = 'pg_catalog.pg_database'::pg_catalog.regclass
+               AND objoid IN (SELECT oid FROM current_db)
+            UNION ALL
+            SELECT 'database security label' FROM pg_catalog.pg_shseclabel
+             WHERE classoid = 'pg_catalog.pg_database'::pg_catalog.regclass
+               AND objoid IN (SELECT oid FROM current_db)
+        )
+        SELECT kind FROM user_objects LIMIT 1
+        """
     import psycopg
     with psycopg.connect(dsn, connect_timeout=5) as connection:
-        row = connection.execute(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
-            "WHERE table_type='BASE TABLE' AND table_schema NOT IN "
-            "('pg_catalog', 'information_schema'))").fetchone()
-    return bool(row[0])
+        row = connection.execute(query).fetchone()
+    return str(row[0]) if row is not None else None
 
 
 def _ensure_private_directories(root: Path, target: Path) -> None:
@@ -1386,8 +1482,11 @@ def _restore_backup_owned(
                     "Windows restore requires an absent target home; remove the "
                     "empty directory and retry")
         try:
-            if _target_db_has_tables(target_dsn):
-                raise BackupError("target database already has user tables")
+            object_kind = _target_db_user_object_kind(target_dsn)
+            if object_kind is not None:
+                raise BackupError(
+                    "target database already has user objects "
+                    f"(found {object_kind})")
         except BackupError:
             raise
         except Exception as exc:  # noqa: BLE001

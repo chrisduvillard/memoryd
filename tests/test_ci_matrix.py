@@ -230,7 +230,10 @@ def test_real_postgres_recovery_harness_is_present() -> None:
     for evidence in (
         "ThreadPoolExecutor", "api_request_ledger", "socket",
         "create_backup", "verify_snapshot", "restore_backup",
-        "CREATE DATABASE", "DROP DATABASE",
+        "CREATE DATABASE", "DROP DATABASE", "CREATE SCHEMA preexisting",
+        "CREATE VIEW preexisting_view", "CREATE SEQUENCE preexisting_sequence",
+        "CREATE FUNCTION preexisting_function", "CREATE TYPE preexisting_type",
+        "CREATE EXTENSION vector", "target database already has user objects",
     ):
         assert evidence in source
 
