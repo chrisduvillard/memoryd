@@ -183,14 +183,16 @@ jobs:
           import importlib.metadata
           import site
           from pathlib import Path
+          import yaml
           import agent.memory_provider
           import memoryd
           prefix = Path(__import__('sys').prefix).resolve()
           checkout = Path(__import__('os').environ['GITHUB_WORKSPACE']).resolve()
           site_packages = [Path(value).resolve() for value in site.getsitepackages()]
           daemon = Path(memoryd.__file__).resolve()
+          package = daemon.parent
           hermes_contract = Path(agent.memory_provider.__file__).resolve()
-          plugin = daemon.parent / 'hermes_plugin'
+          plugin = package / 'hermes_plugin'
           assert any(prefix == root or prefix in root.parents for root in site_packages)
           for label, path in {
               'memoryd': daemon,
@@ -201,7 +203,30 @@ jobs:
               assert any(root in path.parents for root in site_packages), (label, path)
           assert (plugin / '__init__.py').is_file()
           assert (plugin / 'spool.py').is_file()
-          assert importlib.metadata.version('memoryd') == '0.3.0'
+          required = (
+              'hermes_install.py',
+              'hermes_compat.py',
+              'hermes_validation/contract.py',
+              'hermes_validation/installed_runtime.py',
+              'hermes_validation/resources.py',
+              'hermes_validation/agent/memory_provider.py',
+              'hermes_plugin/plugin.yaml',
+              'hermes_plugin/__init__.py',
+              'hermes_plugin/spool.py',
+              'migrations/001_init.sql',
+              'migrations/002_extraction.sql',
+              'migrations/003_multi_agent.sql',
+              'migrations/004_quarantine_event.sql',
+              'migrations/005_bitter_lesson.sql',
+              'migrations/006_durable_capture.sql',
+              'migrations/007_api_request_ledger.sql',
+          )
+          assert all((package / relative).is_file() for relative in required)
+          plugin_metadata = yaml.safe_load((plugin / 'plugin.yaml').read_text())
+          assert plugin_metadata['version'] == '0.3.1'
+          pinned_contract = package / 'hermes_validation/agent/memory_provider.py'
+          assert pinned_contract.read_bytes() == hermes_contract.read_bytes()
+          assert importlib.metadata.version('memoryd') == '0.3.1'
           assert importlib.metadata.version('hermes-agent') == '0.16.0'
           print(f"installed memoryd: {daemon}")
           print(f"installed Hermes contract: {hermes_contract}")

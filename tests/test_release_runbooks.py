@@ -11,15 +11,32 @@ PLUGIN_README_PATH = REPO / "hermes_plugin/memoryd/README.md"
 PLUGIN_README = PLUGIN_README_PATH.read_text(encoding="utf-8")
 
 
-def test_rollout_refuses_a_stale_selected_hermes_profile():
-    profile_section = ROLLOUT.split(
-        "## 1. Preflight, select the Hermes profile, and pin Hermes", 1
-    )[1].split("## 2.", 1)[0]
+def test_rollout_makes_guided_install_primary_and_profile_selection_explicit():
+    assert "guided installer is the supported production path" in ROLLOUT
+    assert "memoryd install --hermes" in ROLLOUT
+    assert "`active_profile`" in ROLLOUT
+    assert "literal `default` selects the root" in ROLLOUT
+    assert "does not invent a missing selected profile" in ROLLOUT
+    assert "Manual commands" in ROLLOUT
+    assert "not a second installation recipe" in ROLLOUT
 
-    assert 'if [[ "$HERMES_PROFILE" == default ]]' in profile_section
-    assert 'test -d "$HERMES_HOME"' in profile_section
-    assert 'install -d -m 700 "$HERMES_ROOT"' in profile_section
-    assert 'install -d -m 700 "$HERMES_HOME"' not in profile_section
+
+def test_rollout_documents_transactional_rollback_and_evidence_preservation():
+    activation = ROLLOUT.split("## 3. Transactional activation", 1)[1].split(
+        "## 4.", 1
+    )[0]
+
+    for status in (
+        "hermes memory status",
+        "hermes memoryd config",
+        "memoryd status",
+        "hermes memoryd status",
+    ):
+        assert status in activation
+    assert "SIGINT" in activation and "SIGTERM" in activation
+    assert "previous provider" in activation
+    assert "previous gateway state" in activation
+    assert "dead-letter evidence" in activation
 
 
 def test_canary_visa_uses_the_running_service_runtime_and_environment():

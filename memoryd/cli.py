@@ -2,6 +2,8 @@
 
   memoryd install      DB (Docker pgvector) + migrations + config + Claude Code
                        hooks + autostart + Hermes plugin (when HERMES_HOME exists)
+  memoryd install --hermes
+                       guided production Hermes installation (Linux/systemd)
   memoryd status       is it actually working? (the antidote to fail-open silence)
   memoryd serve        run the daemon in the foreground
   memoryd doctor       inspect spool and archive integrity (read-only)
@@ -563,7 +565,9 @@ def register_claude_hooks() -> Path:
     return settings
 
 
-def install_hermes_plugin(hermes_home: Path | None = None) -> None:
+def install_hermes_plugin(
+    hermes_home: Path | None = None, *, show_activation_hint: bool = True,
+) -> None:
     hermes = _hermes_home() if hermes_home is None else Path(hermes_home)
     if not hermes.is_dir():
         print(f"  hermes     not detected at {hermes} - create/select HERMES_HOME, "
@@ -574,7 +578,8 @@ def install_hermes_plugin(hermes_home: Path | None = None) -> None:
     cfgp = hermes / "memoryd.json"
     _atomic_owner_json(cfgp, {"url": HERMES_MEMORYD_URL})
     print(f"  hermes     plugin installed -> {dst}")
-    print("             activate with: hermes config set memory.provider memoryd")
+    if show_activation_hint:
+        print("             activate with: hermes config set memory.provider memoryd")
 
 
 _SYSTEMD_SERVICE = """[Unit]
@@ -797,7 +802,7 @@ def install(options: _InstallOptions | None = None) -> int:
         install_hermes_plugin()
         install_autostart()
     else:
-        install_hermes_plugin(options.hermes_home)
+        install_hermes_plugin(options.hermes_home, show_activation_hint=False)
         install_autostart(_hermes_mode=True)
     _start_daemon_now()
     healthy = _wait_for_healthy_daemon()
@@ -981,7 +986,14 @@ def main() -> None:
     if cmd == "serve":
         serve()
     elif cmd == "install":
-        sys.exit(install())
+        args = sys.argv[2:]
+        if not args:
+            sys.exit(install())
+        if args == ["--hermes"]:
+            from .hermes_install import guided_hermes_install
+            sys.exit(guided_hermes_install())
+        print("usage: memoryd install [--hermes]", file=sys.stderr)
+        sys.exit(2)
     elif cmd == "status":
         sys.exit(status())
     elif cmd == "doctor":

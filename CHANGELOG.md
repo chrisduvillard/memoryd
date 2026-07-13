@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.1 — 2026-07-13
+
+memoryd 0.3.1 adds a production-safe guided Hermes installation while keeping
+the existing cross-platform installer unchanged.
+
+### Added
+
+- `memoryd install --hermes` validates Linux/systemd/TTY prerequisites, the
+  authoritative owner-only Hermes profile, and Hermes Agent 0.16.0 through its
+  own interpreter before target mutation.
+- Hidden OpenRouter and Voyage credential prompts with minimal live validation;
+  provider response bodies and secrets are redacted from errors.
+- A transactional activation boundary that preserves the prior provider and
+  gateway state through final health reporting and rolls back on failure,
+  SIGINT, or SIGTERM without deleting memoryd evidence.
+- Installed-wheel CI assertions for the guided installer, compatibility and
+  lifecycle validators, pinned contract, plugin, and migrations 001–007 on
+  Python 3.11 and 3.13.
+
+### Changed
+
+- Production Hermes installation is now the immutable-tag two-command guided
+  flow documented in the README. Manual copying and activation remain only for
+  audit, troubleshooting, and emergency recovery.
+- Managed reruns revalidate boundaries and verify a fresh initial snapshot;
+  unknown nonempty memory homes remain untouched.
+
 ## 0.3.0 — 2026-07-13
 
 memoryd 0.3.0 and its Hermes plugin ship as one release.

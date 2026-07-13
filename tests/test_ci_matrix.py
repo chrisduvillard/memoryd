@@ -69,8 +69,30 @@ def test_structured_matrix_enforces_installed_artifact_boundaries() -> None:
     assert 'cd "$RUNNER_TEMP"' in assertion
     assert "importlib.metadata" in assertion
     assert "agent.memory_provider" in assertion
-    assert "plugin = daemon.parent / 'hermes_plugin'" in assertion
+    assert "package = daemon.parent" in assertion
+    assert "plugin = package / 'hermes_plugin'" in assertion
     assert "site.getsitepackages" in assertion
+    for shipped in (
+        "hermes_install.py",
+        "hermes_compat.py",
+        "hermes_validation/contract.py",
+        "hermes_validation/installed_runtime.py",
+        "hermes_validation/resources.py",
+        "hermes_validation/agent/memory_provider.py",
+        "hermes_plugin/plugin.yaml",
+        "hermes_plugin/__init__.py",
+        "hermes_plugin/spool.py",
+        "migrations/001_init.sql",
+        "migrations/002_extraction.sql",
+        "migrations/003_multi_agent.sql",
+        "migrations/004_quarantine_event.sql",
+        "migrations/005_bitter_lesson.sql",
+        "migrations/006_durable_capture.sql",
+        "migrations/007_api_request_ledger.sql",
+    ):
+        assert shipped in assertion
+    assert "plugin_metadata['version'] == '0.3.1'" in assertion
+    assert "importlib.metadata.version('memoryd') == '0.3.1'" in assertion
 
     staging = steps["Stage installed-artifact harnesses outside checkout"]["run"]
     assert 'INSTALLED_HARNESS="$RUNNER_TEMP/installed-harness"' in staging
@@ -185,6 +207,90 @@ def test_blocking_matrix_exercises_every_required_suite() -> None:
     assert "HERMES_SOURCE_ROOT" in job
     assert "PYTHONPATH=" not in job
     assert "check_hermes_contract.py --require-pinned-bytes" in job
+
+
+def test_release_metadata_and_live_guides_agree_on_v031() -> None:
+    from memoryd import __version__
+    from memoryd.server import Handler
+
+    assert __version__ == "0.3.1"
+    assert Handler.server_version == "memoryd/0.3.1"
+
+    plugin = yaml.safe_load(
+        (REPO / "hermes_plugin" / "memoryd" / "plugin.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert plugin["version"] == "0.3.1"
+
+    live_paths = [
+        REPO / "README.md",
+        REPO / "docs" / "HERMES_INSTALL_PROMPT.md",
+        REPO / "docs" / "PRODUCTION_ROLLOUT.md",
+        REPO / "docs" / "REFERENCE.md",
+        REPO / "docs" / "CANARY_SCORECARD.md",
+        REPO / "hermes_plugin" / "memoryd" / "README.md",
+        REPO / "scripts" / "test_hermes.py",
+        WORKFLOW,
+    ]
+    for path in live_paths:
+        source = path.read_text(encoding="utf-8")
+        assert "0.3." + "0" not in source, path.relative_to(REPO)
+
+
+def test_stale_release_references_are_historical_only() -> None:
+    stale = "0.3." + "0"
+    unexpected: list[str] = []
+    source_suffixes = {
+        ".json", ".md", ".ps1", ".py", ".sh", ".sql", ".toml", ".txt",
+        ".yaml", ".yml",
+    }
+    for path in REPO.rglob("*"):
+        relative = path.relative_to(REPO)
+        if any(
+            part in {".git", ".superpowers", ".venv", "__pycache__", "dist"}
+            for part in relative.parts
+        ):
+            continue
+        relative_text = relative.as_posix()
+        if relative_text == "CHANGELOG.md" or relative_text.startswith(
+            "docs/superpowers/"
+        ):
+            continue
+        if not path.is_file() or path.suffix.lower() not in source_suffixes:
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if stale in source:
+            unexpected.append(relative_text)
+    assert unexpected == []
+
+
+def test_guided_quickstart_is_immutable_and_primary() -> None:
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    install = "pipx install --python python3.13"
+    release = "'git+https://github.com/chrisduvillard/memoryd.git@v0.3.1'"
+    command = "memoryd install --hermes"
+    assert install in readme
+    assert release in readme
+    assert command in readme
+    assert readme.index(install) < readme.index("### Quickstart (evaluation")
+
+    prompt = (REPO / "docs" / "HERMES_INSTALL_PROMPT.md").read_text(
+        encoding="utf-8"
+    )
+    assert install in prompt
+    assert release in prompt
+    assert command in prompt
+    assert "exit" in prompt.lower() and "normal terminal" in prompt.lower()
+    for forbidden in (
+        "hermes config set",
+        "hermes gateway stop",
+        "hermes gateway start",
+    ):
+        assert forbidden not in prompt
 
 
 def test_live_hermes_harness_has_strict_installed_mode_and_full_lifecycle() -> None:

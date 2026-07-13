@@ -10,8 +10,8 @@ Record these values before the first turn:
 
 | Field | Value |
 |---|---|
-| memoryd version | `0.3.0` |
-| plugin version | `0.3.0` |
+| memoryd version | `0.3.1` |
+| plugin version | `0.3.1` |
 | Hermes package | `0.16.0` |
 | Hermes tag | `v2026.6.5` |
 | Hermes commit | `3c231eb3979ab9c57d5cd6d02f1d577a3b718b43` |

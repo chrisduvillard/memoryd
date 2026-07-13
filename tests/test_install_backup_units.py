@@ -227,7 +227,7 @@ def test_hermes_plugin_install_uses_active_profile_and_exact_private_config(
     source.mkdir()
     (source / "__init__.py").write_text("# provider\n", encoding="utf-8")
     (source / "plugin.yaml").write_text(
-        "name: memoryd\nversion: 0.3.0\n", encoding="utf-8")
+        "name: memoryd\nversion: 0.3.1\n", encoding="utf-8")
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
