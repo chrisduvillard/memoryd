@@ -4,7 +4,9 @@ import hashlib
 import io
 import json
 import os
+import socket
 import stat
+import struct
 import tarfile
 import threading
 import types
@@ -16,6 +18,81 @@ import pytest
 
 from memoryd import backup
 from memoryd import cli
+
+
+def _libpq_info(conninfo: str, env: dict[str, str], monkeypatch) -> dict[str, str]:
+    from psycopg import pq
+
+    with monkeypatch.context() as patch:
+        for name in ("PGPASSWORD", "PGSSLPASSWORD", "PGSERVICE",
+                     "PGSERVICEFILE"):
+            patch.delenv(name, raising=False)
+        patch.setenv("PGSERVICEFILE", env["PGSERVICEFILE"])
+        connection = pq.PGconn.connect_start(conninfo.encode())
+        try:
+            return {
+                option.keyword.decode(): option.val.decode()
+                for option in connection.info if option.val is not None
+            }
+        finally:
+            connection.finish()
+
+
+def _capture_libpq_password(
+        conninfo: str, env: dict[str, str], monkeypatch) -> str:
+    import psycopg
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(5)
+    host, port = listener.getsockname()
+    captured: list[str] = []
+    server_errors: list[BaseException] = []
+
+    def receive_packet(connection: socket.socket) -> bytes:
+        size = struct.unpack("!I", connection.recv(4))[0]
+        payload = b""
+        while len(payload) < size - 4:
+            payload += connection.recv(size - 4 - len(payload))
+        return payload
+
+    def serve() -> None:
+        try:
+            connection, _address = listener.accept()
+            with connection:
+                connection.settimeout(5)
+                receive_packet(connection)
+                connection.sendall(b"R" + struct.pack("!II", 8, 3))
+                kind = connection.recv(1)
+                assert kind == b"p"
+                password = receive_packet(connection)
+                captured.append(password.removesuffix(b"\0").decode())
+                fields = b"SFATAL\0C28P01\0Mauthentication failed\0\0"
+                connection.sendall(b"E" + struct.pack("!I", len(fields) + 4) + fields)
+        except BaseException as exc:  # noqa: BLE001
+            server_errors.append(exc)
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        with monkeypatch.context() as patch:
+            for name in ("PGPASSWORD", "PGSSLPASSWORD", "PGSERVICE",
+                         "PGSERVICEFILE"):
+                patch.delenv(name, raising=False)
+            patch.setenv("PGSERVICEFILE", env["PGSERVICEFILE"])
+            with pytest.raises(psycopg.OperationalError):
+                psycopg.connect(
+                    conninfo, host=host, port=port, connect_timeout=2,
+                    sslmode="disable", gssencmode="disable")
+    finally:
+        thread.join(timeout=6)
+    assert not thread.is_alive()
+    assert not server_errors
+    assert captured
+    return captured[0]
 
 
 def _home(tmp_path: Path) -> Path:
@@ -884,7 +961,7 @@ def test_posix_replace_failure_preserves_existing_empty_target(
 def test_local_pg_tools_keep_all_passwords_out_of_argv(
         monkeypatch, tmp_path, dsn):
     commands: list[tuple[list[str], dict[str, str]]] = []
-    service_files: list[tuple[Path, str, int, int]] = []
+    service_files: list[tuple[Path, str, int, int, Path, str, int]] = []
     dump = tmp_path / "dump"
 
     def run(command, **kwargs):
@@ -893,10 +970,13 @@ def test_local_pg_tools_keep_all_passwords_out_of_argv(
         service_path = env.get("PGSERVICEFILE")
         if service_path is not None:
             path = Path(service_path)
+            pass_file = path.parent / "pgpass.conf"
             service_files.append((
                 path, path.read_text(encoding="utf-8"),
                 stat.S_IMODE(path.stat().st_mode),
-                stat.S_IMODE(path.parent.stat().st_mode)))
+                stat.S_IMODE(path.parent.stat().st_mode),
+                pass_file, pass_file.read_text(encoding="utf-8"),
+                stat.S_IMODE(pass_file.stat().st_mode)))
         if "pg_dump" in command[0]:
             dump.write_bytes(b"PGDMPbinary\x00\xff")
         return types.SimpleNamespace(returncode=0, stderr=b"")
@@ -921,20 +1001,208 @@ def test_local_pg_tools_keep_all_passwords_out_of_argv(
                "tls-secret" not in env.values()
                for _command, env in commands)
     assert len(service_files) == 2
-    for path, text, mode, parent_mode in service_files:
+    for path, text, mode, parent_mode, pass_file, pass_text, pass_mode in service_files:
         assert "[memoryd]" in text
-        assert "password=super-secret" in text
+        assert "password=super-secret" not in text
+        assert f"passfile={pass_file}" in text
         assert "sslpassword=tls-secret" in text
+        assert pass_text == "*:*:*:*:super-secret\n"
         if os.name != "nt":
             assert mode == 0o600
+            assert pass_mode == 0o600
             assert parent_mode == 0o700
         assert not path.exists()
+        assert not pass_file.exists()
         assert not path.parent.exists()
     assert "--format=custom" in commands[0][0]
     assert "--exit-on-error" in commands[1][0]
     assert "--no-owner" in commands[1][0]
     assert "--single-transaction" in commands[1][0]
     assert "--no-privileges" in commands[1][0]
+
+
+def test_direct_password_boundary_whitespace_round_trips_through_libpq(
+        monkeypatch, tmp_path):
+    from psycopg.conninfo import make_conninfo
+
+    monkeypatch.setattr(
+        backup, "_default_home", lambda: tmp_path / "memory")
+    password = " \t data:base\\secret \t"
+    values, _redactions = backup._safe_conninfo(make_conninfo(
+        host="ignored.invalid", port="1", dbname="memoryd",
+        user="operator", password=password))
+
+    with backup._libpq_service(values) as (safe_dsn, env, _redactions):
+        captured = _capture_libpq_password(safe_dsn, env, monkeypatch)
+
+    assert captured == password
+
+
+def test_inherited_service_is_resolved_once_and_inline_values_win(
+        monkeypatch, tmp_path):
+    upstream = tmp_path / "upstream.conf"
+    upstream.write_text(
+        "[upstream]\n"
+        "host=upstream.invalid\n"
+        "port=6543\n"
+        "dbname=upstream_db\n"
+        "user=upstream_user\n"
+        "password=upstream-password\n"
+        "sslpassword=upstream-tls\n",
+        encoding="utf-8")
+    monkeypatch.setenv("PGSERVICEFILE", str(upstream))
+    monkeypatch.setattr(
+        backup, "_default_home", lambda: tmp_path / "memory")
+    values, _redactions = backup._safe_conninfo(
+        "service=upstream host=127.0.0.1 port=1 "
+        "password=' inline-password ' sslpassword=inline-tls")
+
+    with backup._libpq_service(values) as (safe_dsn, env, discovered):
+        resolved = _libpq_info(safe_dsn, env, monkeypatch)
+
+    assert resolved["service"] == "memoryd"
+    assert resolved["host"] == "127.0.0.1"
+    assert resolved["port"] == "1"
+    assert resolved["dbname"] == "upstream_db"
+    assert resolved["user"] == "upstream_user"
+    assert resolved["sslpassword"] == "inline-tls"
+    assert "upstream" not in resolved.values()
+    assert set(discovered) == {" inline-password ", "inline-tls"}
+
+
+@pytest.mark.parametrize("lookup", ["user", "system"])
+def test_service_lookup_uses_libpq_user_and_system_locations(
+        monkeypatch, tmp_path, lookup):
+    monkeypatch.delenv("PGSERVICEFILE", raising=False)
+    user_root = tmp_path / "user"
+    if os.name == "nt":
+        monkeypatch.setenv("APPDATA", str(user_root))
+        user_file = user_root / "postgresql" / ".pg_service.conf"
+    else:
+        monkeypatch.setenv("HOME", str(user_root))
+        user_file = user_root / ".pg_service.conf"
+    system_root = tmp_path / "system"
+    monkeypatch.setenv("PGSYSCONFDIR", str(system_root))
+    service_file = (
+        user_file if lookup == "user" else system_root / "pg_service.conf")
+    service_file.parent.mkdir(parents=True)
+    service_file.write_text(
+        "[looked-up]\n"
+        "host=127.0.0.1\n"
+        "port=1\n"
+        f"user={lookup}-user\n"
+        "dbname=memoryd\n",
+        encoding="utf-8")
+    monkeypatch.setattr(
+        backup, "_default_home", lambda: tmp_path / "memory")
+
+    with backup._libpq_service(
+            {"service": "looked-up"}) as (safe_dsn, env, _redactions):
+        resolved = _libpq_info(safe_dsn, env, monkeypatch)
+
+    assert resolved["user"] == f"{lookup}-user"
+    assert resolved["dbname"] == "memoryd"
+
+
+def test_missing_selected_service_falls_through_to_compiled_system_file(
+        monkeypatch, tmp_path):
+    selected = tmp_path / "selected.conf"
+    selected.write_text(
+        "[different-service]\nhost=ignored.invalid\n", encoding="utf-8")
+    system_root = tmp_path / "compiled-system"
+    system_root.mkdir()
+    (system_root / "pg_service.conf").write_text(
+        "[system-service]\n"
+        "host=127.0.0.1\n"
+        "port=1\n"
+        "user=system-user\n"
+        "dbname=memoryd\n",
+        encoding="utf-8")
+    monkeypatch.setenv("PGSERVICEFILE", str(selected))
+    monkeypatch.delenv("PGSYSCONFDIR", raising=False)
+    monkeypatch.setenv("PGPASSWORD", "must-not-reach-pg-config")
+    monkeypatch.setattr(
+        backup, "_default_home", lambda: tmp_path / "memory")
+    monkeypatch.setattr(
+        backup.shutil, "which",
+        lambda name: "/tools/pg_config" if name == "pg_config" else None)
+    calls: list[tuple[list[str], dict]] = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return types.SimpleNamespace(
+            returncode=0, stdout=str(system_root).encode(), stderr=b"")
+
+    monkeypatch.setattr(backup.subprocess, "run", run)
+
+    with backup._libpq_service(
+            {"service": "system-service"}) as (safe_dsn, env, _redactions):
+        resolved = _libpq_info(safe_dsn, env, monkeypatch)
+
+    assert resolved["user"] == "system-user"
+    assert calls[0][0] == ["/tools/pg_config", "--sysconfdir"]
+    assert calls[0][1]["shell"] is False
+    assert calls[0][1]["timeout"] == 5
+    assert "PGPASSWORD" not in calls[0][1]["env"]
+
+
+@pytest.mark.parametrize("dsn_format", ["keyword", "uri"])
+def test_explicit_servicefile_is_honored_with_older_or_newer_libpq(
+        monkeypatch, tmp_path, dsn_format):
+    from urllib.parse import quote
+
+    service_file = tmp_path / "explicit.conf"
+    service_file.write_text(
+        "[explicit]\n"
+        "host=127.0.0.1\n"
+        "port=1\n"
+        "user=explicit-user\n"
+        "dbname=memoryd\n",
+        encoding="utf-8")
+    escaped = str(service_file).replace("\\", "\\\\").replace("'", "\\'")
+    dsn = (f"service=explicit servicefile='{escaped}'"
+           if dsn_format == "keyword" else
+           f"postgresql:///?service=explicit&servicefile={quote(str(service_file), safe='')}")
+    values, _redactions = backup._safe_conninfo(dsn)
+    monkeypatch.setattr(
+        backup, "_default_home", lambda: tmp_path / "memory")
+
+    with backup._libpq_service(values) as (safe_dsn, env, _redactions):
+        resolved = _libpq_info(safe_dsn, env, monkeypatch)
+
+    assert resolved["user"] == "explicit-user"
+    assert resolved["dbname"] == "memoryd"
+
+
+@pytest.mark.parametrize("name", ["sslpassword", "application_name"])
+def test_unencodable_service_trailing_whitespace_is_rejected_without_secret(
+        monkeypatch, tmp_path, name):
+    monkeypatch.setattr(
+        backup, "_default_home", lambda: tmp_path / "memory")
+    secret = "boundary-value "
+
+    with pytest.raises(backup.BackupError) as exc:
+        with backup._libpq_service({
+                "host": "127.0.0.1", name: secret}):
+            pytest.fail("unsafe service value must not be yielded")
+
+    assert "boundary whitespace" in str(exc.value)
+    assert name in str(exc.value)
+    assert secret not in str(exc.value)
+
+
+def test_sslpassword_leading_whitespace_round_trips_through_libpq(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        backup, "_default_home", lambda: tmp_path / "memory")
+    sslpassword = " \t tls-secret"
+
+    with backup._libpq_service({
+            "host": "127.0.0.1", "port": "1",
+            "sslpassword": sslpassword}) as (safe_dsn, env, _redactions):
+        resolved = _libpq_info(safe_dsn, env, monkeypatch)
+
+    assert resolved["sslpassword"] == sslpassword
 
 
 def test_restore_tool_failure_redacts_secrets_and_keeps_mock_database_empty(
@@ -949,7 +1217,8 @@ def test_restore_tool_failure_redacts_secrets_and_keeps_mock_database_empty(
         if service_path is not None:
             path = Path(service_path)
             text = path.read_text(encoding="utf-8")
-            assert "password=super-secret" in text
+            assert "password=super-secret" not in text
+            assert (path.parent / "pgpass.conf").is_file()
             assert "sslpassword=tls-secret" in text
             observed_service_files.append(path)
         if "--single-transaction" not in command:
@@ -972,6 +1241,40 @@ def test_restore_tool_failure_redacts_secrets_and_keeps_mock_database_empty(
     assert len(observed_service_files) == 1
     assert not observed_service_files[0].exists()
     assert not observed_service_files[0].parent.exists()
+
+
+def test_service_file_secrets_are_redacted_from_tool_diagnostics(
+        monkeypatch, tmp_path):
+    upstream = tmp_path / "upstream.conf"
+    upstream.write_text(
+        "[upstream]\n"
+        "host=127.0.0.1\n"
+        "port=1\n"
+        "dbname=memoryd\n"
+        "user=operator\n"
+        "password=service-database-secret\n"
+        "sslpassword=service-tls-secret\n",
+        encoding="utf-8")
+    monkeypatch.setenv("PGSERVICEFILE", str(upstream))
+    monkeypatch.setattr(
+        backup, "_default_home", lambda: tmp_path / "memory")
+    monkeypatch.setattr(backup.shutil, "which", lambda _name: "/tools/pg_restore")
+    monkeypatch.setattr(
+        backup.subprocess, "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=1,
+            stderr=(b"password=service-database-secret "
+                    b"sslpassword=service-tls-secret failure")))
+    dump = tmp_path / "dump"
+    dump.write_bytes(b"PGDMPservice")
+
+    with pytest.raises(backup.BackupError) as exc:
+        backup._restore_database(dump, "service=upstream")
+
+    assert "service-database-secret" not in str(exc.value)
+    assert "service-tls-secret" not in str(exc.value)
+    assert "password=***" in str(exc.value)
+    assert "sslpassword=***" in str(exc.value)
 
 
 def test_service_cleanup_retries_transient_unlink_under_private_home_root(
@@ -1176,7 +1479,7 @@ def test_crash_releases_service_lock_and_next_operation_cleans_residue(
         "import os\n"
         "from memoryd.backup import _libpq_service\n"
         "with _libpq_service({'host': 'localhost', 'dbname': 'memoryd', "
-        "'user': 'operator', 'password': 'secret'}) as (_, env):\n"
+        "'user': 'operator', 'password': 'secret'}) as (_, env, _):\n"
         "    print(env['PGSERVICEFILE'], flush=True)\n"
         "    os._exit(0)\n")
     child = backup.subprocess.run(

@@ -254,11 +254,92 @@ def _safe_conninfo(dsn: str) -> tuple[dict[str, str], tuple[str, ...]]:
         from psycopg.conninfo import conninfo_to_dict
         values = conninfo_to_dict(dsn)
     except Exception as exc:  # noqa: BLE001
-        raise BackupError("invalid PostgreSQL DSN") from exc
+        try:
+            values = _legacy_servicefile_conninfo(dsn)
+        except Exception:  # noqa: BLE001
+            raise BackupError("invalid PostgreSQL DSN") from exc
     redactions = tuple(
         values[name] for name in ("password", "sslpassword")
         if values.get(name))
     return values, redactions
+
+
+def _legacy_servicefile_conninfo(dsn: str) -> dict[str, str]:
+    """Parse the PostgreSQL 19 servicefile option with an older libpq."""
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    if dsn.startswith(("postgresql://", "postgres://")):
+        from urllib.parse import unquote, urlsplit
+        parts = urlsplit(dsn)
+        kept: list[str] = []
+        servicefile: str | None = None
+        for parameter in parts.query.split("&"):
+            raw_name, separator, raw_value = parameter.partition("=")
+            if unquote(raw_name) == "servicefile":
+                if not separator or re.search(r"%(?![0-9A-Fa-f]{2})", raw_value):
+                    raise ValueError("invalid servicefile URI parameter")
+                servicefile = unquote(raw_value)
+            else:
+                kept.append(parameter)
+        if servicefile is None:
+            raise ValueError("no legacy servicefile option")
+        query_at = dsn.find("?")
+        clean = dsn[:query_at] + (f"?{'&'.join(kept)}" if kept else "")
+        values = conninfo_to_dict(clean)
+        values["servicefile"] = servicefile
+        return values
+
+    whitespace = " \t\r\n\v\f"
+    index = 0
+    parsed: dict[str, str] = {}
+    while index < len(dsn):
+        while index < len(dsn) and dsn[index] in whitespace:
+            index += 1
+        if index == len(dsn):
+            break
+        start = index
+        while (index < len(dsn) and dsn[index] not in whitespace and
+               dsn[index] != "="):
+            index += 1
+        name = dsn[start:index]
+        while index < len(dsn) and dsn[index] in whitespace:
+            index += 1
+        if not name or index == len(dsn) or dsn[index] != "=":
+            raise ValueError("invalid conninfo parameter")
+        index += 1
+        while index < len(dsn) and dsn[index] in whitespace:
+            index += 1
+        value: list[str] = []
+        quoted = index < len(dsn) and dsn[index] == "'"
+        if quoted:
+            index += 1
+        while index < len(dsn):
+            character = dsn[index]
+            if character == "\\":
+                index += 1
+                if index == len(dsn):
+                    raise ValueError("unterminated conninfo escape")
+                value.append(dsn[index])
+                index += 1
+            elif quoted and character == "'":
+                index += 1
+                break
+            elif not quoted and character in whitespace:
+                break
+            else:
+                value.append(character)
+                index += 1
+        if quoted and (index == 0 or dsn[index - 1] != "'"):
+            raise ValueError("unterminated conninfo quote")
+        if index < len(dsn) and dsn[index] not in whitespace:
+            raise ValueError("characters after conninfo value")
+        parsed[name] = "".join(value)
+    if "servicefile" not in parsed:
+        raise ValueError("no legacy servicefile option")
+    servicefile = parsed.pop("servicefile")
+    values = conninfo_to_dict(make_conninfo(**parsed))
+    values["servicefile"] = servicefile
+    return values
 
 
 def _fsync_directory(path: Path) -> None:
@@ -318,12 +399,15 @@ def _cleanup_service_operation(operation: Path) -> None:
         raise BackupError(
             f"cannot inspect service operation {operation}: {exc}") from exc
     if children:
-        if len(children) != 1 or children[0].name != "pg_service.conf":
+        allowed = {"pg_service.conf", "pgpass.conf"}
+        if ({child.name for child in children} - allowed or
+                len({child.name for child in children}) != len(children)):
             raise BackupError(
                 f"unrecognized service artifact in {operation}")
-        service_file = children[0]
-        _require_service_artifact(service_file, directory=False, mode=0o600)
-        _remove_service_artifact(service_file, directory=False)
+        for artifact in children:
+            _require_service_artifact(
+                artifact, directory=False, mode=0o600)
+            _remove_service_artifact(artifact, directory=False)
     _remove_service_artifact(operation, directory=True)
 
 
@@ -450,6 +534,143 @@ def _cleanup_stale_service_operations(root: Path) -> None:
         _cleanup_service_operation(operation)
 
 
+def _resolve_service_values(values: dict[str, str]) -> dict[str, str]:
+    """Apply libpq's local service-file lookup and override semantics."""
+    if "service" not in values:
+        return values.copy()
+    service = values["service"]
+    if "servicefile" in values:
+        servicefile = values["servicefile"]
+    else:
+        servicefile = os.environ.get("PGSERVICEFILE")
+    if servicefile is not None:
+        candidates = [(Path(servicefile), True)]
+    else:
+        if os.name == "nt":
+            appdata = os.environ.get("APPDATA")
+            user_file = (Path(appdata) / "postgresql" / ".pg_service.conf"
+                         if appdata else None)
+        else:
+            home = os.environ.get("HOME")
+            user_file = Path(home) / ".pg_service.conf" if home else None
+        candidates = [(user_file, False)] if user_file else []
+    service_values: dict[str, str] | None = None
+    for path, required in candidates:
+        if not path.is_file():
+            if required:
+                raise BackupError("cannot resolve PostgreSQL connection service")
+            continue
+        service_values = _parse_service_file(path, service)
+        if service_values is not None:
+            break
+    if service_values is None:
+        system = os.environ.get("PGSYSCONFDIR")
+        system_file = (Path(system) / "pg_service.conf" if system else
+                       _compiled_system_service_file())
+        if system_file is not None and system_file.is_file():
+            service_values = _parse_service_file(system_file, service)
+    if service_values is None:
+        raise BackupError("cannot resolve PostgreSQL connection service")
+    service_values.update({
+        name: value for name, value in values.items()
+        if name not in {"service", "servicefile"}
+    })
+    return service_values
+
+
+def _compiled_system_service_file() -> Path | None:
+    """Locate libpq's compiled system service directory without connecting."""
+    pg_config = shutil.which("pg_config")
+    if not pg_config:
+        return None
+    inherited = {
+        name: value for name, value in os.environ.items()
+        if name.upper() in {
+            "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC",
+            "TEMP", "TMP",
+        }
+    }
+    try:
+        result = subprocess.run(
+            [pg_config, "--sysconfdir"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=inherited,
+            shell=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    try:
+        lines = result.stdout.decode().splitlines()
+    except UnicodeError:
+        return None
+    if len(lines) != 1 or not lines[0].strip():
+        return None
+    return Path(lines[0].strip()) / "pg_service.conf"
+
+
+def _parse_service_file(path: Path, service: str) -> dict[str, str] | None:
+    """Parse one service exactly as libpq's local INI parser does."""
+    try:
+        from psycopg import pq
+        keywords = {
+            option.keyword.decode() for option in pq.Conninfo.get_defaults()
+        }
+        content = path.read_bytes()
+        parts = content.split(b"\n")
+        lines = [
+            part + (b"\n" if index < len(parts) - 1 else b"")
+            for index, part in enumerate(parts)
+        ]
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise BackupError("cannot resolve PostgreSQL connection service") from exc
+    found = False
+    result: dict[str, str] = {}
+    whitespace = b" \t\r\n\v\f"
+    for raw_line in lines:
+        if len(raw_line) >= 1023 or b"\0" in raw_line:
+            raise BackupError("cannot resolve PostgreSQL connection service")
+        line = raw_line.rstrip(whitespace).lstrip(whitespace)
+        if not line or line.startswith(b"#"):
+            continue
+        if line.startswith(b"["):
+            if found:
+                return result
+            try:
+                found = line.startswith(f"[{service}]".encode())
+            except UnicodeEncodeError as exc:
+                raise BackupError(
+                    "cannot resolve PostgreSQL connection service") from exc
+            continue
+        if not found:
+            continue
+        try:
+            key_bytes, value_bytes = line.split(b"=", 1)
+            key = key_bytes.decode()
+            value = value_bytes.decode()
+        except (ValueError, UnicodeError) as exc:
+            raise BackupError(
+                "cannot resolve PostgreSQL connection service") from exc
+        if key in {"service", "servicefile"} or key not in keywords:
+            raise BackupError("cannot resolve PostgreSQL connection service")
+        result.setdefault(key, value)
+    return result if found else None
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    flags = (os.O_CREAT | os.O_EXCL | os.O_WRONLY |
+             getattr(os, "O_BINARY", 0))
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _chmod(path, 0o600)
+
+
+def _pgpass_password(value: str) -> str:
+    return value.replace("\\", "\\\\").replace(":", "\\:")
+
+
 @contextmanager
 def _service_operation(values: dict[str, str], root: Path):
     operation: Path | None = None
@@ -468,16 +689,17 @@ def _service_operation(values: dict[str, str], root: Path):
         _chmod(operation, 0o700)
         _fsync_directory(root)
         service_file = operation / "pg_service.conf"
-        flags = (os.O_CREAT | os.O_EXCL | os.O_WRONLY |
-                 getattr(os, "O_BINARY", 0))
-        fd = os.open(service_file, flags, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write("[memoryd]\n")
-            for name, value in sorted(values.items()):
-                handle.write(f"{name}={value}\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        _chmod(service_file, 0o600)
+        service_values = values.copy()
+        if "password" in service_values:
+            password = service_values.pop("password")
+            pass_file = operation / "pgpass.conf"
+            _write_private_text(
+                pass_file, f"*:*:*:*:{_pgpass_password(password)}\n")
+            service_values["passfile"] = str(pass_file)
+        service_text = "[memoryd]\n" + "".join(
+            f"{name}={value}\n"
+            for name, value in sorted(service_values.items()))
+        _write_private_text(service_file, service_text)
         _fsync_directory(operation)
         env = os.environ.copy()
         for name in ("PGPASSWORD", "PGSSLPASSWORD", "PGSERVICE",
@@ -507,8 +729,23 @@ def _libpq_service(values: dict[str, str]):
     root = _service_root()
     with _service_state_lock(root):
         _cleanup_stale_service_operations(root)
-        with _service_operation(values, root) as connection:
-            yield connection
+        resolved = _resolve_service_values(values)
+        for name, value in resolved.items():
+            # libpq strips trailing isspace() bytes from service-file lines
+            # and the format has no quoting or escaping for them. Password is
+            # the sole exception because its lossless transport is pgpass.
+            service_whitespace = " \t\v\f"
+            if (name != "password" and value and
+                    value[-1] in service_whitespace):
+                raise BackupError(
+                    "PostgreSQL connection parameter "
+                    f"{name} has boundary whitespace that cannot be "
+                    "transported safely to local PostgreSQL tools")
+        with _service_operation(resolved, root) as connection:
+            discovered = tuple(
+                resolved[name] for name in ("password", "sslpassword")
+                if resolved.get(name))
+            yield (*connection, discovered)
 
 
 def _run_tool(
@@ -558,10 +795,12 @@ def _dump_database(dsn: str, destination: Path) -> None:
     values, redactions = _safe_conninfo(dsn)
     tool = shutil.which("pg_dump")
     if tool:
-        with _libpq_service(values) as (safe_dsn, env):
+        with _libpq_service(values) as (safe_dsn, env, discovered):
+            all_redactions = tuple(sorted(
+                set((*redactions, *discovered)), key=len, reverse=True))
             _run_tool([tool, "--format=custom", "--file", str(destination),
                        "--dbname", safe_dsn], env=env,
-                      redactions=redactions)
+                      redactions=all_redactions)
         return
     connection = _container_connection(values)
     if not connection or not _docker_available():
@@ -585,10 +824,13 @@ def _restore_database(dump: Path, dsn: str) -> None:
     values, redactions = _safe_conninfo(dsn)
     tool = shutil.which("pg_restore")
     if tool:
-        with _libpq_service(values) as (safe_dsn, env):
+        with _libpq_service(values) as (safe_dsn, env, discovered):
+            all_redactions = tuple(sorted(
+                set((*redactions, *discovered)), key=len, reverse=True))
             _run_tool([tool, "--exit-on-error", "--single-transaction",
                        "--no-owner", "--no-privileges", "--dbname", safe_dsn,
-                       str(dump)], env=env, redactions=redactions)
+                       str(dump)], env=env,
+                      redactions=all_redactions)
         return
     connection = _container_connection(values)
     if not connection or not _docker_available():
