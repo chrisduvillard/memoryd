@@ -1,8 +1,13 @@
 """Static guardrails for the production CI promotion matrix."""
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
+
+import yaml
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -20,6 +25,86 @@ def _job(text: str, name: str, following: str | None = None) -> str:
     return text[start:text.index(f"  {following}:", start)]
 
 
+def _workflow_model() -> dict:
+    value = yaml.safe_load(_workflow())
+    assert isinstance(value, dict) and isinstance(value.get("jobs"), dict)
+    return value
+
+
+def _named_steps(job: dict) -> dict[str, dict]:
+    steps = job.get("steps")
+    assert isinstance(steps, list)
+    named = {step.get("name"): step for step in steps if step.get("name")}
+    assert len(named) == len([step for step in steps if step.get("name")])
+    return named
+
+
+def test_structured_matrix_enforces_installed_artifact_boundaries() -> None:
+    job = _workflow_model()["jobs"]["test"]
+    assert job["strategy"]["matrix"]["python-version"] == ["3.11", "3.13"]
+    assert job["services"]["postgres"]["image"] == "pgvector/pgvector:pg16"
+    steps = _named_steps(job)
+    ordered_names = [step.get("name") for step in job["steps"]]
+    required_order = [
+        "Verify pinned Hermes commit and PostgreSQL client",
+        "Build wheel in an isolated environment",
+        "Install exact memoryd wheel and pinned Hermes runtime",
+        "Assert installed package and plugin origins",
+        "Stage installed-artifact harnesses outside checkout",
+        "Validate installed Hermes loader and lifecycle",
+        "Apply packaged migrations 001 through 007",
+        "Run installed-wheel DB-backed regression matrix",
+        "Run installed-wheel offline backup and disposable restore",
+    ]
+    positions = [ordered_names.index(name) for name in required_order]
+    assert positions == sorted(positions)
+
+    install = steps["Install exact memoryd wheel and pinned Hermes runtime"]["run"]
+    assert 'python -m venv "$RUNNER_TEMP/venv-test"' in install
+    assert '"${wheels[0]}"' in install
+    assert '"$HERMES_SOURCE_ROOT"' in install
+    assert "--no-deps" not in install and "pip install ." not in install
+
+    assertion = steps["Assert installed package and plugin origins"]["run"]
+    assert 'cd "$RUNNER_TEMP"' in assertion
+    assert "importlib.metadata" in assertion
+    assert "agent.memory_provider" in assertion
+    assert "plugin = daemon.parent / 'hermes_plugin'" in assertion
+    assert "site.getsitepackages" in assertion
+
+    staging = steps["Stage installed-artifact harnesses outside checkout"]["run"]
+    assert 'INSTALLED_HARNESS="$RUNNER_TEMP/installed-harness"' in staging
+    assert "plugin = package / 'hermes_plugin'" in staging
+    assert "GITHUB_ENV" in staging
+
+    hermes = steps["Validate installed Hermes loader and lifecycle"]["run"]
+    assert 'cd "$INSTALLED_HARNESS"' in hermes
+    assert "validate_installed_hermes.py" in hermes
+    assert '"$MEMORYD_PLUGIN_SOURCE"' in hermes
+    assert "check_hermes_contract.py --require-pinned-bytes" in hermes
+    assert "--source-root" not in hermes and "PYTHONPATH" not in hermes
+
+    database = steps["Run installed-wheel DB-backed regression matrix"]["run"]
+    assert 'cd "$INSTALLED_HARNESS"' in database
+    assert all(f"scripts/{name}" in database for name in (
+        "smoke_test.py", "test_extract.py", "test_vector.py",
+        "test_postgres_recovery.py"))
+    assert "GITHUB_WORKSPACE/scripts" not in database
+    assert "PYTHONPATH" not in database
+
+
+def test_structured_source_and_installed_suites_are_separate() -> None:
+    job = _workflow_model()["jobs"]["test"]
+    steps = _named_steps(job)
+    source = steps["Run checkout unit and fault-injection suites"]["run"]
+    installed = steps["Run installed-wheel DB-backed regression matrix"]["run"]
+    assert "python -m pytest -q tests" in source
+    assert "test_durable_capture.py" in source
+    assert "$INSTALLED_HARNESS" not in source
+    assert "$INSTALLED_HARNESS" in installed
+    assert "test_durable_capture.py" not in installed
+
+
 def test_blocking_matrix_builds_and_installs_the_exact_wheel() -> None:
     workflow = _workflow()
     job = _job(workflow, "test")
@@ -30,7 +115,7 @@ def test_blocking_matrix_builds_and_installs_the_exact_wheel() -> None:
     assert "find dist" in job
     assert '"${wheels[0]}" pytest' in job
     assert "pip install ." not in job
-    assert "assert-installed-wheel" in job
+    assert "Assert installed package and plugin origins" in job
 
 
 def test_blocking_matrix_exercises_every_required_suite() -> None:
@@ -46,7 +131,7 @@ def test_blocking_matrix_exercises_every_required_suite() -> None:
         "scripts/smoke_test.py",
         "scripts/test_extract.py",
         "scripts/test_vector.py",
-        "scripts/test_hermes.py",
+        "scripts/validate_installed_hermes.py",
         "scripts/test_postgres_recovery.py idempotency",
         "scripts/test_postgres_recovery.py backup-restore",
         "memoryd doctor",
@@ -65,7 +150,7 @@ def test_blocking_matrix_exercises_every_required_suite() -> None:
     ]
     assert all(name in job for name in migrations)
     assert "HERMES_SOURCE_ROOT" in job
-    assert 'PYTHONPATH="$HERMES_SOURCE_ROOT' in job
+    assert "PYTHONPATH=" not in job
     assert "check_hermes_contract.py --require-pinned-bytes" in job
 
 
@@ -100,3 +185,26 @@ def test_real_postgres_recovery_harness_is_present() -> None:
         "CREATE DATABASE", "DROP DATABASE",
     ):
         assert evidence in source
+
+
+def test_real_postgres_recovery_harness_is_collection_safe() -> None:
+    script = REPO / "scripts" / "test_postgres_recovery.py"
+    source = script.read_text(encoding="utf-8")
+    assert "def test_" not in source
+    environment = os.environ.copy()
+    environment.pop("MEMORYD_DSN", None)
+    environment.pop("MEMORYD_HOME", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy; runpy.run_path(" + repr(str(script)) + ", "
+            "run_name='_collection_probe')",
+        ],
+        cwd=REPO,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

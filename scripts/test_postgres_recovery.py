@@ -24,8 +24,9 @@ from psycopg.conninfo import make_conninfo
 from memoryd.backup import create_backup, restore_backup, verify_snapshot
 
 
-DSN = os.environ["MEMORYD_DSN"]
-HOME = Path(os.environ["MEMORYD_HOME"])
+DSN = os.environ.get("MEMORYD_DSN", "")
+HOME = (Path(os.environ["MEMORYD_HOME"])
+        if os.environ.get("MEMORYD_HOME") else None)
 PORT = int(os.environ.get("MEMORYD_PORT", "7437"))
 BASE_URL = f"http://127.0.0.1:{PORT}"
 EXPECTED_MIGRATIONS = [
@@ -89,7 +90,7 @@ def _send_without_reading_response(path: str, body: dict) -> socket.socket:
     return connection
 
 
-def test_real_idempotency() -> None:
+def run_real_idempotency() -> None:
     token = uuid.uuid4().hex
     concurrent_request = f"ci-concurrent-{token}"
     concurrent_session = f"ci-concurrent-session-{token}"
@@ -155,6 +156,7 @@ def _migration_inventory(dsn: str) -> list[str]:
 
 
 def _write_source_config() -> None:
+    assert HOME is not None
     HOME.mkdir(parents=True, exist_ok=True)
     HOME.chmod(0o700)
     config = HOME / "config.json"
@@ -167,7 +169,8 @@ def _write_source_config() -> None:
         path.chmod(0o700)
 
 
-def test_real_backup_restore() -> None:
+def run_real_backup_restore() -> None:
+    assert HOME is not None
     assert _migration_inventory(DSN) == EXPECTED_MIGRATIONS
     _write_source_config()
     source_events = _count("SELECT count(*) FROM events", ())
@@ -214,10 +217,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("idempotency", "backup-restore"))
     phase = parser.parse_args().phase
+    missing = [name for name in ("MEMORYD_DSN", "MEMORYD_HOME")
+               if not os.environ.get(name)]
+    if missing:
+        parser.error(f"required environment variables are missing: {missing}")
     if phase == "idempotency":
-        test_real_idempotency()
+        run_real_idempotency()
     else:
-        test_real_backup_restore()
+        run_real_backup_restore()
     return 0
 
 
