@@ -42,14 +42,17 @@ HERMES_ROOT="$(realpath -m "${HERMES_HOME:-$HOME/.hermes}")"
 # Hermes treats an explicit .../profiles/<name> path as authoritative. When
 # given the root, resolve its sticky active profile now so memoryd and every
 # later Hermes command address the same directory.
+HERMES_PROFILE_DIR_SELECTED=0
 if [[ "$(basename "$(dirname "$HERMES_ROOT")")" == profiles ]]; then
   export HERMES_HOME="$HERMES_ROOT"
+  HERMES_PROFILE_DIR_SELECTED=1
 elif [[ -s "$HERMES_ROOT/active_profile" ]]; then
   IFS= read -r HERMES_PROFILE <"$HERMES_ROOT/active_profile"
   if [[ "$HERMES_PROFILE" == default ]]; then
     export HERMES_HOME="$HERMES_ROOT"
   elif [[ "$HERMES_PROFILE" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
     export HERMES_HOME="$HERMES_ROOT/profiles/$HERMES_PROFILE"
+    HERMES_PROFILE_DIR_SELECTED=1
   else
     echo 'Invalid Hermes active_profile value.' >&2; exit 1
   fi
@@ -57,7 +60,18 @@ else
   export HERMES_HOME="$HERMES_ROOT"
 fi
 case "$HERMES_HOME" in /*) ;; *) echo 'HERMES_HOME must be absolute' >&2; exit 1;; esac
-install -d -m 700 "$HERMES_HOME"
+if (( HERMES_PROFILE_DIR_SELECTED )); then
+  test -d "$HERMES_HOME" || {
+    echo "Selected Hermes profile is missing: $HERMES_HOME" >&2
+    echo 'Repair active_profile or select an existing profile; no directory was created.' >&2
+    exit 1
+  }
+  chmod 700 "$HERMES_HOME"
+else
+  # Pinned Hermes treats an absent or literal "default" active_profile as the
+  # root profile. Only this default root may be created during preflight.
+  install -d -m 700 "$HERMES_ROOT"
+fi
 test "$(stat -c '%a' "$HERMES_HOME")" = 700
 
 # A production rollout always uses ~/memory. An inherited override is a

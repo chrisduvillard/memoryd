@@ -96,18 +96,71 @@ copy the service file into daily evidence or print its contents.
 ## Plant ten out-of-visa memories
 
 Hermes's production visa must exclude `personal_private`. Verify the effective
-default or configured override before planting:
+value through the exact installed interpreter, home, configuration, and
+environment of the running systemd service. The check copies `/proc` environment
+values only in memory to the child process; it never prints secret values or
+places them in process arguments.
 
 ```bash
+systemctl --user is-active --quiet memoryd.service
 python3 - <<'PY'
 import json
+import os
+import stat
+import subprocess
 from pathlib import Path
-cfg = json.loads((Path.home() / "memory/config.json").read_text(encoding="utf-8"))
-raw = (cfg.get("env") or {}).get("MEMORYD_VISAS")
-scopes = ((json.loads(raw).get("hermes") if raw else None)
-          or ["work_private", "project_shared", "public"])
-assert "personal_private" not in scopes, scopes
-print("Hermes visa excludes personal_private")
+
+pid = int(subprocess.check_output(
+    ["systemctl", "--user", "show", "memoryd.service",
+     "--property=MainPID", "--value"], text=True).strip())
+assert pid > 0, "memoryd.service has no running MainPID"
+cmdline_path = Path(f"/proc/{pid}/cmdline")
+environ_path = Path(f"/proc/{pid}/environ")
+argv = [os.fsdecode(value) for value in
+        cmdline_path.read_bytes().split(b"\0") if value]
+assert len(argv) >= 4 and argv[1:4] == ["-m", "memoryd", "serve"], argv[1:]
+service_python = Path(argv[0])
+assert service_python.is_file(), service_python
+
+daemon_env = {}
+for entry in environ_path.read_bytes().split(b"\0"):
+    key, separator, value = entry.partition(b"=")
+    if separator:
+        daemon_env[os.fsdecode(key)] = os.fsdecode(value)
+assert daemon_env.get("HOME"), "running service has no HOME"
+assert not daemon_env.get("MEMORYD_HOME"), \
+    "production service must use the approved default ~/memory"
+daemon_user_home = Path(daemon_env["HOME"]).resolve()
+assert daemon_user_home == Path.home().resolve(), \
+    "shell and user service have different HOME values"
+expected_home = (daemon_user_home / "memory").resolve()
+expected_config = expected_home / "config.json"
+assert expected_config.is_file()
+assert stat.S_IMODE(expected_config.stat().st_mode) == 0o600
+
+probe = r'''
+import json
+import os
+from pathlib import Path
+from memoryd.core import CFG
+
+config = (Path(os.environ.get("MEMORYD_HOME", "~/memory")).expanduser()
+          / "config.json").resolve()
+print(json.dumps({
+    "config": str(config),
+    "home": str(CFG.home.resolve()),
+    "visa": CFG.visa("hermes"),
+}))
+'''
+completed = subprocess.run(
+    [str(service_python), "-c", probe], env=daemon_env,
+    text=True, capture_output=True, timeout=30)
+assert completed.returncode == 0, "installed memoryd runtime visa probe failed"
+result = json.loads(completed.stdout)
+assert Path(result["config"]) == expected_config
+assert Path(result["home"]) == expected_home
+assert "personal_private" not in result["visa"], result["visa"]
+print(json.dumps(result, sort_keys=True))
 PY
 ```
 
@@ -385,25 +438,47 @@ SQL
 
 ## Extraction citation gate
 
-Sample memories first, then left-join citations and events. This preserves a
-sampled memory with no citation as a row containing null source columns instead
-of silently excluding the defect. Every source must support the memory's
-strength; a hedge such as “might,” “considering,” or “maybe” cannot become a
-commitment or decision.
+Sample non-canary, extraction-produced memories first, then left-join their
+citations and events. The current schema has no explicit memory creator
+provenance column, so this scorecard defines “extraction-produced” by auditable
+transaction lineage: the memory and a successful `extraction_run` event have
+the same PostgreSQL inserting transaction (`xmin`). The extractor writes both
+in one transaction. This excludes the ten planted visa canaries and ordinary
+manual/imported rows while still allowing the left joins to reveal a sampled
+memory with no source row. It is an operational proxy, not creator provenance
+that survives backup/restore; record that limitation with the evidence until
+such a column is added. Run this query on the live canary database, not a
+dump/restore that may rewrite transaction IDs.
+
+The left joins keep unresolved event resolution visible in the sampled output.
+Every source must support the memory's strength; a hedge such as “might,”
+“considering,” or “maybe” cannot become a commitment or decision.
 
 ```bash
 psql -X --set=ON_ERROR_STOP=1 --set=canary_start="$CANARY_START_UTC" \
   'service=memoryd_canary' <<'SQL'
 BEGIN READ ONLY;
-WITH sampled AS MATERIALIZED (
+WITH extraction_population AS MATERIALIZED (
+  SELECT m.id, m.type, m.authority, m.text
+  FROM memories m
+  WHERE m.created_at >= :'canary_start'::timestamptz
+    AND NOT m.is_canary
+    AND EXISTS (
+      SELECT 1
+      FROM events extraction
+      WHERE extraction.kind = 'extraction_run'
+        AND extraction.payload->>'ok' = 'true'
+        AND extraction.xmin = m.xmin
+    )
+), sampled AS MATERIALIZED (
   SELECT id, type, authority, text
-  FROM memories
-  WHERE created_at >= :'canary_start'::timestamptz
+  FROM extraction_population
   ORDER BY md5(id || :'canary_start')
   LIMIT 20
 )
 SELECT s.id, s.type, s.authority, s.text,
-       ms.event_id AS cited_event, e.id AS resolved_event, e.kind, e.payload
+       ms.event_id AS cited_event, e.id AS resolved_event, e.kind, e.payload,
+       (SELECT count(*) FROM extraction_population) AS eligible_population
 FROM sampled s
 LEFT JOIN memory_sources ms ON ms.memory_id = s.id
 LEFT JOIN events e ON e.id = ms.event_id
@@ -412,9 +487,10 @@ COMMIT;
 SQL
 ```
 
-Record the number of distinct sampled memories, unresolved citations, and
-hedge-to-commitment overstatements. Both defect counts must be zero, and the
-distinct sample count must be 20 when at least 20 memories were created.
+Record the eligible population, number of distinct sampled memories,
+unresolved citations, and hedge-to-commitment overstatements. Both defect
+counts must be zero, and the distinct sample count must be 20 when the eligible
+extraction population is at least 20.
 
 ## Real production snapshot restore gate
 

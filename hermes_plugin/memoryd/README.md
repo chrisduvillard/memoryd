@@ -1,6 +1,6 @@
 # memoryd — Hermes memory provider
 
-Connects Hermes to a running [memoryd](../../..) daemon: deterministic
+Connects Hermes to a running [memoryd](../../README.md) daemon: deterministic
 per-turn recall (prefetch), full turn capture into the canonical event
 ledger, mirroring of built-in MEMORY.md writes, pre-compression snapshots,
 subagent delegation records, and end-of-session extraction. Memory is
