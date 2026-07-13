@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -19,7 +20,13 @@ from typing import Literal
 
 from . import backup, cli
 from .embed import VoyageEmbedder
-from .hermes_compat import HermesTarget, resolve_hermes_home
+from .hermes_compat import (
+    HermesCompatibilityError,
+    HermesTarget,
+    resolve_hermes_home,
+    resolve_hermes_target,
+    validate_hermes_compatibility,
+)
 from .llm import OpenAIChatClient
 
 
@@ -855,6 +862,79 @@ def install_hermes_core(
         raise HermesInstallError(failure)
     assert snapshot is not None
     return snapshot
+
+
+def guided_hermes_install() -> int:
+    """Run the complete interactive Hermes installation workflow."""
+    credentials: ProviderCredentials | None = None
+    interrupted_signal: int | None = None
+    previous_handlers: dict[int, object] = {}
+    installed_handlers: list[int] = []
+
+    def interrupt(signum: int, _frame: object) -> None:
+        nonlocal interrupted_signal
+        interrupted_signal = int(signum)
+        raise KeyboardInterrupt
+
+    def interruption_result(signum: int) -> int:
+        name = signal.Signals(signum).name
+        print(f"Hermes guided installation interrupted ({name}).", file=sys.stderr)
+        return 128 + signum
+
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            numeric = int(signum)
+            previous_handlers[numeric] = signal.getsignal(signum)
+            signal.signal(signum, interrupt)
+            installed_handlers.append(numeric)
+
+        require_guided_environment()
+        target = resolve_hermes_target()
+        validate_hermes_compatibility(
+            target, cli._resource_dir("hermes_plugin"),
+        )
+        memory_home = cli._home()
+        classify_memory_home(memory_home)
+        confirm_operator()
+        credentials = collect_provider_credentials(memory_home / "config.json")
+        validate_provider_credentials(credentials)
+        snapshot = install_hermes_core(target, credentials)
+        activate_and_verify(target)
+
+        report = "\n".join(
+            (
+                f"Authoritative Hermes profile: {target.home}",
+                "memoryd daemon: http://127.0.0.1:7437",
+                f"Verified initial snapshot: {snapshot}",
+                "Four healthy checks passed: Hermes memory status, Hermes memoryd config, "
+                "memoryd status, Hermes memoryd status.",
+                "Restored prior gateway state.",
+                "Start or continue the existing 14-day/200-turn canary before promotion.",
+            )
+        )
+        for secret in (credentials.openrouter_key, credentials.voyage_key):
+            report = report.replace(secret, "<redacted>")
+        print(report)
+        return 0
+    except KeyboardInterrupt:
+        return interruption_result(
+            int(signal.SIGINT) if interrupted_signal is None else interrupted_signal
+        )
+    except (HermesInstallError, HermesCompatibilityError) as error:
+        if interrupted_signal is not None:
+            return interruption_result(interrupted_signal)
+        message = str(error)
+        if credentials is not None:
+            for secret in (credentials.openrouter_key, credentials.voyage_key):
+                message = message.replace(secret, "<redacted>")
+        message = " ".join(message.splitlines()).strip()
+        if not message:
+            message = "A required installation stage failed."
+        print(f"Hermes guided installation failed: {message}", file=sys.stderr)
+        return 1
+    finally:
+        for signum in reversed(installed_handlers):
+            signal.signal(signum, previous_handlers[signum])
 
 
 def _read_owner_only_config(config_path: Path) -> object:
