@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import stat
 import sys
@@ -38,6 +39,32 @@ class _Connection:
 
 def _fake_psycopg(monkeypatch, connect):
     monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
+
+
+def test_serve_treats_address_in_use_as_idempotent_double_start(monkeypatch):
+    from memoryd import server
+
+    def address_in_use(**_kwargs):
+        raise OSError(errno.EADDRINUSE, "address already in use")
+
+    monkeypatch.setattr(server, "main", address_in_use)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.serve()
+
+    assert exc.value.code == 0
+
+
+def test_serve_propagates_permission_errors(monkeypatch):
+    from memoryd import server
+
+    def permission_denied(**_kwargs):
+        raise PermissionError("injected ownership permission failure")
+
+    monkeypatch.setattr(server, "main", permission_denied)
+
+    with pytest.raises(PermissionError, match="ownership permission"):
+        cli.serve()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode enforcement")

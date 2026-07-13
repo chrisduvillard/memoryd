@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
+import queue
+import socket
 import stat
 import subprocess
 import sys
+import threading
+import time
 import types
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -97,6 +102,57 @@ def test_home_lock_refuses_group_readable_artifact(tmp_path):
             pytest.fail("unsafe artifact was opened")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory trust")
+def test_home_lock_refuses_writable_nonsticky_parent(tmp_path):
+    from memoryd import ownership
+
+    parent = tmp_path / "unsafe-parent"
+    parent.mkdir()
+    parent.chmod(0o777)
+    home = parent / "home"
+
+    with pytest.raises(ownership.OwnershipError, match="unsafe.*parent"):
+        with ownership.home_ownership(home, purpose="server"):
+            pytest.fail("lock acquired through unsafe parent")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock replacement race")
+def test_home_lock_revalidates_identity_after_flock_replacement(
+        monkeypatch, tmp_path):
+    import fcntl
+    from memoryd import ownership
+
+    home = tmp_path / "home"
+    path = ownership._home_lock_path(home)
+    displaced = path.with_suffix(".displaced")
+    real_flock = fcntl.flock
+    replacement_fd: int | None = None
+    replacement_acquired = False
+    replaced = False
+
+    def replace_after_flock(fd, operation):
+        nonlocal replacement_fd, replacement_acquired, replaced
+        real_flock(fd, operation)
+        if operation == fcntl.LOCK_EX | fcntl.LOCK_NB and not replaced:
+            replaced = True
+            os.replace(path, displaced)
+            replacement_fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                                     0o600)
+            os.write(replacement_fd, b"\0")
+            real_flock(
+                replacement_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            replacement_acquired = True
+
+    monkeypatch.setattr(fcntl, "flock", replace_after_flock)
+    try:
+        with pytest.raises(ownership.OwnershipError, match="unsafe.*lock"):
+            with ownership.home_ownership(home, purpose="backup"):
+                pytest.fail("replaced lock yielded concurrent ownership")
+        assert replacement_acquired
+    finally:
+        if replacement_fd is not None:
+            real_flock(replacement_fd, fcntl.LOCK_UN)
+            os.close(replacement_fd)
 def test_home_lock_is_released_when_owner_process_crashes(tmp_path):
     from memoryd import ownership
 
@@ -307,3 +363,107 @@ def test_server_secures_home_under_permissive_umask(monkeypatch, tmp_path):
         os.umask(previous)
 
     assert stat.S_IMODE(home.stat().st_mode) == 0o700
+
+
+def test_server_ownership_waits_for_real_inflight_handler(
+        monkeypatch, tmp_path):
+    from memoryd import server
+
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    ownership_exited = threading.Event()
+    main_errors: list[BaseException] = []
+    servers = []
+
+    class BlockingHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            handler_started.set()
+            self.server.shutdown()
+            assert release_handler.wait(timeout=5)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    @contextmanager
+    def own(_home, _dsn, *, purpose):
+        assert purpose == "server"
+        try:
+            yield
+        finally:
+            ownership_exited.set()
+
+    real_http_server = server.ThreadingHTTPServer
+
+    class TrackingHTTPServer(real_http_server):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            servers.append(self)
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    monkeypatch.setattr(server, "offline_ownership", own)
+    monkeypatch.setattr(server, "_secure_server_home", lambda: None)
+    monkeypatch.setattr(server.CFG, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(server.CFG, "port", port)
+    monkeypatch.setattr(server, "Handler", BlockingHandler)
+    monkeypatch.setattr(server, "ThreadingHTTPServer", TrackingHTTPServer)
+    monkeypatch.setattr(server, "_drain_spool_bg", lambda: None)
+    monkeypatch.setattr(server, "CAPTURE_Q", queue.Queue())
+
+    def run_server():
+        try:
+            server.main()
+        except BaseException as exc:  # noqa: BLE001
+            main_errors.append(exc)
+
+    daemon = threading.Thread(target=run_server, daemon=True)
+    daemon.start()
+
+    client_errors: list[BaseException] = []
+
+    def request():
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    client = socket.create_connection(
+                        ("127.0.0.1", port), timeout=1)
+                    break
+                except ConnectionRefusedError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            with client:
+                client.settimeout(5)
+                client.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                while client.recv(4096):
+                    pass
+        except BaseException as exc:  # noqa: BLE001
+            client_errors.append(exc)
+
+    client = threading.Thread(target=request)
+    client.start()
+    try:
+        for _ in range(100):
+            if handler_started.wait(timeout=0.05):
+                break
+            if not daemon.is_alive():
+                break
+        assert handler_started.is_set(), main_errors
+        assert not ownership_exited.wait(timeout=1.5)
+    finally:
+        release_handler.set()
+        if daemon.is_alive() and servers:
+            servers[0].shutdown()
+        client.join(timeout=5)
+        daemon.join(timeout=5)
+
+    assert not daemon.is_alive()
+    assert ownership_exited.is_set()
+    assert not main_errors
+    assert not client_errors

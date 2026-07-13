@@ -874,6 +874,162 @@ def test_restore_verifies_then_publishes_home_with_target_config(
     assert restored and restored[0][1] == dsn
 
 
+def test_restore_consumes_private_snapshot_after_original_is_swapped(
+        monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+    original_dump = (snapshot / "database.dump").read_bytes()
+    real_verify = backup.verify_snapshot
+    swapped = False
+    restored: list[tuple[bytes, str]] = []
+
+    def verify_then_swap(path, **kwargs):
+        nonlocal swapped
+        result = real_verify(path, **kwargs)
+        if result.ok and Path(path) != snapshot and not swapped:
+            replacement = snapshot / "database.replacement"
+            replacement.write_bytes(b"PGDMP\x00attacker replacement")
+            os.replace(replacement, snapshot / "database.dump")
+            swapped = True
+        return result
+
+    def restore(dump, _dsn):
+        restored.append((dump.read_bytes(), dump.parent.name))
+
+    monkeypatch.setattr(backup, "verify_snapshot", verify_then_swap)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", restore)
+
+    backup.restore_backup(
+        snapshot, target_dsn="postgresql:///empty", target_home=target)
+
+    assert swapped
+    assert restored == [(original_dump, restored[0][1])]
+    assert restored[0][1].startswith(".target.snapshot-")
+    assert (snapshot / "database.dump").read_bytes().endswith(
+        b"attacker replacement")
+    assert not list(tmp_path.glob(".target.snapshot-*"))
+
+
+def test_restore_rejects_corruption_in_private_snapshot_copy(
+        monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+
+    def corrupt_copy(source, destination):
+        payload = source.read_bytes()
+        if source.name == "database.dump":
+            payload = payload[:-1] + bytes([payload[-1] ^ 0xFF])
+        destination.write_bytes(payload)
+        backup._chmod(destination, 0o600)
+
+    monkeypatch.setattr(
+        backup, "_copy_snapshot_file", corrupt_copy, raising=False)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(
+        backup, "_restore_database",
+        lambda *_args: pytest.fail("corrupt staged snapshot reached database"))
+
+    with pytest.raises(backup.BackupError, match="checksum mismatch"):
+        backup.restore_backup(
+            snapshot, target_dsn="postgresql:///empty", target_home=target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".target.snapshot-*"))
+
+
+def test_restore_detects_source_file_replacement_during_private_copy(
+        monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+    replaced = False
+
+    def replacing_copy(source, destination):
+        nonlocal replaced
+        payload = source.read_bytes()
+        destination.write_bytes(payload)
+        backup._chmod(destination, 0o600)
+        if source.name == "database.dump":
+            moved = source.with_name("database.original")
+            os.replace(source, moved)
+            source.write_bytes(payload)
+            backup._chmod(source, 0o600)
+            replaced = True
+
+    monkeypatch.setattr(
+        backup, "_copy_snapshot_file", replacing_copy, raising=False)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", lambda *_args: None)
+
+    with pytest.raises(backup.BackupError, match="changed during copy"):
+        backup.restore_backup(
+            snapshot, target_dsn="postgresql:///empty", target_home=target)
+
+    assert replaced
+    assert not target.exists()
+    assert not list(tmp_path.glob(".target.snapshot-*"))
+
+
+def test_restore_operation_error_cleans_private_snapshot_and_preserves_primary(
+        monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+    saw_private_snapshot = False
+
+    def fail_restore(dump, _dsn):
+        nonlocal saw_private_snapshot
+        saw_private_snapshot = dump.parent.name.startswith(".target.snapshot-")
+        raise backup.BackupError("injected primary restore failure")
+
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", fail_restore)
+
+    with pytest.raises(backup.BackupError, match="primary restore failure"):
+        backup.restore_backup(
+            snapshot, target_dsn="postgresql:///empty", target_home=target)
+
+    assert saw_private_snapshot
+    assert not target.exists()
+    assert not list(tmp_path.glob(".target.snapshot-*"))
+    assert not list(tmp_path.glob(".target.restore-*"))
+
+
+@pytest.mark.parametrize("stage_kind", ["snapshot", "restore"])
+def test_restore_stage_initialization_failure_cleans_all_private_directories(
+        monkeypatch, tmp_path, stage_kind):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+    real_chmod = backup._chmod
+
+    def fail_staging_chmod(path, mode):
+        if path.name.startswith(f".target.{stage_kind}-"):
+            raise PermissionError(f"injected {stage_kind} chmod failure")
+        return real_chmod(path, mode)
+
+    monkeypatch.setattr(backup, "_chmod", fail_staging_chmod)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", lambda *_args: None)
+
+    with pytest.raises((backup.BackupError, OSError),
+                       match=f"{stage_kind} chmod failure"):
+        backup.restore_backup(
+            snapshot, target_dsn="postgresql:///empty", target_home=target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".target.snapshot-*"))
+    assert not list(tmp_path.glob(".target.restore-*"))
+
+
 def test_restore_checks_staged_home_and_config_modes(monkeypatch, tmp_path):
     source_home = _home(tmp_path)
     _prepare(monkeypatch, source_home)

@@ -20,6 +20,7 @@ Heavy imports (psycopg via .core) happen lazily so `--help` stays instant.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import secrets
@@ -879,7 +880,10 @@ def serve() -> None:
         # safely created it; scheduled/pythonw output would otherwise vanish.
         server_main(log_unattended=not _tty(sys.stdout))
     except OSError as e:
-        # bind failed -> another instance is listening; idempotent double-start
+        if (e.errno != errno.EADDRINUSE and
+                getattr(e, "winerror", None) != 10048):
+            raise
+        # An address-in-use bind failure is an idempotent double-start.
         print(f"memoryd: not starting ({e}); another instance is likely running")
         sys.exit(0)
 

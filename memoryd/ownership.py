@@ -41,13 +41,35 @@ def _validate_lock_descriptor(fd: int, path: Path) -> None:
         raise OwnershipError(f"unsafe mode on memoryd ownership lock {path}")
 
 
-def _open_home_lock(home: Path | str) -> tuple[int, Path]:
+def _validate_lock_parent(path: Path) -> tuple[int, int] | None:
+    if os.name == "nt":
+        return None
+    parent = path.parent
+    try:
+        value = parent.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise OwnershipError(
+            f"cannot inspect memoryd ownership lock parent {parent}") from exc
+    if parent.is_symlink() or not stat.S_ISDIR(value.st_mode):
+        raise OwnershipError(f"unsafe memoryd ownership lock parent {parent}")
+    uid = os.getuid()
+    mode = stat.S_IMODE(value.st_mode)
+    trusted_owner = value.st_uid in {0, uid}
+    writable_by_others = bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+    sticky = bool(value.st_mode & stat.S_ISVTX)
+    if not trusted_owner or (writable_by_others and not sticky):
+        raise OwnershipError(f"unsafe memoryd ownership lock parent {parent}")
+    return value.st_dev, value.st_ino
+
+
+def _open_home_lock(home: Path | str) -> tuple[int, Path, tuple[int, int] | None]:
     path = _home_lock_path(home)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as exc:
         raise OwnershipError(
             f"cannot create memoryd ownership lock directory {path.parent}") from exc
+    parent_identity = _validate_lock_parent(path)
     common = os.O_RDWR | getattr(os, "O_BINARY", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     created = False
@@ -71,13 +93,13 @@ def _open_home_lock(home: Path | str) -> tuple[int, Path]:
     except BaseException:
         os.close(fd)
         raise
-    return fd, path
+    return fd, path, parent_identity
 
 
 @contextmanager
 def home_ownership(home: Path | str, *, purpose: str):
     """Hold one canonical home's nonblocking OS ownership lock."""
-    fd, path = _open_home_lock(home)
+    fd, path, parent_identity = _open_home_lock(home)
     acquired = False
     primary: BaseException | None = None
     try:
@@ -90,6 +112,10 @@ def home_ownership(home: Path | str, *, purpose: str):
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
+            if _validate_lock_parent(path) != parent_identity:
+                raise OwnershipError(
+                    f"unsafe replaced memoryd ownership lock parent {path.parent}")
+            _validate_lock_descriptor(fd, path)
         except OSError as exc:
             busy = (os.name == "nt" or
                     exc.errno in {errno.EACCES, errno.EAGAIN})

@@ -24,7 +24,10 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import (
+    BaseHTTPRequestHandler,
+    ThreadingHTTPServer as _ThreadingHTTPServer,
+)
 from pathlib import Path
 
 from .core import (
@@ -54,6 +57,13 @@ ADMIN_POST_ENDPOINTS = {
     "/admin/export-evidence",
     "/admin/rebuild-indexes",
 }
+
+
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    """Threaded HTTP server whose close waits for every active handler."""
+
+    daemon_threads = False
+    block_on_close = True
 
 
 def _nonempty_string(value: object) -> bool:

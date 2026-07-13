@@ -349,7 +349,7 @@ def _fsync_directory(path: Path) -> None:
         finally:
             os.close(fd)
     except OSError as exc:
-        raise BackupError(f"cannot fsync service directory {path}: {exc}") from exc
+        raise BackupError(f"cannot fsync directory {path}: {exc}") from exc
 
 
 def _require_service_artifact(
@@ -1222,6 +1222,140 @@ def _extract_memory_tar(path: Path, destination: Path) -> None:
         raise BackupError(f"memory tar extraction failed: {exc}") from exc
 
 
+def _snapshot_file_state(path: Path) -> tuple[int, int, int, int, int]:
+    try:
+        value = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise BackupError(f"cannot inspect source snapshot entry {path.name}") from exc
+    if path.is_symlink() or not stat.S_ISREG(value.st_mode):
+        raise BackupError(
+            f"source snapshot entry is not a regular file: {path.name}")
+    _require_mode(path, 0o600)
+    return (value.st_dev, value.st_ino, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _copy_snapshot_file(source: Path, destination: Path) -> None:
+    read_flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0) |
+                  getattr(os, "O_NOFOLLOW", 0))
+    write_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                   getattr(os, "O_BINARY", 0))
+    try:
+        source_fd = os.open(source, read_flags)
+    except OSError as exc:
+        raise BackupError(
+            f"cannot safely open source snapshot entry {source.name}") from exc
+    destination_fd: int | None = None
+    try:
+        opened = os.fstat(source_fd)
+        named = source.stat(follow_symlinks=False)
+        if (source.is_symlink() or not stat.S_ISREG(opened.st_mode) or
+                not stat.S_ISREG(named.st_mode) or
+                (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+            raise BackupError(
+                f"source snapshot entry changed during copy: {source.name}")
+        destination_fd = os.open(destination, write_flags, 0o600)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(destination_fd, chunk[offset:])
+        os.fsync(destination_fd)
+        if POSIX_MODE_ENFORCED:
+            os.fchmod(destination_fd, 0o600)
+    except BackupError:
+        raise
+    except OSError as exc:
+        raise BackupError(
+            f"cannot copy source snapshot entry {source.name}: {exc}") from exc
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        os.close(source_fd)
+
+
+def _sync_private_snapshot_file(path: Path) -> None:
+    _chmod(path, 0o600)
+    value = path.stat(follow_symlinks=False)
+    if path.is_symlink() or not stat.S_ISREG(value.st_mode):
+        raise BackupError(f"unsafe private snapshot entry: {path.name}")
+    _require_mode(path, 0o600)
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _cleanup_staging(path: Path, primary: BaseException | None) -> None:
+    if not os.path.lexists(path):
+        return
+    try:
+        shutil.rmtree(path)
+    except BaseException as exc:
+        cleanup = BackupError(f"cannot remove private staging directory {path}")
+        if primary is None:
+            raise cleanup from exc
+        primary.add_note(str(cleanup))
+
+
+@contextmanager
+def _private_snapshot_copy(source: Path, parent: Path, *, target_name: str):
+    if not SNAPSHOT_RE.fullmatch(source.name):
+        raise BackupError("snapshot name is not a generated v1 name")
+    try:
+        source_value = source.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise BackupError(f"snapshot is unreadable: {exc}") from exc
+    if source.is_symlink() or not stat.S_ISDIR(source_value.st_mode):
+        raise BackupError("snapshot must be a real directory")
+    _require_mode(source, 0o700)
+    source_identity = (source_value.st_dev, source_value.st_ino)
+    try:
+        entries = {entry.name for entry in source.iterdir()}
+    except OSError as exc:
+        raise BackupError(f"snapshot is unreadable: {exc}") from exc
+    if entries != SNAPSHOT_FILES:
+        raise BackupError(
+            f"snapshot file allowlist mismatch: {sorted(entries)!r}")
+
+    staging = Path(tempfile.mkdtemp(
+        prefix=f".{target_name}.snapshot-", dir=parent))
+    primary: BaseException | None = None
+    try:
+        _chmod(staging, 0o700)
+        for name in sorted(SNAPSHOT_FILES):
+            source_file = source / name
+            before = _snapshot_file_state(source_file)
+            destination = staging / name
+            _copy_snapshot_file(source_file, destination)
+            _sync_private_snapshot_file(destination)
+            after = _snapshot_file_state(source_file)
+            if after != before:
+                raise BackupError(
+                    f"source snapshot entry changed during copy: {name}")
+        current = source.stat(follow_symlinks=False)
+        current_entries = {entry.name for entry in source.iterdir()}
+        if ((current.st_dev, current.st_ino) != source_identity or
+                source.is_symlink() or not stat.S_ISDIR(current.st_mode) or
+                current_entries != SNAPSHOT_FILES):
+            raise BackupError("source snapshot changed during copy")
+        _fsync_directory(staging)
+        result = verify_snapshot(staging, require_generated_name=False)
+        if not result.ok:
+            raise BackupError(
+                f"private snapshot verification failed: {result.reason}")
+        yield staging
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        _cleanup_staging(staging, primary)
+
+
 def restore_backup(snapshot: Path | str, *, target_dsn: str,
                    target_home: Path | str) -> Path:
     source = Path(snapshot)
@@ -1236,64 +1370,64 @@ def restore_backup(snapshot: Path | str, *, target_dsn: str,
 
 def _restore_backup_owned(
         source: Path, *, target_dsn: str, home: Path) -> Path:
-    result = verify_snapshot(source)
-    if not result.ok:
-        raise BackupError(f"snapshot verification failed: {result.reason}")
-    if os.path.lexists(home):
-        if home.is_symlink():
-            raise BackupError(f"target home must not be a symlink: {home}")
-        if not home.is_dir():
-            raise BackupError(f"target home is not a directory: {home}")
-        with os.scandir(home) as entries:
-            if next(entries, None) is not None:
-                raise BackupError(f"target home is not empty: {home}")
-        if WINDOWS_RESTORE_REQUIRES_ABSENT_HOME:
-            raise BackupError(
-                "Windows restore requires an absent target home; remove the "
-                "empty directory and retry")
-    try:
-        if _target_db_has_tables(target_dsn):
-            raise BackupError("target database already has user tables")
-    except BackupError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise BackupError(f"cannot validate target database: {exc}") from exc
-
     home.parent.mkdir(parents=True, exist_ok=True)
-    staging: Path | None = None
-    database_risk = False
-    try:
+    with _private_snapshot_copy(
+            source, home.parent, target_name=home.name) as private_source:
+        if os.path.lexists(home):
+            if home.is_symlink():
+                raise BackupError(f"target home must not be a symlink: {home}")
+            if not home.is_dir():
+                raise BackupError(f"target home is not a directory: {home}")
+            with os.scandir(home) as entries:
+                if next(entries, None) is not None:
+                    raise BackupError(f"target home is not empty: {home}")
+            if WINDOWS_RESTORE_REQUIRES_ABSENT_HOME:
+                raise BackupError(
+                    "Windows restore requires an absent target home; remove the "
+                    "empty directory and retry")
+        try:
+            if _target_db_has_tables(target_dsn):
+                raise BackupError("target database already has user tables")
+        except BackupError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise BackupError(f"cannot validate target database: {exc}") from exc
+
         staging = Path(tempfile.mkdtemp(
             prefix=f".{home.name}.restore-", dir=home.parent))
-        _chmod(staging, 0o700)
-        _extract_memory_tar(source / "memory.tar.gz", staging)
-        config = json.loads(
-            (source / "config.sanitized.json").read_text(encoding="utf-8"))
-        config["dsn"] = target_dsn
-        config["home"] = str(home)
-        config_path = staging / "config.json"
-        config_path.write_text(
-            json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
-        _chmod(config_path, 0o600)
-        _require_mode(staging, 0o700)
-        _require_mode(config_path, 0o600)
-        database_risk = True
-        _restore_database(source / "database.dump", target_dsn)
-        _atomic_rename(staging, home)
-        staging = None
-        return home
-    except Exception as exc:  # noqa: BLE001
-        if isinstance(exc, BackupError):
+        database_risk = False
+        primary: BaseException | None = None
+        try:
+            _chmod(staging, 0o700)
+            _extract_memory_tar(private_source / "memory.tar.gz", staging)
+            config = json.loads(
+                (private_source / "config.sanitized.json").read_text(
+                    encoding="utf-8"))
+            config["dsn"] = target_dsn
+            config["home"] = str(home)
+            config_path = staging / "config.json"
+            config_path.write_text(
+                json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+            _chmod(config_path, 0o600)
+            _require_mode(staging, 0o700)
+            _require_mode(config_path, 0o600)
+            database_risk = True
+            _restore_database(private_source / "database.dump", target_dsn)
+            _atomic_rename(staging, home)
+            return home
+        except Exception as exc:  # noqa: BLE001
             detail = str(exc)
-        else:
-            detail = str(exc)
-        suffix = ("; partial empty-target DB risk: pg_restore may have "
-                  "created objects; inspect or recreate that target database"
-                  if database_risk else "")
-        raise BackupError(f"restore failed: {detail}{suffix}") from exc
-    finally:
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
+            suffix = ("; partial empty-target DB risk: pg_restore may have "
+                      "created objects; inspect or recreate that target database"
+                      if database_risk else "")
+            error = BackupError(f"restore failed: {detail}{suffix}")
+            primary = error
+            raise error from exc
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            _cleanup_staging(staging, primary)
 
 
 def _parser() -> argparse.ArgumentParser:
