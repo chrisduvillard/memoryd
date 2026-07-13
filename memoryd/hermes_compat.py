@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 
 
 PINNED_HERMES_VERSION = "0.16.0"
@@ -181,3 +182,101 @@ def resolve_hermes_target(
             f"{PINNED_HERMES_VERSION}"
         )
     return HermesTarget(root=root, home=home, executable=executable, python=python)
+
+
+def _canonical_plugin_source(plugin_source: Path) -> Path:
+    package_root = Path(__file__).resolve().parent
+    packaged = package_root / "hermes_plugin"
+    source_fallback = package_root.parent / "hermes_plugin" / "memoryd"
+    expected = packaged if packaged.is_dir() else source_fallback
+    try:
+        source = plugin_source.resolve(strict=True)
+        canonical = expected.resolve(strict=True)
+        matches = os.path.samefile(source, canonical)
+    except (OSError, RuntimeError):
+        matches = False
+    if not matches or not (canonical / "__init__.py").is_file():
+        raise _error("Plugin source must be the bundled memoryd plugin")
+    return canonical
+
+
+def _validation_environment(root: Path, hermes_home: Path) -> dict[str, str]:
+    environment = {
+        "HOME": os.fspath(root / "home"),
+        "HERMES_HOME": os.fspath(hermes_home),
+        "MEMORYD_HOME": os.fspath(root / "memoryd-home"),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": os.fspath(Path(__file__).resolve().parent.parent),
+        "TEMP": os.fspath(root / "tmp"),
+        "TMP": os.fspath(root / "tmp"),
+        "TMPDIR": os.fspath(root / "tmp"),
+        "USERPROFILE": os.fspath(root / "home"),
+    }
+    for name in ("SYSTEMROOT", "WINDIR"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    return environment
+
+
+def _run_validation_stage(
+    target: HermesTarget,
+    stage: str,
+    module: str,
+    arguments: list[str],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+) -> None:
+    command = [os.fspath(target.python), "-P", "-m", module, *arguments]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=dict(environment),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        raise _error(f"Hermes {stage} validation could not start") from None
+    if result.returncode != 0:
+        raise _error(
+            f"Hermes {stage} validation failed (exit code {result.returncode})"
+        )
+
+
+def validate_hermes_compatibility(
+    target: HermesTarget, plugin_source: Path
+) -> None:
+    """Run pinned contract and isolated installed-runtime lifecycle validation."""
+    canonical_plugin = _canonical_plugin_source(plugin_source)
+    with tempfile.TemporaryDirectory(prefix="memoryd-hermes-validation-") as temporary:
+        root = Path(temporary).resolve()
+        (root / "home").mkdir(mode=0o700)
+        (root / "tmp").mkdir(mode=0o700)
+        hermes_home = root / "hermes-home"
+        environment = _validation_environment(root, hermes_home)
+        plugin_argument = os.fspath(canonical_plugin)
+        _run_validation_stage(
+            target,
+            "contract",
+            "memoryd.hermes_validation.contract",
+            ["--require-pinned-bytes"],
+            cwd=root,
+            environment=environment,
+        )
+        _run_validation_stage(
+            target,
+            "lifecycle",
+            "memoryd.hermes_validation.installed_runtime",
+            [
+                "--hermes-home",
+                os.fspath(hermes_home),
+                "--plugin-source",
+                plugin_argument,
+                "--expected-version",
+                PINNED_HERMES_VERSION,
+            ],
+            cwd=root,
+            environment=environment,
+        )

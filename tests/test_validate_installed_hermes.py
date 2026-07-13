@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import stat
@@ -9,18 +8,10 @@ from pathlib import Path
 import pytest
 
 
-REPO = Path(__file__).resolve().parents[1]
-VALIDATOR = REPO / "scripts" / "validate_installed_hermes.py"
-
-
 def _validator():
-    assert VALIDATOR.is_file(), "installed Hermes validator is missing"
-    spec = importlib.util.spec_from_file_location(
-        "memoryd_validate_installed_hermes", VALIDATOR)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    from memoryd.hermes_validation import installed_runtime
+
+    return installed_runtime
 
 
 def test_prepare_isolated_home_uses_real_user_provider_layout(tmp_path):
