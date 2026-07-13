@@ -562,32 +562,106 @@ def test_restore_command_failure_removes_only_staging_and_warns_db_risk(
     assert not list(tmp_path.glob(".target.restore-*"))
 
 
-def test_restore_publish_failure_preserves_existing_empty_target(
+def test_posix_existing_empty_target_publishes_with_one_replace(
         monkeypatch, tmp_path):
     source_home = _home(tmp_path)
     _prepare(monkeypatch, source_home)
     snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
     target = tmp_path / "target"
     target.mkdir()
+    monkeypatch.setattr(
+        backup, "WINDOWS_RESTORE_REQUIRES_ABSENT_HOME", False, raising=False)
     monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
     monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
-    real_rename = backup._atomic_rename
+    real_replace = backup.os.replace
+    calls: list[tuple[Path, Path]] = []
 
-    def fail_staging_publish(source, destination):
-        if source.name.startswith(".target.restore-"):
-            raise OSError("injected publish failure")
-        return real_rename(source, destination)
+    def posix_replace(source, destination):
+        source = Path(source)
+        destination = Path(destination)
+        calls.append((source, destination))
+        if destination == target and target.is_dir():
+            target.rmdir()  # simulate POSIX's atomic empty-directory replacement
+        return real_replace(source, destination)
 
-    monkeypatch.setattr(backup, "_atomic_rename", fail_staging_publish)
+    monkeypatch.setattr(backup.os, "replace", posix_replace)
+
+    backup.restore_backup(snapshot, target_dsn="postgresql:///empty",
+                          target_home=target)
+
+    assert len(calls) == 1
+    assert calls[0][1] == target
+    assert (target / "config.json").is_file()
+
+
+def test_windows_existing_empty_target_refuses_before_database_access(
+        monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+    target.mkdir()
+    database_calls: list[str] = []
+    monkeypatch.setattr(
+        backup, "WINDOWS_RESTORE_REQUIRES_ABSENT_HOME", True, raising=False)
+    monkeypatch.setattr(
+        backup, "_target_db_has_tables",
+        lambda dsn: database_calls.append(dsn) or False)
+    monkeypatch.setattr(
+        backup, "_restore_database",
+        lambda _dump, _dsn: database_calls.append("restore"))
+
+    with pytest.raises(backup.BackupError, match="Windows.*absent"):
+        backup.restore_backup(snapshot, target_dsn="postgresql:///empty",
+                              target_home=target)
+
+    assert database_calls == []
+    assert target.is_dir() and not list(target.iterdir())
+
+
+def test_windows_absent_target_publishes_atomically(monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+    monkeypatch.setattr(
+        backup, "WINDOWS_RESTORE_REQUIRES_ABSENT_HOME", True, raising=False)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
+
+    backup.restore_backup(snapshot, target_dsn="postgresql:///empty",
+                          target_home=target)
+
+    assert (target / "config.json").is_file()
+
+
+def test_posix_replace_failure_preserves_existing_empty_target(
+        monkeypatch, tmp_path):
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target = tmp_path / "target"
+    target.mkdir()
+    monkeypatch.setattr(
+        backup, "WINDOWS_RESTORE_REQUIRES_ABSENT_HOME", False, raising=False)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
+    calls: list[tuple[Path, Path]] = []
+
+    def fail_replace(source, destination):
+        calls.append((Path(source), Path(destination)))
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(backup.os, "replace", fail_replace)
 
     with pytest.raises(backup.BackupError, match="publish failure"):
         backup.restore_backup(snapshot, target_dsn="postgresql:///empty",
                               target_home=target)
 
+    assert len(calls) == 1
     assert target.is_dir()
     assert not list(target.iterdir())
     assert not list(tmp_path.glob(".target.restore-*"))
-    assert not list(tmp_path.glob(".target.empty-*"))
 
 
 def test_local_pg_tools_keep_password_out_of_argv(monkeypatch, tmp_path):

@@ -115,13 +115,16 @@ snapshot verifies and removes only older valid generated snapshot directories;
 it never follows symlinks or removes unrecognized/corrupt paths.
 
 Restore is deliberately out-of-place. Stop the daemon and provide an empty
-target PostgreSQL database plus a new or empty, nonsymlink target home. The
-command verifies first, stages safe extraction beside the target, restores with
-`pg_restore --exit-on-error --no-owner`, writes a config containing the target
-DSN/home and no API keys, then atomically publishes the home. If `pg_restore`
-fails, the snapshot remains intact and the error warns that the otherwise empty
-target database may now be partially populated. A restore drill should finish
-with `MEMORYD_HOME=<target> memoryd doctor`; re-enter API keys separately.
+target PostgreSQL database plus a new, nonsymlink target home. POSIX also
+accepts an existing empty target directory and atomically replaces it. Windows
+requires the target path to be absent because replacing an existing directory
+is not atomic there. The command verifies first, stages beside the target,
+restores with `pg_restore --exit-on-error --no-owner`, writes a config containing
+the target DSN/home and no API keys, then atomically publishes the home. If
+`pg_restore` fails, the snapshot remains intact and the error warns that the
+otherwise empty target database may now be partially populated. A restore drill
+should finish with `MEMORYD_HOME=<target> memoryd doctor`; re-enter API keys
+separately.
 
 Backups are local-only: memoryd does not upload snapshots. Linux installs a
 02:35 persistent systemd user timer that stops `memoryd.service`, creates and

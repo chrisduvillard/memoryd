@@ -7,6 +7,7 @@ import importlib.util
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,36 @@ REPO = Path(__file__).resolve().parents[1]
 CHECKER = REPO / "scripts" / "check_hermes_contract.py"
 PINNED = REPO / "scripts" / "_stubs" / "agent" / "memory_provider.py"
 PLUGIN = REPO / "hermes_plugin" / "memoryd" / "__init__.py"
+
+
+def _daemon_state() -> tuple[bool, object | None]:
+    return "memoryd" in sys.modules, sys.modules.get("memoryd")
+
+
+def _assert_daemon_state(
+        case: unittest.TestCase, before: tuple[bool, object | None]) -> None:
+    present, module = before
+    if present:
+        case.assertIs(sys.modules.get("memoryd"), module)
+    else:
+        case.assertNotIn("memoryd", sys.modules)
+
+
+def _managed_import_state() -> dict[str, object]:
+    return {
+        name: module for name, module in sys.modules.items()
+        if (name == "agent" or name.startswith("agent.") or
+            name == "_memoryd_hermes_contract_plugin" or
+            name.startswith("_hermes_memoryd_spool_"))
+    }
+
+
+def _assert_managed_import_state(
+        case: unittest.TestCase, before: dict[str, object]) -> None:
+    after = _managed_import_state()
+    case.assertEqual(set(after), set(before))
+    for name, module in before.items():
+        case.assertIs(after[name], module)
 
 
 class _ContractMutation(ast.NodeTransformer):
@@ -250,9 +281,10 @@ class HermesContractCheckerTests(unittest.TestCase):
         checker = importlib.util.module_from_spec(spec)
         self.assertIsNotNone(spec.loader)
         spec.loader.exec_module(checker)
+        daemon_before = _daemon_state()
         errors = checker.check_contract(self.root, plugin_path=broken_plugin)
         self.assertTrue(any("abstract" in error.lower() for error in errors), errors)
-        self.assertNotIn("memoryd", sys.modules)
+        _assert_daemon_state(self, daemon_before)
 
     def test_changed_concrete_hook_override_is_incompatible(self) -> None:
         self._write_contract(self.pinned_source)
@@ -373,21 +405,40 @@ class HermesContractCheckerTests(unittest.TestCase):
                 source += "sys.modules['memoryd'] = type(sys)('memoryd')\n"
                 source += "raise RuntimeError('plugin import failure')\n"
             plugin_path.write_text(source, encoding="utf-8")
+            daemon_before = _daemon_state()
+            managed_before = _managed_import_state()
             errors = checker.check_contract(self.root, plugin_path=plugin_path)
             if suffix == "failure":
                 self.assertTrue(
                     any("daemon package" in error for error in errors), errors
                 )
-                self.assertNotIn("memoryd", sys.modules)
-            leaked = [
-                name
-                for name in sys.modules
-                if name == "agent"
-                or name.startswith("agent.")
-                or name == "_memoryd_hermes_contract_plugin"
-                or name.startswith("_hermes_memoryd_spool_")
-            ]
-            self.assertEqual(leaked, [])
+                _assert_daemon_state(self, daemon_before)
+            _assert_managed_import_state(self, managed_before)
+
+    def test_preserves_preexisting_legitimate_import_modules(self) -> None:
+        self._write_contract(self.pinned_source)
+        checker = self._load_checker()
+        import memoryd as daemon
+
+        names = ("agent", "agent.helper")
+        previous = {name: sys.modules.get(name) for name in names}
+        present = {name for name in names if name in sys.modules}
+        agent = types.ModuleType("agent")
+        helper = types.ModuleType("agent.helper")
+        sys.modules["agent"] = agent
+        sys.modules["agent.helper"] = helper
+        try:
+            errors = checker.check_contract(self.root)
+            self.assertEqual(errors, [])
+            self.assertIs(sys.modules.get("memoryd"), daemon)
+            self.assertIs(sys.modules.get("agent"), agent)
+            self.assertIs(sys.modules.get("agent.helper"), helper)
+        finally:
+            for name in names:
+                if name in present:
+                    sys.modules[name] = previous[name]
+                else:
+                    sys.modules.pop(name, None)
 
     def test_workflow_pins_actions_and_never_executes_upstream_main(self) -> None:
         workflow = (REPO / ".github" / "workflows" / "tests.yml").read_text(

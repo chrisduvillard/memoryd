@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import shutil
 import stat
 import subprocess
@@ -23,6 +22,7 @@ from . import __version__
 
 SCHEMA_VERSION = 1
 POSIX_MODE_ENFORCED = os.name != "nt"
+WINDOWS_RESTORE_REQUIRES_ABSENT_HOME = os.name == "nt"
 SNAPSHOT_RE = re.compile(r"^\d{8}T\d{6}Z-v1$")
 MIGRATION_RE = re.compile(r"^\d{3}_[A-Za-z0-9][A-Za-z0-9_-]*\.sql$")
 SNAPSHOT_FILES = {
@@ -664,29 +664,6 @@ def _extract_memory_tar(path: Path, destination: Path) -> None:
         raise BackupError(f"memory tar extraction failed: {exc}") from exc
 
 
-def _publish_restored_home(
-        staging: Path, home: Path, *, caller_empty_home: bool) -> None:
-    if not caller_empty_home:
-        _atomic_rename(staging, home)
-        return
-    try:
-        _atomic_rename(staging, home)
-        return
-    except OSError as direct_error:
-        placeholder = home.with_name(
-            f".{home.name}.empty-{secrets.token_hex(8)}")
-        try:
-            _atomic_rename(home, placeholder)
-        except OSError:
-            raise direct_error
-        try:
-            _atomic_rename(staging, home)
-        except Exception:
-            _atomic_rename(placeholder, home)
-            raise
-        placeholder.rmdir()
-
-
 def restore_backup(snapshot: Path | str, *, target_dsn: str,
                    target_home: Path | str) -> Path:
     source = Path(snapshot)
@@ -696,7 +673,6 @@ def restore_backup(snapshot: Path | str, *, target_dsn: str,
     if _daemon_health() is not None:
         raise BackupError("stop the memoryd daemon before restoring a backup")
     home = Path(target_home)
-    caller_empty_home = False
     if os.path.lexists(home):
         if home.is_symlink():
             raise BackupError(f"target home must not be a symlink: {home}")
@@ -705,7 +681,10 @@ def restore_backup(snapshot: Path | str, *, target_dsn: str,
         with os.scandir(home) as entries:
             if next(entries, None) is not None:
                 raise BackupError(f"target home is not empty: {home}")
-        caller_empty_home = True
+        if WINDOWS_RESTORE_REQUIRES_ABSENT_HOME:
+            raise BackupError(
+                "Windows restore requires an absent target home; remove the "
+                "empty directory and retry")
     try:
         if _target_db_has_tables(target_dsn):
             raise BackupError("target database already has user tables")
@@ -734,8 +713,7 @@ def restore_backup(snapshot: Path | str, *, target_dsn: str,
         _require_mode(config_path, 0o600)
         database_risk = True
         _restore_database(source / "database.dump", target_dsn)
-        _publish_restored_home(
-            staging, home, caller_empty_home=caller_empty_home)
+        _atomic_rename(staging, home)
         staging = None
         return home
     except Exception as exc:  # noqa: BLE001

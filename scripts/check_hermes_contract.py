@@ -45,14 +45,18 @@ class MethodContract(NamedTuple):
     descriptor: str
 
 
+def _managed_import_name(name: str) -> bool:
+    return (
+        name == "agent"
+        or name.startswith("agent.")
+        or name == "_memoryd_hermes_contract_plugin"
+        or name.startswith("_hermes_memoryd_spool_")
+    )
+
+
 def _clean_import_modules() -> None:
     for name in tuple(sys.modules):
-        if (
-            name == "agent"
-            or name.startswith("agent.")
-            or name == "_memoryd_hermes_contract_plugin"
-            or name.startswith("_hermes_memoryd_spool_")
-        ):
+        if _managed_import_name(name):
             sys.modules.pop(name, None)
 
 
@@ -353,6 +357,10 @@ def check_contract(
     plugin_path: Path = PLUGIN_PATH,
     require_pinned_bytes: bool = False,
 ) -> list[str]:
+    managed_before = {
+        name: module for name, module in sys.modules.items()
+        if _managed_import_name(name)
+    }
     _clean_import_modules()
     try:
         checked_path = (
@@ -376,6 +384,7 @@ def check_contract(
         return errors
     finally:
         _clean_import_modules()
+        sys.modules.update(managed_before)
 
 
 def _parse_args() -> argparse.Namespace:

@@ -154,8 +154,10 @@ owner-only directory (`0700`) or file (`0600`) modes cannot be enforced;
 Windows applies its available chmod protection on a best-effort basis, so use
 an account-private directory and appropriate NTFS ACLs.
 
-Practice the restore into an **empty database and empty/new home**, never over
-the live installation:
+Practice the restore into an **empty database and a new target home**, never
+over the live installation. On POSIX, the target may instead be an existing
+empty directory and is atomically replaced. On Windows, the target directory
+must not exist because replacing a directory is not an atomic operation there:
 
 ```bash
 # Stop every memoryd daemon that could use the source or target first.
@@ -165,9 +167,10 @@ memoryd backup restore ~/memory/backups/20260713T023500Z-v1 \
 MEMORYD_HOME=~/memory-restore-drill memoryd doctor
 ```
 
-Restore refuses a running daemon, a nonempty/symlink target home, or a target
-database that already has user tables. Re-enter required API keys after the
-drill rather than copying them into a snapshot.
+Restore refuses a running daemon, a nonempty/symlink target home, a Windows
+target home that already exists, or a target database that already has user
+tables. Re-enter required API keys after the drill rather than copying them
+into a snapshot.
 
 ---
 
