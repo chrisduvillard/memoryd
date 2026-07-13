@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import __version__
+from .ownership import OwnershipError, offline_ownership
 
 SCHEMA_VERSION = 1
 POSIX_MODE_ENFORCED = os.name != "nt"
@@ -119,11 +120,6 @@ def _atomic_rename(source: Path, destination: Path) -> None:
             if destination_existed or time.monotonic() >= deadline:
                 raise
             time.sleep(0.005)
-
-
-def _daemon_health() -> dict | None:
-    from .cli import _health
-    return _health()
 
 
 def _doctor_findings(home: Path) -> list[Any]:
@@ -890,8 +886,6 @@ def create_backup(*, output: Path | str | None = None,
     """Create, verify, atomically publish, then safely retain snapshots."""
     if retain < 1:
         raise BackupError("--retain must be at least 1")
-    if _daemon_health() is not None:
-        raise BackupError("stop the memoryd daemon before creating a backup")
     config_home = Path(home) if home is not None else _default_home()
     config = _read_config(config_home)
     configured_home = config.get("home")
@@ -900,15 +894,27 @@ def create_backup(*, output: Path | str | None = None,
         source_home = Path(configured_home).expanduser()
     else:
         source_home = config_home
+    dsn = os.environ.get("MEMORYD_DSN") or config.get("dsn")
+    if not isinstance(dsn, str) or not dsn:
+        raise BackupError("no PostgreSQL DSN configured")
+    try:
+        with offline_ownership(source_home, dsn, purpose="backup"):
+            return _create_backup_owned(
+                output=output, retain=retain, config=config,
+                source_home=source_home, dsn=dsn)
+    except OwnershipError as exc:
+        raise BackupError(str(exc)) from exc
+
+
+def _create_backup_owned(
+        *, output: Path | str | None, retain: int, config: dict[str, Any],
+        source_home: Path, dsn: str) -> Path:
     findings = [finding for finding in _doctor_findings(source_home)
                 if _finding_value(finding, "severity") == "error"]
     if findings:
         codes = ", ".join(_finding_value(item, "code", "integrity_error")
                           for item in findings)
         raise BackupError(f"doctor found integrity errors: {codes}")
-    dsn = os.environ.get("MEMORYD_DSN") or config.get("dsn")
-    if not isinstance(dsn, str) or not dsn:
-        raise BackupError("no PostgreSQL DSN configured")
     sanitized, required, removed_values = _sanitize_config(config)
     environment_secrets = {
         name: os.environ[name] for name in KNOWN_SECRET_ENV_NAMES
@@ -1219,12 +1225,20 @@ def _extract_memory_tar(path: Path, destination: Path) -> None:
 def restore_backup(snapshot: Path | str, *, target_dsn: str,
                    target_home: Path | str) -> Path:
     source = Path(snapshot)
+    home = Path(target_home)
+    try:
+        with offline_ownership(home, target_dsn, purpose="restore"):
+            return _restore_backup_owned(
+                source, target_dsn=target_dsn, home=home)
+    except OwnershipError as exc:
+        raise BackupError(str(exc)) from exc
+
+
+def _restore_backup_owned(
+        source: Path, *, target_dsn: str, home: Path) -> Path:
     result = verify_snapshot(source)
     if not result.ok:
         raise BackupError(f"snapshot verification failed: {result.reason}")
-    if _daemon_health() is not None:
-        raise BackupError("stop the memoryd daemon before restoring a backup")
-    home = Path(target_home)
     if os.path.lexists(home):
         if home.is_symlink():
             raise BackupError(f"target home must not be a symlink: {home}")

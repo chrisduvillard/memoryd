@@ -40,6 +40,158 @@ def _fake_psycopg(monkeypatch, connect):
     monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode enforcement")
+def test_write_config_restricts_home_and_file_under_permissive_umask(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    monkeypatch.setattr(cli, "_home", lambda: home)
+    previous = os.umask(0)
+    try:
+        path = cli.write_config("postgresql://operator:secret@localhost/memoryd")
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert json.loads(path.read_text(encoding="utf-8"))["dsn"].endswith(
+        "/memoryd")
+    assert not list(home.glob(".config.json.*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode enforcement")
+def test_write_config_home_chmod_failure_writes_no_secret(monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    monkeypatch.setattr(cli, "_home", lambda: home)
+    real_chmod = cli.os.chmod
+
+    def fail_home(path, mode, *args, **kwargs):
+        if Path(path) == home:
+            raise PermissionError("injected home chmod failure")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "chmod", fail_home)
+
+    with pytest.raises(PermissionError, match="home chmod"):
+        cli.write_config("postgresql://operator:secret@localhost/memoryd")
+
+    assert not (home / "config.json").exists()
+    assert not list(home.glob(".config.json.*.tmp"))
+
+
+def test_write_config_refuses_existing_symlink_without_touching_target(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    home.mkdir(mode=0o700)
+    target = tmp_path / "foreign.json"
+    old_bytes = b'{"dsn":"postgresql:///foreign"}\n'
+    target.write_bytes(old_bytes)
+    config = home / "config.json"
+    try:
+        config.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    monkeypatch.setattr(cli, "_home", lambda: home)
+
+    with pytest.raises(OSError, match="regular file"):
+        cli.write_config("postgresql://operator:new-secret@localhost/memoryd")
+
+    assert config.is_symlink()
+    assert target.read_bytes() == old_bytes
+    assert b"new-secret" not in target.read_bytes()
+    assert not list(home.glob(".config.json.*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode enforcement")
+def test_write_config_refuses_existing_permissive_file_before_secret_write(
+        monkeypatch, tmp_path):
+    home = tmp_path / "memory"
+    home.mkdir(mode=0o700)
+    config = home / "config.json"
+    old_bytes = b'{"dsn":"postgresql:///old"}\n'
+    config.write_bytes(old_bytes)
+    config.chmod(0o644)
+    monkeypatch.setattr(cli, "_home", lambda: home)
+
+    with pytest.raises(OSError, match="owner-only"):
+        cli.write_config("postgresql://operator:new-secret@localhost/memoryd")
+
+    assert config.read_bytes() == old_bytes
+    assert stat.S_IMODE(config.stat().st_mode) == 0o644
+    assert not list(home.glob(".config.json.*.tmp"))
+
+
+@pytest.mark.parametrize("failure", ["malformed", "unreadable"])
+def test_write_config_preserves_existing_config_when_read_fails(
+        monkeypatch, tmp_path, failure):
+    home = tmp_path / "memory"
+    home.mkdir(mode=0o700)
+    config = home / "config.json"
+    old_bytes = b"{malformed\n" if failure == "malformed" else b'{"dsn":"old"}\n'
+    config.write_bytes(old_bytes)
+    if os.name != "nt":
+        config.chmod(0o600)
+    monkeypatch.setattr(cli, "_home", lambda: home)
+
+    if failure == "unreadable":
+        real_read_text = Path.read_text
+
+        def deny_read(path, *args, **kwargs):
+            if path == config:
+                raise PermissionError("injected config read failure")
+            return real_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", deny_read)
+
+    with pytest.raises((OSError, ValueError)):
+        cli.write_config("postgresql://operator:new-secret@localhost/memoryd")
+
+    assert config.read_bytes() == old_bytes
+    assert b"new-secret" not in config.read_bytes()
+    assert not list(home.glob(".config.json.*.tmp"))
+
+
+@pytest.mark.parametrize("fault", ["temporary_chmod", "replace", "fsync"])
+def test_write_config_atomic_fault_preserves_old_config_and_cleans_temp(
+        monkeypatch, tmp_path, fault):
+    home = tmp_path / "memory"
+    home.mkdir(mode=0o700)
+    old = home / "config.json"
+    old_bytes = b'{"dsn":"postgresql:///old"}\n'
+    old.write_bytes(old_bytes)
+    if os.name != "nt":
+        old.chmod(0o600)
+    monkeypatch.setattr(cli, "_home", lambda: home)
+
+    if fault == "temporary_chmod":
+        if os.name == "nt":
+            pytest.skip("temporary chmod is POSIX-only")
+        real_chmod = cli.os.chmod
+
+        def fail_temporary(path, mode, *args, **kwargs):
+            if Path(path).name.endswith(".tmp"):
+                raise PermissionError("injected temporary chmod failure")
+            return real_chmod(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(cli.os, "chmod", fail_temporary)
+    elif fault == "replace":
+        monkeypatch.setattr(
+            cli.os, "replace",
+            lambda *_args: (_ for _ in ()).throw(
+                PermissionError("injected replace failure")))
+    else:
+        monkeypatch.setattr(
+            cli.os, "fsync",
+            lambda *_args: (_ for _ in ()).throw(
+                OSError("injected fsync failure")))
+
+    with pytest.raises(OSError, match="injected"):
+        cli.write_config("postgresql://operator:new-secret@localhost/memoryd")
+
+    assert old.read_bytes() == old_bytes
+    assert b"new-secret" not in old.read_bytes()
+    assert not list(home.glob(".config.json.*.tmp"))
+
+
 def test_hermes_plugin_install_uses_active_profile_and_exact_private_config(
         monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes-profile"

@@ -488,11 +488,26 @@ def apply_migrations(dsn: str) -> list[str]:
 
 def write_config(dsn: str) -> Path:
     home = _home()
-    home.mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if home.is_symlink() or not home.is_dir():
+        raise OSError(f"memoryd home must be a real directory: {home}")
+    if os.name != "nt":
+        os.chmod(home, 0o700)
+        mode = stat.S_IMODE(home.stat(follow_symlinks=False).st_mode)
+        if mode != 0o700:
+            raise OSError(
+                f"memoryd home is not owner-only: {home} has mode {mode:04o}")
     p = home / "config.json"
-    try:
+    config_exists = os.path.lexists(p)
+    if config_exists:
+        value = p.stat(follow_symlinks=False)
+        if p.is_symlink() or not stat.S_ISREG(value.st_mode):
+            raise OSError(f"memoryd config is not a regular file: {p}")
+        if os.name != "nt" and stat.S_IMODE(value.st_mode) != 0o600:
+            raise OSError(f"memoryd config is not owner-only: {p}")
+    if config_exists:
         cfg = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    else:
         cfg = {}
     cfg["dsn"] = dsn
     cfg.setdefault("port", 7437)
@@ -515,12 +530,12 @@ def write_config(dsn: str) -> Path:
             env[k] = os.environ[k]  # env wins on install so key rotation takes effect
         print(f"  config     persisted {', '.join(changed)} so scheduled runs "
               "use them; edit config.json's env map to change")
-    p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    if sys.platform != "win32":  # the file holds API keys — keep it owner-only
-        try:
-            os.chmod(p, 0o600)
-        except OSError:
-            pass
+    _atomic_owner_json(p, cfg)
+    value = p.stat(follow_symlinks=False)
+    if p.is_symlink() or not stat.S_ISREG(value.st_mode):
+        raise OSError(f"memoryd config is not a regular file: {p}")
+    if os.name != "nt" and stat.S_IMODE(value.st_mode) != 0o600:
+        raise OSError(f"memoryd config is not owner-only: {p}")
     return p
 
 
@@ -852,22 +867,17 @@ def status() -> int:
 
 
 def serve() -> None:
-    from .core import CFG
-    CFG.ensure_dirs()
-
     def _tty(stream) -> bool:
         try:
             return stream is not None and stream.isatty()
         except Exception:  # noqa: BLE001
             return False
 
-    if not _tty(sys.stdout):
-        # pythonw / scheduled task: print() would vanish and tracebacks with it
-        log = open(CFG.home / "memoryd.log", "a", encoding="utf-8", buffering=1)
-        sys.stdout = sys.stderr = log
     from .server import main as server_main
     try:
-        server_main()
+        # Open the unattended log only after the server owns the home and has
+        # safely created it; scheduled/pythonw output would otherwise vanish.
+        server_main(log_unattended=not _tty(sys.stdout))
     except OSError as e:
         # bind failed -> another instance is listening; idempotent double-start
         print(f"memoryd: not starting ({e}); another instance is likely running")

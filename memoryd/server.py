@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import queue
 import re
+import stat
+import sys
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +35,7 @@ from .core import (
     pool,
 )
 from .ingest import drain_spool
+from .ownership import offline_ownership
 from .recall import build_packet
 from .spool import (
     JobIdentityCollision,
@@ -39,7 +44,8 @@ from .spool import (
     find_request_identity,
 )
 
-CAPTURE_Q: "queue.Queue[dict]" = queue.Queue()
+CAPTURE_Q: "queue.Queue[dict | object]" = queue.Queue()
+_CAPTURE_STOP = object()
 ADMIN_POST_ENDPOINTS = {
     "/admin/eval",
     "/admin/replay",
@@ -189,6 +195,9 @@ def _capture_worker() -> None:
     while True:
         job = CAPTURE_Q.get()
         try:
+            if job is _CAPTURE_STOP:
+                return
+            assert isinstance(job, dict)
             if job.get("drain_spool"):
                 drain_spool()
         except Exception as exc:  # noqa: BLE001 — keep the worker alive
@@ -520,18 +529,98 @@ def _drain_spool_bg() -> None:
         print(f"memoryd: spool drain failed: {e}")
 
 
-def main() -> None:
-    CFG.ensure_dirs()
-    threading.Thread(target=_capture_worker, daemon=True).start()
-    # background: with the DB down (Docker still booting at logon), a
-    # synchronous drain would block the socket bind for pool-timeout × N files
-    threading.Thread(target=_drain_spool_bg, daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
-    print(f"memoryd listening on 127.0.0.1:{CFG.port}  home={CFG.home}")
+def _secure_server_home() -> None:
+    home = CFG.home
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    value = home.stat(follow_symlinks=False)
+    if home.is_symlink() or not stat.S_ISDIR(value.st_mode):
+        raise OSError(f"memoryd home must be a real directory: {home}")
+    if os.name != "nt":
+        os.chmod(home, 0o700)
+        value = home.stat(follow_symlinks=False)
+        if stat.S_IMODE(value.st_mode) != 0o700:
+            raise OSError(f"memoryd home is not owner-only: {home}")
+
+
+def _open_unattended_log():
+    path = CFG.home / "memoryd.log"
+    flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT |
+             getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags, 0o600)
     try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        srv.shutdown()
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        value = os.fstat(fd)
+        path_value = path.stat(follow_symlinks=False)
+        if (path.is_symlink() or not stat.S_ISREG(value.st_mode) or
+                not stat.S_ISREG(path_value.st_mode) or
+                (value.st_dev, value.st_ino) !=
+                (path_value.st_dev, path_value.st_ino)):
+            raise OSError(f"memoryd log is not a safe regular file: {path}")
+        if os.name != "nt" and stat.S_IMODE(value.st_mode) != 0o600:
+            raise OSError(f"memoryd log is not owner-only: {path}")
+        handle = os.fdopen(fd, "a", encoding="utf-8", buffering=1)
+        fd = -1
+        return handle
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def main(*, log_unattended: bool = False) -> None:
+    with offline_ownership(CFG.home, CFG.dsn, purpose="server"):
+        _secure_server_home()
+        CFG.ensure_dirs()
+        if log_unattended:
+            log = _open_unattended_log()
+            sys.stdout = sys.stderr = log
+        srv = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
+        capture_thread = threading.Thread(target=_capture_worker, daemon=True)
+        drain_thread = threading.Thread(target=_drain_spool_bg, daemon=True)
+        capture_started = False
+        drain_started = False
+        primary_error: BaseException | None = None
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        try:
+            capture_thread.start()
+            capture_started = True
+            # With the DB down (Docker still booting at logon), a synchronous
+            # drain would block the socket bind for pool-timeout × N files.
+            drain_thread.start()
+            drain_started = True
+            print(
+                f"memoryd listening on 127.0.0.1:{CFG.port}  home={CFG.home}")
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        except BaseException as exc:
+            primary_error = exc
+        finally:
+            cleanup_steps: list[tuple[str, Callable[[], object]]] = [
+                ("close HTTP server", srv.server_close),
+            ]
+            if capture_started:
+                cleanup_steps.extend([
+                    ("finish queued captures", CAPTURE_Q.join),
+                    ("stop capture worker", lambda: CAPTURE_Q.put(_CAPTURE_STOP)),
+                    ("join capture worker", capture_thread.join),
+                ])
+            if drain_started:
+                cleanup_steps.append(("join spool drain", drain_thread.join))
+            for label, cleanup in cleanup_steps:
+                try:
+                    cleanup()
+                except BaseException as exc:  # preserve the serving failure
+                    cleanup_errors.append((label, exc))
+
+        if primary_error is not None:
+            for label, cleanup_error in cleanup_errors:
+                primary_error.add_note(f"{label} failed: {cleanup_error}")
+            raise primary_error.with_traceback(primary_error.__traceback__)
+        if cleanup_errors:
+            label, cleanup_error = cleanup_errors[0]
+            cleanup_error.add_note(f"memoryd shutdown step failed: {label}")
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
 
 
 if __name__ == "__main__":

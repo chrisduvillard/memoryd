@@ -7,10 +7,12 @@ import os
 import socket
 import stat
 import struct
+import sys
 import tarfile
 import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -124,7 +126,6 @@ def _prepare(monkeypatch, home: Path) -> None:
     monkeypatch.setattr(
         backup, "_utc_now",
         lambda: datetime(2026, 7, 13, 1, 23, 45, tzinfo=timezone.utc))
-    monkeypatch.setattr(backup, "_daemon_health", lambda: None)
     monkeypatch.setattr(backup, "_doctor_findings", lambda _home: [])
     monkeypatch.setattr(
         backup, "_database_migrations",
@@ -132,6 +133,14 @@ def _prepare(monkeypatch, home: Path) -> None:
     monkeypatch.setattr(
         backup, "_dump_database",
         lambda _dsn, path: path.write_bytes(b"PGDMP\x00unit-test"))
+
+    @contextmanager
+    def ownership_stub(_home, _dsn, *, purpose):
+        assert purpose in {"backup", "restore"}
+        yield
+
+    monkeypatch.setattr(
+        backup, "offline_ownership", ownership_stub, raising=False)
 
 
 def _manifest(snapshot: Path) -> dict:
@@ -198,20 +207,104 @@ def test_create_produces_verified_secret_free_owner_only_snapshot(
                    for path in snapshot.iterdir())
 
 
-def test_create_refuses_running_daemon_before_dump(monkeypatch, tmp_path):
+def test_create_does_not_treat_http_503_as_offline_ownership(
+        monkeypatch, tmp_path):
     home = _home(tmp_path)
+    _prepare(monkeypatch, home)
     called = False
-    monkeypatch.setattr(backup, "_daemon_health", lambda: {"ok": True})
+    health_called = False
 
-    def dump(_dsn, _path):
+    def http_503():
+        nonlocal health_called
+        health_called = True
+        return {"ok": False, "status": 503}
+
+    monkeypatch.setattr(cli, "_health", http_503)
+
+    def dump(_dsn, path):
         nonlocal called
         called = True
+        path.write_bytes(b"PGDMP\x00health-is-diagnostic")
 
     monkeypatch.setattr(backup, "_dump_database", dump)
 
-    with pytest.raises(backup.BackupError, match="stop.*daemon"):
-        backup.create_backup(output=tmp_path / "out", home=home)
-    assert not called
+    snapshot = backup.create_backup(output=tmp_path / "out", home=home)
+
+    assert called
+    assert not health_called
+    assert snapshot.is_dir()
+
+
+def test_live_unhealthy_daemon_home_lock_blocks_backup_without_health_probe(
+        monkeypatch, tmp_path):
+    from memoryd import ownership
+
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    monkeypatch.setattr(
+        cli, "_health",
+        lambda: pytest.fail("HTTP health must not decide offline ownership"))
+    monkeypatch.setattr(backup, "offline_ownership", ownership.offline_ownership)
+
+    @contextmanager
+    def database_available(_dsn, *, purpose):
+        assert purpose == "backup"
+        yield
+
+    monkeypatch.setattr(ownership, "database_ownership", database_available)
+
+    with ownership.home_ownership(home, purpose="server"):
+        with pytest.raises(backup.BackupError, match="home is in use"):
+            backup.create_backup(output=tmp_path / "out", home=home)
+
+
+def test_server_start_cannot_race_into_backup_after_offline_gate(
+        monkeypatch, tmp_path):
+    from memoryd import ownership
+
+    home = _home(tmp_path)
+    _prepare(monkeypatch, home)
+    monkeypatch.setattr(backup, "offline_ownership", ownership.offline_ownership)
+
+    @contextmanager
+    def database_available(_dsn, *, purpose):
+        assert purpose == "backup"
+        yield
+
+    monkeypatch.setattr(ownership, "database_ownership", database_available)
+    dump_started = threading.Event()
+    release_dump = threading.Event()
+
+    def dump(_dsn, path):
+        dump_started.set()
+        assert release_dump.wait(timeout=5)
+        path.write_bytes(b"PGDMP\x00locked")
+
+    monkeypatch.setattr(backup, "_dump_database", dump)
+    result: list[Path] = []
+    errors: list[BaseException] = []
+
+    def create() -> None:
+        try:
+            result.append(backup.create_backup(
+                output=tmp_path / "out", home=home))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=create)
+    thread.start()
+    assert dump_started.wait(timeout=5)
+    try:
+        with pytest.raises(ownership.OwnershipError, match="home is in use"):
+            with ownership.home_ownership(home, purpose="server"):
+                pytest.fail("server acquired a home during backup")
+    finally:
+        release_dump.set()
+        thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(result) == 1
 
 
 def test_create_honors_relocated_home_from_config(monkeypatch, tmp_path):
@@ -313,7 +406,7 @@ def test_database_migration_query_reports_missing_table(monkeypatch):
 
 def test_create_refuses_doctor_errors_and_dead_letters(monkeypatch, tmp_path):
     home = _home(tmp_path)
-    monkeypatch.setattr(backup, "_daemon_health", lambda: None)
+    _prepare(monkeypatch, home)
     monkeypatch.setattr(backup, "_doctor_findings", lambda _home: [
         {"severity": "error", "code": "dead_letter_jobs"}])
 
@@ -802,7 +895,7 @@ def test_restore_checks_staged_home_and_config_modes(monkeypatch, tmp_path):
                for path, mode in checked)
 
 
-def test_restore_refuses_daemon_nonempty_home_and_nonempty_db(
+def test_restore_refuses_nonempty_home_and_nonempty_db_but_not_health(
         monkeypatch, tmp_path):
     source_home = _home(tmp_path)
     _prepare(monkeypatch, source_home)
@@ -824,10 +917,118 @@ def test_restore_refuses_daemon_nonempty_home_and_nonempty_db(
                               target_home=target)
     assert not target.exists()
 
-    monkeypatch.setattr(backup, "_daemon_health", lambda: {"ok": True})
-    with pytest.raises(backup.BackupError, match="stop.*daemon"):
-        backup.restore_backup(snapshot, target_dsn="postgresql:///db2",
-                              target_home=tmp_path / "third")
+    monkeypatch.setattr(
+        cli, "_health",
+        lambda: pytest.fail("HTTP health must not decide offline ownership"))
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(backup, "_restore_database", lambda _dump, _dsn: None)
+    third = backup.restore_backup(
+        snapshot, target_dsn="postgresql:///db2",
+        target_home=tmp_path / "third")
+    assert third.is_dir()
+
+
+def test_restore_arbitrary_home_is_blocked_by_same_database_owner(
+        monkeypatch, tmp_path):
+    from memoryd import ownership
+
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target_home = tmp_path / "different-home"
+    dsn = "postgresql:///shared-target"
+    held: set[str] = set()
+
+    class Cursor:
+        def __init__(self, acquired):
+            self.acquired = acquired
+
+        def fetchone(self):
+            return (self.acquired,)
+
+    class Connection:
+        def __init__(self, database):
+            self.database = database
+            self.acquired = False
+
+        def execute(self, sql, _params):
+            assert "pg_try_advisory_lock" in sql
+            self.acquired = self.database not in held
+            if self.acquired:
+                held.add(self.database)
+            return Cursor(self.acquired)
+
+        def close(self):
+            if self.acquired:
+                held.remove(self.database)
+
+    monkeypatch.setitem(
+        sys.modules, "psycopg", types.SimpleNamespace(
+            connect=lambda value, **_kwargs: Connection(value)))
+    monkeypatch.setattr(backup, "offline_ownership", ownership.offline_ownership)
+
+    with ownership.database_ownership(dsn, purpose="server"):
+        with pytest.raises(backup.BackupError, match="database is in use"):
+            backup.restore_backup(
+                snapshot, target_dsn=dsn, target_home=target_home)
+
+    assert not target_home.exists()
+    with ownership.home_ownership(target_home, purpose="server"):
+        pass
+
+
+def test_restore_error_releases_home_and_database_ownership(
+        monkeypatch, tmp_path):
+    from memoryd import ownership
+
+    source_home = _home(tmp_path)
+    _prepare(monkeypatch, source_home)
+    snapshot = backup.create_backup(output=tmp_path / "out", home=source_home)
+    target_home = tmp_path / "target"
+    dsn = "postgresql:///release-after-error"
+    held: set[str] = set()
+
+    class Cursor:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __init__(self, database):
+            self.database = database
+            self.acquired = False
+
+        def execute(self, sql, _params=None):
+            if "pg_try_advisory_lock" in sql:
+                self.acquired = self.database not in held
+                if self.acquired:
+                    held.add(self.database)
+                return Cursor((self.acquired,))
+            return Cursor((False,))
+
+        def close(self):
+            if self.acquired:
+                held.remove(self.database)
+
+    monkeypatch.setitem(
+        sys.modules, "psycopg", types.SimpleNamespace(
+            connect=lambda value, **_kwargs: Connection(value)))
+    monkeypatch.setattr(backup, "offline_ownership", ownership.offline_ownership)
+    monkeypatch.setattr(backup, "_target_db_has_tables", lambda _dsn: False)
+    monkeypatch.setattr(
+        backup, "_restore_database",
+        lambda *_args: (_ for _ in ()).throw(backup.BackupError("injected")))
+
+    with pytest.raises(backup.BackupError, match="injected"):
+        backup.restore_backup(
+            snapshot, target_dsn=dsn, target_home=target_home)
+
+    assert held == set()
+    with ownership.offline_ownership(
+            target_home, dsn, purpose="server"):
+        pass
 
 
 def test_restore_command_failure_removes_only_staging_and_warns_db_risk(
