@@ -349,8 +349,12 @@ python scripts/check_hermes_contract.py --source-root /path/to/hermes-agent
 ```
 
 Without `--source-root`, the checker validates the actually installed
-`agent.memory_provider.MemoryProvider`. A mismatch report identifies removed
-methods, abstract-method changes, and required signature changes.
+`agent.memory_provider.MemoryProvider` source found on `sys.path`. Source
+contracts are parsed statically with Python's AST and are never imported or
+executed; plugin instantiation always uses the trusted vendored snapshot. A
+mismatch report identifies removed methods, abstract-method changes, and
+required signature changes. The pinned CI gate also passes
+`--require-pinned-bytes` to require exact source identity.
 
 ## Next: deploy + trial (M6–M8)
 

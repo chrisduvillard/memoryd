@@ -31,7 +31,9 @@ python scripts/check_hermes_contract.py --source-root /path/to/hermes-agent
 ```
 
 Omit `--source-root` to check the actually installed
-`agent.memory_provider.MemoryProvider`.
+`agent.memory_provider.MemoryProvider` source found on `sys.path`. The checker
+parses Hermes source statically and never imports or executes it; the memoryd
+plugin is instantiated only against the trusted vendored contract.
 
 ## Behavior & guarantees
 

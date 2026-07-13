@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import importlib
-import importlib.util
+import ast
 import inspect
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -30,9 +29,34 @@ REQUIRED_METHODS = (
     "get_config_schema",
     "save_config",
 )
+MISSING_DEFAULT = ("missing", "")
+
+
+class ParameterContract(NamedTuple):
+    name: str
+    kind: str
+    default: tuple[str, str]
+
+
+class MethodContract(NamedTuple):
+    parameters: tuple[ParameterContract, ...]
+    abstract: bool
+
+
+def _clean_import_modules() -> None:
+    for name in tuple(sys.modules):
+        if (
+            name == "agent"
+            or name.startswith("agent.")
+            or name == "_memoryd_hermes_contract_plugin"
+            or name.startswith("_hermes_memoryd_spool_")
+        ):
+            sys.modules.pop(name, None)
 
 
 def _load_file(module_name: str, path: Path):
+    import importlib.util
+
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot create an import spec for {path}")
@@ -46,65 +70,127 @@ def _load_file(module_name: str, path: Path):
     return module
 
 
-def _load_source_contract(source_root: Path):
-    provider_path = source_root.resolve() / "agent" / "memory_provider.py"
-    if not provider_path.is_file():
-        raise FileNotFoundError(
-            f"Hermes source root has no agent/memory_provider.py: {source_root}"
+def _default_key(value: Any) -> tuple[str, str]:
+    return (type(value).__qualname__, repr(value))
+
+
+def _ast_default(node: ast.expr | None) -> tuple[str, str]:
+    if node is None:
+        return MISSING_DEFAULT
+    try:
+        return _default_key(ast.literal_eval(node))
+    except (ValueError, TypeError):
+        return ("expression", ast.dump(node, include_attributes=False))
+
+
+def _ast_parameters(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ParameterContract, ...]:
+    args = node.args
+    positional = [*args.posonlyargs, *args.args]
+    first_default = len(positional) - len(args.defaults)
+    parameters: list[ParameterContract] = []
+    for index, parameter in enumerate(positional):
+        default = (
+            MISSING_DEFAULT
+            if index < first_default
+            else _ast_default(args.defaults[index - first_default])
         )
-    agent_package = types.ModuleType("agent")
-    agent_package.__path__ = [str(provider_path.parent)]
-    sys.modules["agent"] = agent_package
-    return _load_file("agent.memory_provider", provider_path), provider_path
+        kind = (
+            "POSITIONAL_ONLY"
+            if index < len(args.posonlyargs)
+            else "POSITIONAL_OR_KEYWORD"
+        )
+        parameters.append(ParameterContract(parameter.arg, kind, default))
+    if args.vararg is not None:
+        parameters.append(
+            ParameterContract(args.vararg.arg, "VAR_POSITIONAL", MISSING_DEFAULT)
+        )
+    for parameter, default_node in zip(args.kwonlyargs, args.kw_defaults):
+        parameters.append(
+            ParameterContract(parameter.arg, "KEYWORD_ONLY", _ast_default(default_node))
+        )
+    if args.kwarg is not None:
+        parameters.append(
+            ParameterContract(args.kwarg.arg, "VAR_KEYWORD", MISSING_DEFAULT)
+        )
+    return tuple(parameters)
 
 
-def _load_installed_contract():
-    module = importlib.import_module("agent.memory_provider")
-    origin = Path(module.__file__).resolve() if module.__file__ else Path("<unknown>")
-    return module, origin
+def _is_abstract(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for decorator in node.decorator_list:
+        name = decorator.id if isinstance(decorator, ast.Name) else None
+        if isinstance(decorator, ast.Attribute):
+            name = decorator.attr
+        if name == "abstractmethod":
+            return True
+    return False
 
 
-def _member_signature(member: Any) -> str | None:
+def _parse_contract(path: Path) -> dict[str, MethodContract]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    provider = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MemoryProvider"
+        ),
+        None,
+    )
+    if provider is None:
+        raise ValueError(f"{path} does not define MemoryProvider")
+    contract: dict[str, MethodContract] = {}
+    for node in provider.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name.startswith("_"):
+            continue
+        contract[node.name] = MethodContract(_ast_parameters(node), _is_abstract(node))
+    return contract
+
+
+def _runtime_parameters(member: Any) -> tuple[ParameterContract, ...] | None:
     if isinstance(member, property):
         member = member.fget
     if not callable(member):
         return None
-    return str(inspect.signature(member, eval_str=False))
+    parameters: list[ParameterContract] = []
+    for parameter in inspect.signature(member, eval_str=False).parameters.values():
+        default = (
+            MISSING_DEFAULT
+            if parameter.default is inspect.Parameter.empty
+            else _default_key(parameter.default)
+        )
+        parameters.append(
+            ParameterContract(parameter.name, parameter.kind.name, default)
+        )
+    return tuple(parameters)
 
 
-def _public_contract(provider_class: type) -> dict[str, tuple[str, bool]]:
-    contract: dict[str, tuple[str, bool]] = {}
-    for name, member in vars(provider_class).items():
-        if name.startswith("_"):
-            continue
-        signature = _member_signature(member)
-        if signature is None:
-            continue
-        contract[name] = (signature, bool(getattr(member, "__isabstractmethod__", False)))
-    return contract
+def _format_parameters(parameters: tuple[ParameterContract, ...]) -> str:
+    return repr([(item.name, item.kind, item.default) for item in parameters])
 
 
-def _compare_contracts(pinned_class: type, checked_class: type) -> list[str]:
+def _compare_contracts(
+    pinned: dict[str, MethodContract], checked: dict[str, MethodContract]
+) -> list[str]:
     errors: list[str] = []
-    pinned = _public_contract(pinned_class)
-    checked = _public_contract(checked_class)
-    for name, (pinned_signature, pinned_abstract) in pinned.items():
-        if name not in checked:
+    for name, pinned_method in pinned.items():
+        checked_method = checked.get(name)
+        if checked_method is None:
             errors.append(f"contract removed public method/property {name}")
             continue
-        checked_signature, checked_abstract = checked[name]
-        if checked_signature != pinned_signature:
+        if checked_method.parameters != pinned_method.parameters:
             errors.append(
-                f"contract signature changed for {name}: pinned {pinned_signature}; "
-                f"checked {checked_signature}"
+                f"contract signature changed for {name}: pinned "
+                f"{_format_parameters(pinned_method.parameters)}; checked "
+                f"{_format_parameters(checked_method.parameters)}"
             )
-        if checked_abstract != pinned_abstract:
+        if checked_method.abstract != pinned_method.abstract:
             errors.append(
                 f"contract abstract status changed for {name}: "
-                f"pinned={pinned_abstract}, checked={checked_abstract}"
+                f"pinned={pinned_method.abstract}, checked={checked_method.abstract}"
             )
-    pinned_abstracts = set(pinned_class.__abstractmethods__)
-    checked_abstracts = set(checked_class.__abstractmethods__)
+    pinned_abstracts = {name for name, method in pinned.items() if method.abstract}
+    checked_abstracts = {name for name, method in checked.items() if method.abstract}
     for name in sorted(checked_abstracts - pinned_abstracts):
         errors.append(f"contract added abstract method/property {name}")
     for name in sorted(pinned_abstracts - checked_abstracts):
@@ -112,15 +198,25 @@ def _compare_contracts(pinned_class: type, checked_class: type) -> list[str]:
     return errors
 
 
-def _validate_plugin(checked_class: type, plugin_path: Path) -> list[str]:
+def _load_plugin_against_pinned(plugin_path: Path):
+    agent_package = types.ModuleType("agent")
+    agent_package.__path__ = [str(PINNED_CONTRACT.parent)]
+    sys.modules["agent"] = agent_package
+    pinned_module = _load_file("agent.memory_provider", PINNED_CONTRACT)
+    plugin = _load_file("_memoryd_hermes_contract_plugin", plugin_path.resolve())
+    return pinned_module.MemoryProvider, plugin
+
+
+def _validate_plugin(
+    checked: dict[str, MethodContract], plugin_path: Path
+) -> list[str]:
     errors: list[str] = []
     daemon_before = sys.modules.get("memoryd")
-    module_name = "_memoryd_hermes_contract_plugin"
-    sys.modules.pop(module_name, None)
     plugin = None
+    pinned_class = None
     import_error = None
     try:
-        plugin = _load_file(module_name, plugin_path.resolve())
+        pinned_class, plugin = _load_plugin_against_pinned(plugin_path)
     except Exception as exc:
         import_error = exc
     finally:
@@ -134,12 +230,12 @@ def _validate_plugin(checked_class: type, plugin_path: Path) -> list[str]:
         return errors + [
             f"memoryd plugin import failed: {type(import_error).__name__}: {import_error}"
         ]
-    assert plugin is not None
+    assert pinned_class is not None and plugin is not None
     provider_class = getattr(plugin, "MemorydProvider", None)
     if not inspect.isclass(provider_class):
         return errors + ["memoryd plugin does not export MemorydProvider"]
-    if not issubclass(provider_class, checked_class):
-        errors.append("MemorydProvider is not a subclass of the checked MemoryProvider")
+    if not issubclass(provider_class, pinned_class):
+        errors.append("MemorydProvider is not a subclass of pinned MemoryProvider")
     remaining = sorted(provider_class.__abstractmethods__)
     if remaining:
         errors.append(f"MemorydProvider has unimplemented abstract methods: {remaining}")
@@ -148,22 +244,24 @@ def _validate_plugin(checked_class: type, plugin_path: Path) -> list[str]:
     except TypeError as exc:
         errors.append(f"MemorydProvider is not instantiable: {exc}")
         return errors
+    for name, checked_method in checked.items():
+        override = vars(provider_class).get(name)
+        if override is None:
+            if checked_method.abstract:
+                errors.append(f"MemorydProvider does not override abstract method {name}")
+            continue
+        actual = _runtime_parameters(override)
+        if actual != checked_method.parameters:
+            errors.append(
+                f"MemorydProvider signature mismatch for {name}: contract "
+                f"{_format_parameters(checked_method.parameters)}; plugin "
+                f"{_format_parameters(actual or ())}"
+            )
     if not isinstance(provider.name, str) or not provider.name:
         errors.append("MemorydProvider.name must be a non-empty string")
     for name in REQUIRED_METHODS:
-        member = getattr(provider, name, None)
-        if not callable(member):
+        if not callable(getattr(provider, name, None)):
             errors.append(f"MemorydProvider lifecycle/config/tool method {name} is missing")
-            continue
-        base_member = inspect.getattr_static(checked_class, name, None)
-        plugin_member = inspect.getattr_static(provider_class, name, None)
-        expected = _member_signature(base_member)
-        actual = _member_signature(plugin_member)
-        if expected != actual:
-            errors.append(
-                f"MemorydProvider signature mismatch for {name}: "
-                f"contract {expected}; plugin {actual}"
-            )
     schemas = provider.get_tool_schemas()
     if not isinstance(schemas, list) or any(not isinstance(item, dict) for item in schemas):
         errors.append("MemorydProvider.get_tool_schemas() must return a list of objects")
@@ -179,42 +277,46 @@ def _validate_plugin(checked_class: type, plugin_path: Path) -> list[str]:
     return errors
 
 
+def _installed_contract_path() -> Path:
+    for entry in sys.path:
+        root = Path(entry or ".").resolve()
+        candidate = root / "agent" / "memory_provider.py"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "cannot locate installed agent/memory_provider.py on sys.path"
+    )
+
+
 def check_contract(
-    source_root: Path | None = None, *, plugin_path: Path = PLUGIN_PATH
+    source_root: Path | None = None,
+    *,
+    plugin_path: Path = PLUGIN_PATH,
+    require_pinned_bytes: bool = False,
 ) -> list[str]:
-    saved_agent = sys.modules.get("agent")
-    saved_provider = sys.modules.get("agent.memory_provider")
-    saved_spool_modules = {
-        name for name in sys.modules if name.startswith("_hermes_memoryd_spool_")
-    }
+    _clean_import_modules()
     try:
-        pinned_module = _load_file("_memoryd_pinned_hermes_contract", PINNED_CONTRACT)
-        if source_root is None:
-            checked_module, _ = _load_installed_contract()
-        else:
-            sys.modules.pop("agent.memory_provider", None)
-            sys.modules.pop("agent", None)
-            checked_module, _ = _load_source_contract(source_root)
-        pinned_class = pinned_module.MemoryProvider
-        checked_class = checked_module.MemoryProvider
-        errors = _compare_contracts(pinned_class, checked_class)
-        errors.extend(_validate_plugin(checked_class, plugin_path))
+        checked_path = (
+            source_root.resolve() / "agent" / "memory_provider.py"
+            if source_root is not None
+            else _installed_contract_path()
+        )
+        if not checked_path.is_file():
+            raise FileNotFoundError(
+                f"Hermes source root has no agent/memory_provider.py: {source_root}"
+            )
+        errors: list[str] = []
+        if require_pinned_bytes and checked_path.read_bytes() != PINNED_CONTRACT.read_bytes():
+            errors.append(
+                "pinned byte identity mismatch for agent/memory_provider.py"
+            )
+        pinned = _parse_contract(PINNED_CONTRACT)
+        checked = _parse_contract(checked_path)
+        errors.extend(_compare_contracts(pinned, checked))
+        errors.extend(_validate_plugin(checked, plugin_path))
         return errors
     finally:
-        sys.modules.pop("_memoryd_pinned_hermes_contract", None)
-        sys.modules.pop("_memoryd_hermes_contract_plugin", None)
-        for name in tuple(sys.modules):
-            if (
-                name.startswith("_hermes_memoryd_spool_")
-                and name not in saved_spool_modules
-            ):
-                sys.modules.pop(name, None)
-        sys.modules.pop("agent.memory_provider", None)
-        sys.modules.pop("agent", None)
-        if saved_agent is not None:
-            sys.modules["agent"] = saved_agent
-        if saved_provider is not None:
-            sys.modules["agent.memory_provider"] = saved_provider
+        _clean_import_modules()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -222,7 +324,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-root",
         type=Path,
-        help="Hermes Agent checkout root; default checks installed agent.memory_provider",
+        help="Hermes Agent checkout root; default checks installed source on sys.path",
+    )
+    parser.add_argument(
+        "--require-pinned-bytes",
+        action="store_true",
+        help="also require source agent/memory_provider.py to byte-match the pin",
     )
     return parser.parse_args()
 
@@ -232,7 +339,7 @@ def main() -> int:
     checked = (
         args.source_root.resolve() / "agent" / "memory_provider.py"
         if args.source_root
-        else "installed agent.memory_provider"
+        else "installed agent.memory_provider source"
     )
     print(
         f"Pinned Hermes contract: tag {PINNED_TAG}, commit {PINNED_COMMIT}, "
@@ -240,7 +347,9 @@ def main() -> int:
     )
     print(f"Checked Hermes contract: {checked}")
     try:
-        errors = check_contract(args.source_root)
+        errors = check_contract(
+            args.source_root, require_pinned_bytes=args.require_pinned_bytes
+        )
     except Exception as exc:
         print(f"INCOMPATIBLE: contract check could not run: {type(exc).__name__}: {exc}")
         return 1
