@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -238,6 +239,27 @@ def test_release_metadata_and_live_guides_agree_on_v031() -> None:
         assert "0.3." + "0" not in source, path.relative_to(REPO)
 
 
+def _git_tracked_files(repo: Path) -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "ls-files", "-z", "--"],
+            check=False,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise AssertionError(f"cannot enumerate Git-tracked files: {exc}") from exc
+    if result.returncode != 0:
+        detail = os.fsdecode(result.stderr).strip() or "no error output"
+        raise AssertionError(
+            f"git ls-files failed with exit {result.returncode}: {detail}"
+        )
+    return [
+        repo / os.fsdecode(relative)
+        for relative in result.stdout.split(b"\0")
+        if relative
+    ]
+
+
 def test_stale_release_references_are_historical_only() -> None:
     stale = "0.3." + "0"
     unexpected: list[str] = []
@@ -245,7 +267,7 @@ def test_stale_release_references_are_historical_only() -> None:
         ".json", ".md", ".ps1", ".py", ".sh", ".sql", ".toml", ".txt",
         ".yaml", ".yml",
     }
-    for path in REPO.rglob("*"):
+    for path in _git_tracked_files(REPO):
         relative = path.relative_to(REPO)
         if any(
             part in {".git", ".superpowers", ".venv", "__pycache__", "dist"}
@@ -266,6 +288,47 @@ def test_stale_release_references_are_historical_only() -> None:
         if stale in source:
             unexpected.append(relative_text)
     assert unexpected == []
+
+
+def _release_guard_repo(tmp_path: Path, tracked_source: str) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tracked = repo / "tracked.py"
+    tracked.write_text(tracked_source, encoding="utf-8")
+    subprocess.run(
+        ["git", "init", "--quiet", str(repo)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "tracked.py"],
+        check=True,
+        capture_output=True,
+    )
+    return repo
+
+
+def test_stale_release_guard_ignores_untracked_generated_files(
+        monkeypatch, tmp_path: Path) -> None:
+    repo = _release_guard_repo(tmp_path, "VERSION = '0.3.1'\n")
+    generated = repo / "_hermes-agent" / "dependency.py"
+    generated.parent.mkdir()
+    generated.write_text(
+        "VERSION = '" + "0.3." + "0'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "REPO", repo)
+
+    test_stale_release_references_are_historical_only()
+
+
+def test_stale_release_guard_still_rejects_tracked_stale_files(
+        monkeypatch, tmp_path: Path) -> None:
+    repo = _release_guard_repo(tmp_path, "VERSION = '" + "0.3." + "0'\n")
+    monkeypatch.setattr(sys.modules[__name__], "REPO", repo)
+
+    with pytest.raises(AssertionError, match="tracked.py"):
+        test_stale_release_references_are_historical_only()
 
 
 def test_guided_quickstart_is_immutable_and_primary() -> None:
