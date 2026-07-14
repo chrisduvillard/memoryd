@@ -323,18 +323,20 @@ def test_named_profile_root_requires_owner_only_mode_with_safe_remediation(
     assert stat.S_IMODE(root.stat().st_mode) == 0o755
 
 
-@pytest.mark.parametrize("control", ["\n", "\r", "\x1f", "\x7f"])
-def test_hermes_home_rejects_control_characters_without_echoing_path(
-    tmp_path: Path, control: str,
+@pytest.mark.parametrize(
+    "unsafe_character", ["\n", "\r", "\x1f", "\x7f", "\u2028", "\u2029"],
+)
+def test_hermes_home_rejects_line_controls_without_echoing_path(
+    tmp_path: Path, unsafe_character: str,
 ) -> None:
-    configured = tmp_path / f"Hermes-{control}-SENSITIVE"
+    configured = tmp_path / f"Hermes-{unsafe_character}-SENSITIVE"
 
     with pytest.raises(HermesCompatibilityError, match="control") as exc_info:
         resolve_hermes_home({"HERMES_HOME": os.fspath(configured)})
 
     message = str(exc_info.value)
     assert "SENSITIVE" not in message
-    assert control not in message
+    assert unsafe_character not in message
     assert "\n" not in message
     assert "\r" not in message
 

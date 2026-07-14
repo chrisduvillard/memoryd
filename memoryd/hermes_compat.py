@@ -63,10 +63,12 @@ def _error(message: str) -> HermesCompatibilityError:
 
 def _canonical_absolute(path: Path, description: str) -> Path:
     if any(
-        unicodedata.category(character) == "Cc"
+        unicodedata.category(character) in ("Cc", "Zl", "Zp")
         for character in os.fspath(path)
     ):
-        raise _error(f"{description} must not contain control characters")
+        raise _error(
+            f"{description} must not contain control or line-separator characters"
+        )
     if not path.is_absolute():
         raise _error(f"{description} must be absolute")
     current = Path(path.anchor)

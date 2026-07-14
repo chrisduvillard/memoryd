@@ -446,14 +446,15 @@ def test_each_pre_mutation_failure_stops_without_core_or_activation(
     assert current == previous
 
 
-def test_control_character_hermes_home_has_safe_one_line_guided_error(
-    monkeypatch, tmp_path, capsys,
+@pytest.mark.parametrize("separator", ["\n", "\u2028", "\u2029"])
+def test_unicode_line_separator_hermes_home_has_safe_one_line_guided_error(
+    monkeypatch, tmp_path, capsys, separator,
 ):
     resolve_target = hermes.resolve_guided_hermes_target
     events, _target, _snapshot, previous, current = _workflow(monkeypatch, tmp_path)
-    monkeypatch.setenv(
-        "HERMES_HOME", os.fspath(tmp_path / "Hermes\nSENSITIVE-root"),
-    )
+    configured = tmp_path / f"Hermes{separator}SENSITIVE-root"
+    configured.mkdir(mode=0o755)
+    monkeypatch.setenv("HERMES_HOME", os.fspath(configured))
     monkeypatch.setattr(compat.platform, "system", lambda: "Linux")
     monkeypatch.setattr(
         hermes, "resolve_guided_hermes_target", resolve_target,
@@ -468,6 +469,7 @@ def test_control_character_hermes_home_has_safe_one_line_guided_error(
     assert output.err.count("\n") == 1
     assert "control" in output.err
     assert "SENSITIVE" not in output.err
+    assert separator not in output.err.removesuffix("\n")
     assert current == previous
 
 
