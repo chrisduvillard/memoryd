@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import stat
 import subprocess
@@ -302,19 +303,23 @@ def test_owned_descendant_validator_rejects_wrong_owner(
         compat._validate_owned_directory(profile, "Selected Hermes profile")
 
 
+@pytest.mark.parametrize("configured_form", ["root", "profile"])
 def test_named_profile_root_requires_owner_only_mode_with_safe_remediation(
-    tmp_path: Path,
+    tmp_path: Path, configured_form: str,
 ) -> None:
-    root = _mkdir(tmp_path / ".hermes")
+    root = _mkdir(tmp_path / "Hermes root's private")
     profiles = _mkdir(root / "profiles", mode=0o755)
-    _mkdir(profiles / "work", mode=0o755)
+    profile = _mkdir(profiles / "work", mode=0o755)
     _write_active_profile(root, "work", mode=0o644)
     root.chmod(0o755)
+    configured = root if configured_form == "root" else profile
 
     with pytest.raises(HermesCompatibilityError) as exc_info:
-        resolve_hermes_home({"HERMES_HOME": str(root)})
+        resolve_hermes_home({"HERMES_HOME": str(configured)})
 
-    assert 'chmod 700 "$HERMES_HOME"' in str(exc_info.value)
+    expected = shlex.join(["chmod", "700", "--", os.fspath(root)])
+    assert expected in str(exc_info.value)
+    assert os.fspath(profile) not in expected
     assert stat.S_IMODE(root.stat().st_mode) == 0o755
 
 

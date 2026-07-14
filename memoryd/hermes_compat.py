@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -118,8 +119,9 @@ def _validate_private_directory(path: Path, description: str) -> None:
         raise _error(f"{description} does not exist as a directory")
     if stat.S_IMODE(value.st_mode) != 0o700:
         if description == "Hermes root":
+            remediation = shlex.join(["chmod", "700", "--", os.fspath(path)])
             raise _error(
-                'Hermes root must have mode 0700. Run: chmod 700 "$HERMES_HOME"'
+                f"Hermes root must have mode 0700. Run: {remediation}"
             )
         raise _error(f"{description} must have mode 0700")
 

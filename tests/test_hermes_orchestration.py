@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import signal
+import subprocess
 from pathlib import Path
 import pytest
 
@@ -300,6 +303,108 @@ def test_guided_install_composes_exact_order_and_reports_success_without_secrets
     assert OPENROUTER_SECRET not in output.out
     assert VOYAGE_SECRET not in output.out
     assert current == previous
+
+
+@pytest.mark.parametrize("root_marker", ["other", "../invalid-profile"])
+def test_full_orchestration_keeps_explicit_profile_authoritative(
+    monkeypatch, tmp_path, capsys, root_marker,
+):
+    resolve_target = hermes.resolve_guided_hermes_target
+    activation_transaction = hermes._activation_transaction
+    events, target, snapshot, previous, current = _workflow(monkeypatch, tmp_path)
+    target.home.mkdir(parents=True, mode=0o755)
+    target.root.chmod(0o700)
+    (target.root / "profiles").chmod(0o755)
+    other = target.root / "profiles" / "other"
+    other.mkdir(mode=0o755)
+    other_marker = other / "must-not-change"
+    other_marker.write_bytes(b"other profile evidence")
+    (target.root / "active_profile").write_text(root_marker, encoding="utf-8")
+    os.chmod(target.root / "active_profile", 0o644)
+    monkeypatch.setenv("HOME", os.fspath(tmp_path / "hostile-home"))
+    monkeypatch.setenv("HERMES_HOME", os.fspath(target.home))
+    monkeypatch.setenv("MEMORYD_DSN", "postgresql://HOSTILE.invalid/redirect")
+    monkeypatch.setenv("MEMORYD_PORT", "65530")
+    ambient = {
+        name: os.environ.get(name)
+        for name in ("HOME", "HERMES_HOME", "MEMORYD_HOME", "MEMORYD_DSN", "MEMORYD_PORT")
+    }
+
+    (target.home / "config.yaml").write_text(
+        "memory:\n  provider: legacy\n", encoding="utf-8",
+    )
+    os.chmod(target.home / "config.yaml", 0o600)
+    (target.home / "memoryd.json").write_text(
+        json.dumps({"url": "http://127.0.0.1:7437"}), encoding="utf-8",
+    )
+    os.chmod(target.home / "memoryd.json", 0o600)
+    spool = target.home / "spool" / "memoryd"
+    for name in ("incoming", "processing", "dead-letter"):
+        (spool / name).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(hermes, "resolve_guided_hermes_target", resolve_target)
+    monkeypatch.setattr(hermes, "_activation_transaction", activation_transaction)
+    monkeypatch.setattr(compat.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(compat, "_resolve_command", lambda: target.executable)
+    monkeypatch.setattr(compat, "_resolve_python", lambda _command: target.python)
+    monkeypatch.setattr(
+        compat, "_query_version", lambda _python: compat.PINNED_HERMES_VERSION,
+    )
+    monkeypatch.setattr(compat, "_validate_console_origin", lambda *_args: None)
+
+    runtime = {"provider": "legacy", "gateway": False}
+    subprocess_environments: list[dict[str, str]] = []
+    hermes_commands: list[list[str]] = []
+
+    def run(command, **kwargs):
+        command = [os.fspath(part) for part in command]
+        environment = kwargs["env"]
+        assert environment["HERMES_HOME"] == os.fspath(target.home)
+        assert "MEMORYD_DSN" not in environment
+        assert "MEMORYD_PORT" not in environment
+        subprocess_environments.append(dict(environment))
+        if command[0] == os.fspath(target.python):
+            if "get_gateway_runtime_snapshot" in command[-1]:
+                return subprocess.CompletedProcess(
+                    command, 0 if runtime["gateway"] else 1, "", "",
+                )
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(runtime["provider"]) + "\n", "",
+            )
+
+        arguments = command[1:]
+        hermes_commands.append(arguments)
+        if arguments == ["config", "set", "memory.provider", "memoryd"]:
+            runtime["provider"] = "memoryd"
+            events.append("activation")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    def status() -> int:
+        assert os.environ["HERMES_HOME"] == os.fspath(target.home)
+        assert "MEMORYD_DSN" not in os.environ
+        assert "MEMORYD_PORT" not in os.environ
+        events.append("memoryd status")
+        return 0
+
+    monkeypatch.setattr(hermes.subprocess, "run", run)
+    monkeypatch.setattr(hermes.cli, "status", status)
+
+    assert hermes.guided_hermes_install() == 0
+
+    assert other_marker.read_bytes() == b"other profile evidence"
+    assert {name: os.environ.get(name) for name in ambient} == ambient
+    assert current == previous
+    assert events[-3:] == ["core install", "activation", "memoryd status"]
+    assert ["memory", "status"] in hermes_commands
+    assert ["memoryd", "config"] in hermes_commands
+    assert ["memoryd", "status"] in hermes_commands
+    assert subprocess_environments
+    assert {
+        environment["HERMES_HOME"] for environment in subprocess_environments
+    } == {os.fspath(target.home)}
+    output = capsys.readouterr()
+    assert os.fspath(target.home) in output.out
+    assert output.err == ""
 
 
 @pytest.mark.parametrize(

@@ -47,8 +47,10 @@ The authoritative profile comes from `$HERMES_HOME` and Hermes's
 `active_profile` marker. An explicit `.../profiles/<name>` path wins. Otherwise
 an absent marker or literal `default` selects the root; a valid named marker
 selects `$HERMES_HOME/profiles/<name>`. The authoritative root itself must be
-owned by the effective user and mode `0700`; if it is too broad, run
-`chmod 700 "$HERMES_HOME"` and retry. Inside that private root, the installer
+owned by the effective user and mode `0700`; if it is too broad, use the exact
+shell-quoted `chmod 700 -- <resolved-root>` command in the error and retry. The
+resolved root can differ from `$HERMES_HOME` when it names a profile. Inside
+that private root, the installer
 accepts the owned, non-group/other-writable `0755` profile directories and
 `0644` `active_profile` marker created by Hermes 0.16.0. Symlinks, special
 files, wrong owners, writable descendants, invalid or multiline names,

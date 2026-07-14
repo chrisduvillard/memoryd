@@ -2187,20 +2187,92 @@ def test_core_install_requires_daemon_restart_health_after_verified_backup(
         hermes.install_hermes_core(target, credentials)
 
 
-@pytest.mark.parametrize("change", ["identity", "mode"])
-def test_core_install_revalidates_authoritative_profile_before_first_mutation(
-    monkeypatch, tmp_path, change,
+def test_core_install_revalidates_unsafe_authoritative_profile_before_first_mutation(
+    monkeypatch, tmp_path,
 ):
     target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
-    if change == "identity":
-        other = target.root / "profiles" / "other"
-        other.mkdir()
-        os.chmod(other, 0o700)
-        (target.root / "active_profile").write_text("other", encoding="utf-8")
-    else:
-        os.chmod(target.home, 0o777)
+    os.chmod(target.home, 0o777)
     monkeypatch.setattr(
         cli, "install", lambda _options: pytest.fail("mutation started before revalidation"))
 
     with pytest.raises(hermes.HermesInstallError, match="revalid|profile|target"):
         hermes.install_hermes_core(target, credentials)
+
+
+def test_core_install_refuses_changed_explicit_target_before_first_mutation(
+    monkeypatch, tmp_path,
+):
+    target, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    replacement = target.root / "profiles" / "replacement"
+    replacement.mkdir(mode=0o755)
+    evidence = target.home / "must-not-change"
+    evidence.write_bytes(b"selected profile evidence")
+
+    def changed_target() -> tuple[Path, Path]:
+        assert os.environ["HERMES_HOME"] == os.fspath(target.home)
+        return target.root, replacement
+
+    monkeypatch.setattr(
+        hermes,
+        "resolve_guided_hermes_home",
+        changed_target,
+    )
+    monkeypatch.setattr(
+        cli, "install", lambda _options: pytest.fail("mutation started after target changed"))
+
+    with pytest.raises(hermes.HermesInstallError, match="changed|revalidation"):
+        hermes.install_hermes_core(target, credentials)
+
+    assert evidence.read_bytes() == b"selected profile evidence"
+
+
+@pytest.mark.parametrize("root_marker", ["other", "../invalid-profile"])
+def test_core_revalidation_pins_explicit_profile_authority_and_restores_ambient(
+    monkeypatch, tmp_path, root_marker,
+):
+    target, memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    other = target.root / "profiles" / "other"
+    other.mkdir(mode=0o755)
+    other_marker = other / "must-not-change"
+    other_marker.write_bytes(b"other profile evidence")
+    (target.root / "active_profile").write_text(root_marker, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", os.fspath(target.home))
+    monkeypatch.setenv("MEMORYD_DSN", "postgresql://HOSTILE.invalid/redirect")
+    monkeypatch.setenv("MEMORYD_PORT", "65530")
+    ambient = {
+        name: os.environ.get(name)
+        for name in ("HOME", "HERMES_HOME", "MEMORYD_HOME", "MEMORYD_DSN", "MEMORYD_PORT")
+    }
+    snapshot = tmp_path / "backups" / "explicit-profile-v1"
+    listings = iter(([], [_backup_row(snapshot)]))
+    observed: list[tuple[Path, str, str]] = []
+
+    def install(options):
+        observed.append((
+            options.hermes_home,
+            os.environ["HERMES_HOME"],
+            os.environ["MEMORYD_HOME"],
+        ))
+        assert "MEMORYD_DSN" not in os.environ
+        assert "MEMORYD_PORT" not in os.environ
+        return 0
+
+    monkeypatch.setattr(cli, "install", install)
+    monkeypatch.setattr(hermes, "publish_guided_plugin", lambda actual: (
+        observed.append((actual.home, os.environ["HERMES_HOME"], os.environ["MEMORYD_HOME"]))
+    ))
+    monkeypatch.setattr(backup, "list_backups", lambda: next(listings))
+    monkeypatch.setattr(cli, "_run", lambda _command, timeout=120: (0, ""))
+    monkeypatch.setattr(backup, "verify_snapshot", lambda _path: backup.Verification(True))
+    monkeypatch.setattr(cli, "_wait_for_healthy_daemon", lambda: True, raising=False)
+
+    assert hermes.install_hermes_core(target, credentials) == snapshot
+
+    assert observed == [
+        (target.home, os.fspath(target.home), os.fspath(memory_home)),
+        (target.home, os.fspath(target.home), os.fspath(memory_home)),
+    ]
+    assert other_marker.read_bytes() == b"other profile evidence"
+    assert {
+        name: os.environ.get(name) for name in ambient
+    } == ambient

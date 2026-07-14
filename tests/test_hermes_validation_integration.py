@@ -33,8 +33,9 @@ def _target_python() -> Path:
     return target
 
 
-def test_packaged_preflight_runs_against_distinct_pinned_hermes(
-    tmp_path: Path,
+@pytest.mark.parametrize("root_marker", ["other", "../invalid-profile"])
+def test_packaged_preflight_runs_against_distinct_pinned_explicit_profile(
+    tmp_path: Path, root_marker: str,
 ) -> None:
     target_python = _target_python()
     probe = subprocess.run(
@@ -78,6 +79,11 @@ def test_packaged_preflight_runs_against_distinct_pinned_hermes(
     assert (root / "profiles").stat().st_mode & 0o777 == 0o755
     assert home.stat().st_mode & 0o777 == 0o755
     assert (root / "active_profile").stat().st_mode & 0o777 == 0o644
+    other = root / "profiles" / "other"
+    other.mkdir(mode=0o755)
+    (other / "must-not-change").write_bytes(b"other profile evidence")
+    (root / "active_profile").write_text(root_marker, encoding="utf-8")
+    os.chmod(root / "active_profile", 0o644)
     (home / "sentinel.json").write_text(
         '{"authoritative": true}\n', encoding="utf-8"
     )
@@ -86,7 +92,7 @@ def test_packaged_preflight_runs_against_distinct_pinned_hermes(
     previous_path = os.environ.get("PATH", "")
     os.environ["PATH"] = os.pathsep.join((os.fspath(target_python.parent), previous_path))
     try:
-        resolved = resolve_hermes_target({"HERMES_HOME": os.fspath(root)})
+        resolved = resolve_hermes_target({"HERMES_HOME": os.fspath(home)})
     finally:
         os.environ["PATH"] = previous_path
     assert resolved == HermesTarget(
