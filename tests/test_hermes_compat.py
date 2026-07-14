@@ -70,6 +70,55 @@ def _assert_safe_error(exc_info: pytest.ExceptionInfo[HermesCompatibilityError])
     return message
 
 
+def _mock_console_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scripts: Path,
+    entry_point: str | None = "hermes_cli.main:main",
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {"entry_point": entry_point, "scripts": os.fspath(scripts)}
+            )
+            + "\n",
+            stderr="",
+        ),
+    )
+
+
+UV_CONSOLE_BODY = """# -*- coding: utf-8 -*-
+import sys
+from hermes_cli.main import main
+if __name__ == "__main__":
+    if sys.argv[0].endswith("-script.pyw"):
+        sys.argv[0] = sys.argv[0][:-11]
+    elif sys.argv[0].endswith(".exe"):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(main())
+"""
+
+PIP_LEGACY_CONSOLE_BODY = """# -*- coding: utf-8 -*-
+import re
+import sys
+from hermes_cli.main import main
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])
+    sys.exit(main())
+"""
+
+PIP_CURRENT_CONSOLE_BODY = """import sys
+from hermes_cli.main import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
+"""
+
+
 def test_pinned_interface_and_frozen_target() -> None:
     assert PINNED_HERMES_VERSION == "0.16.0"
     assert PINNED_HERMES_TAG == "v2026.6.5"
@@ -654,6 +703,97 @@ def test_console_origin_rejects_tampered_script_at_runtime_entry_path(
             stderr="",
         ),
     )
+
+    with pytest.raises(HermesCompatibilityError, match="content|console|entry"):
+        compat._validate_console_origin(console, python)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        UV_CONSOLE_BODY,
+        PIP_LEGACY_CONSOLE_BODY,
+        PIP_CURRENT_CONSOLE_BODY,
+        PIP_CURRENT_CONSOLE_BODY.replace("'__main__'", '"__main__"')
+        + "# installer-generated wrapper\n",
+    ],
+    ids=["uv", "pip-legacy", "pip-current", "equivalent-formatting"],
+)
+def test_console_origin_accepts_known_safe_installer_wrappers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str,
+) -> None:
+    python = _python_interpreter(tmp_path)
+    console = _write_executable(
+        python.parent / "hermes", f"#!{python}\n{body}",
+    )
+    _mock_console_metadata(monkeypatch, scripts=python.parent)
+
+    compat._validate_console_origin(console, python)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        PIP_CURRENT_CONSOLE_BODY.replace("import sys\n", "import os\nimport sys\n"),
+        PIP_CURRENT_CONSOLE_BODY + "print('unexpected side effect')\n",
+        PIP_CURRENT_CONSOLE_BODY + "main()\n",
+    ],
+    ids=["extra-import", "extra-statement", "extra-call"],
+)
+def test_console_origin_rejects_extra_wrapper_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str,
+) -> None:
+    python = _python_interpreter(tmp_path)
+    console = _write_executable(
+        python.parent / "hermes", f"#!{python}\n{body}",
+    )
+    _mock_console_metadata(monkeypatch, scripts=python.parent)
+
+    with pytest.raises(HermesCompatibilityError, match="content|console|entry"):
+        compat._validate_console_origin(console, python)
+
+
+def test_console_origin_rejects_wrong_entry_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = _python_interpreter(tmp_path)
+    console = _write_executable(
+        python.parent / "hermes", f"#!{python}\n{PIP_CURRENT_CONSOLE_BODY}",
+    )
+    _mock_console_metadata(
+        monkeypatch, scripts=python.parent, entry_point="hostile.module:main",
+    )
+
+    with pytest.raises(HermesCompatibilityError, match="entry point"):
+        compat._validate_console_origin(console, python)
+
+
+def test_console_origin_rejects_wrong_scripts_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = _python_interpreter(tmp_path)
+    console = _write_executable(
+        python.parent / "hermes", f"#!{python}\n{PIP_CURRENT_CONSOLE_BODY}",
+    )
+    other_scripts = _mkdir(tmp_path / "other-bin")
+    _write_executable(
+        other_scripts / "hermes", f"#!{python}\n{PIP_CURRENT_CONSOLE_BODY}",
+    )
+    _mock_console_metadata(monkeypatch, scripts=other_scripts)
+
+    with pytest.raises(HermesCompatibilityError, match="shadow wrapper"):
+        compat._validate_console_origin(console, python)
+
+
+def test_console_origin_rejects_wrong_shebang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = _python_interpreter(tmp_path)
+    console = _write_executable(
+        python.parent / "hermes",
+        f"#!/other/python\n{PIP_CURRENT_CONSOLE_BODY}",
+    )
+    _mock_console_metadata(monkeypatch, scripts=python.parent)
 
     with pytest.raises(HermesCompatibilityError, match="content|console|entry"):
         compat._validate_console_origin(console, python)

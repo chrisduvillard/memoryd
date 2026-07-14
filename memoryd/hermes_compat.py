@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
@@ -27,7 +28,7 @@ PINNED_HERMES_COMMIT = "3c231eb3979ab9c57d5cd6d02f1d577a3b718b43"
 
 _PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _CONSOLE_ENTRY_POINT = "hermes_cli.main:main"
-_CONSOLE_BODY = """# -*- coding: utf-8 -*-
+_UV_CONSOLE_BODY = """# -*- coding: utf-8 -*-
 import sys
 from hermes_cli.main import main
 if __name__ == "__main__":
@@ -37,6 +38,28 @@ if __name__ == "__main__":
         sys.argv[0] = sys.argv[0][:-4]
     sys.exit(main())
 """
+_PIP_LEGACY_CONSOLE_BODY = """# -*- coding: utf-8 -*-
+import re
+import sys
+from hermes_cli.main import main
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])
+    sys.exit(main())
+"""
+_PIP_CURRENT_CONSOLE_BODY = """import sys
+from hermes_cli.main import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
+"""
+_SAFE_CONSOLE_SIGNATURES = frozenset(
+    ast.dump(ast.parse(body), include_attributes=False)
+    for body in (
+        _UV_CONSOLE_BODY,
+        _PIP_LEGACY_CONSOLE_BODY,
+        _PIP_CURRENT_CONSOLE_BODY,
+    )
+)
 _REMEDIATION = (
     "pipx install --force --python python3.13 "
     "'git+https://github.com/NousResearch/hermes-agent.git@"
@@ -334,7 +357,18 @@ def _validate_console_origin(executable: Path, python: Path) -> None:
         content = executable.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         raise _error("Could not inspect the Hermes console entry point content") from None
-    if content != f"#!{python}\n{_CONSOLE_BODY}":
+    shebang = f"#!{python}\n"
+    if not content.startswith(shebang):
+        raise _error("The Hermes console entry point content is not the pinned safe wrapper")
+    try:
+        signature = ast.dump(
+            ast.parse(content[len(shebang):]), include_attributes=False,
+        )
+    except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError):
+        raise _error(
+            "The Hermes console entry point content is not the pinned safe wrapper"
+        ) from None
+    if signature not in _SAFE_CONSOLE_SIGNATURES:
         raise _error("The Hermes console entry point content is not the pinned safe wrapper")
 
 
