@@ -731,6 +731,23 @@ def test_console_origin_accepts_known_safe_installer_wrappers(
     compat._validate_console_origin(console, python)
 
 
+def test_console_origin_accepts_unicode_interpreter_path_and_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = _write_executable(
+        tmp_path / "interpréteur-雪" / "python3.13", "",
+    )
+    console = python.parent / "hermes"
+    body = PIP_CURRENT_CONSOLE_BODY + "# généré pour mémoire — 雪\n"
+    console.write_bytes(
+        b"#!" + os.fsencode(python) + b"\n" + body.encode("utf-8")
+    )
+    console.chmod(0o755)
+    _mock_console_metadata(monkeypatch, scripts=python.parent)
+
+    compat._validate_console_origin(console, python)
+
+
 @pytest.mark.parametrize(
     "body",
     [
