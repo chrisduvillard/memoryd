@@ -117,11 +117,29 @@ def _validate_private_directory(path: Path, description: str) -> None:
     if not stat.S_ISDIR(value.st_mode):
         raise _error(f"{description} does not exist as a directory")
     if stat.S_IMODE(value.st_mode) != 0o700:
+        if description == "Hermes root":
+            raise _error(
+                'Hermes root must have mode 0700. Run: chmod 700 "$HERMES_HOME"'
+            )
         raise _error(f"{description} must have mode 0700")
 
 
+def _validate_owned_directory(path: Path, description: str) -> None:
+    """Accept Hermes-owned descendants protected by the private root."""
+    try:
+        value = _stable_path_stat(path, description)
+    except HermesCompatibilityError as error:
+        if not path.exists():
+            raise _error(f"{description} does not exist as a directory") from None
+        raise error
+    if not stat.S_ISDIR(value.st_mode):
+        raise _error(f"{description} does not exist as a directory")
+    if stat.S_IMODE(value.st_mode) & 0o022:
+        raise _error(f"{description} must not be group- or other-writable")
+
+
 def _validate_selected_home(path: Path) -> None:
-    _validate_private_directory(path, "Selected Hermes profile")
+    _validate_owned_directory(path, "Selected Hermes profile")
 
 
 def _read_active_profile(marker: Path) -> str:
@@ -136,10 +154,12 @@ def _read_active_profile(marker: Path) -> str:
     stable = _stable_path_stat(marker, "Hermes active_profile marker")
     if not stat.S_ISREG(stable.st_mode):
         raise _error("Hermes active_profile marker must be a regular file")
-    if stat.S_IMODE(stable.st_mode) != 0o600:
-        raise _error("Hermes active_profile marker must have mode 0600")
+    if stat.S_IMODE(stable.st_mode) & 0o022:
+        raise _error(
+            "Hermes active_profile marker must not be group- or other-writable"
+        )
     try:
-        return marker.read_text(encoding="utf-8")
+        return marker.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         raise _error("Could not read the Hermes active_profile marker") from None
 
@@ -159,7 +179,7 @@ def resolve_hermes_home(
     if candidate.parent.name == "profiles":
         root = _canonical_absolute(candidate.parent.parent, "Hermes root")
         _validate_private_directory(root, "Hermes root")
-        _validate_private_directory(candidate.parent, "Hermes profiles directory")
+        _validate_owned_directory(candidate.parent, "Hermes profiles directory")
         _validate_selected_home(candidate)
         return root, candidate
 
@@ -180,7 +200,7 @@ def resolve_hermes_home(
     if _PROFILE_NAME.fullmatch(active_profile) is None:
         raise _error("Hermes active_profile contains an invalid profile name")
 
-    _validate_private_directory(root / "profiles", "Hermes profiles directory")
+    _validate_owned_directory(root / "profiles", "Hermes profiles directory")
     home = _canonical_absolute(root / "profiles" / active_profile, "Hermes profile")
     _validate_selected_home(home)
     return root, home

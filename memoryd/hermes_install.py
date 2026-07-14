@@ -71,7 +71,8 @@ _ALTERNATE_PROVIDER_KEYS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
 _PROVIDER_ENV = (*_PROVIDER_ROUTING_ENV, *_ALTERNATE_PROVIDER_KEYS, *_KEY_NAMES)
 _VALIDATION_ENV = _PROVIDER_ENV
 _INSTALL_ENV = (
-    "HOME", "HERMES_HOME", "MEMORYD_HOME", *_PROVIDER_ENV,
+    "HOME", "HERMES_HOME", "MEMORYD_HOME", "MEMORYD_DSN", "MEMORYD_PORT",
+    *_PROVIDER_ENV,
 )
 _PROVIDER_PATTERN = r"[a-z0-9][a-z0-9_-]{0,63}"
 _PROVIDER_NAME = re.compile(_PROVIDER_PATTERN)
@@ -1810,7 +1811,19 @@ def install_hermes_core(
     snapshot: Path | None = None
     try:
         operator_home = _resolved_operator_home()
-        os.environ["HOME"] = os.fspath(operator_home)
+        for name in _INSTALL_ENV:
+            os.environ.pop(name, None)
+        os.environ.update(
+            {
+                "HOME": os.fspath(operator_home),
+                "HERMES_HOME": os.fspath(target.root),
+                "MEMORYD_HOME": os.fspath(operator_home / "memory"),
+                "OPENROUTER_API_KEY": credentials.openrouter_key,
+                "VOYAGE_API_KEY": credentials.voyage_key,
+                "MEMORYD_LLM": "openrouter",
+                "MEMORYD_EMBED": "voyage",
+            }
+        )
         try:
             current_root, current_home = resolve_guided_hermes_home()
             guided_memory_home = resolve_guided_memory_home()
@@ -1823,18 +1836,8 @@ def install_hermes_core(
 
         if failure is None:
             try:
-                for name in _PROVIDER_ENV:
-                    os.environ.pop(name, None)
-                os.environ.update(
-                    {
-                        "HERMES_HOME": os.fspath(target.home),
-                        "MEMORYD_HOME": os.fspath(guided_memory_home),
-                        "OPENROUTER_API_KEY": credentials.openrouter_key,
-                        "VOYAGE_API_KEY": credentials.voyage_key,
-                        "MEMORYD_LLM": "openrouter",
-                        "MEMORYD_EMBED": "voyage",
-                    }
-                )
+                os.environ["HERMES_HOME"] = os.fspath(target.home)
+                os.environ["MEMORYD_HOME"] = os.fspath(guided_memory_home)
                 options = cli._InstallOptions(
                     hermes_home=target.home, publish_hermes_plugin=False,
                 )
@@ -1910,9 +1913,11 @@ def _guided_activation_environment(
     target: HermesTarget,
     memory_home: Path,
     credentials: ProviderCredentials,
-    before_restore,
 ):
-    names = ("HOME", "HERMES_HOME", "MEMORYD_HOME", "MEMORYD_DSN", *_PROVIDER_ENV)
+    names = (
+        "HOME", "HERMES_HOME", "MEMORYD_HOME", "MEMORYD_DSN", "MEMORYD_PORT",
+        *_PROVIDER_ENV,
+    )
     previous = {name: os.environ[name] for name in names if name in os.environ}
     try:
         for name in names:
@@ -1930,63 +1935,162 @@ def _guided_activation_environment(
         )
         yield
     finally:
-        before_restore()
         for name in names:
             os.environ.pop(name, None)
         os.environ.update(previous)
 
 
+class _GuidedSignalFence:
+    """Own SIGINT/SIGTERM until one explicit pending-snapshot boundary."""
+
+    watched = frozenset((signal.SIGINT, signal.SIGTERM))
+    ordered = (signal.SIGINT, signal.SIGTERM)
+
+    def __init__(self) -> None:
+        self.previous_handlers: dict[int, object] = {}
+        self.installed_handlers: set[int] = set()
+        self.prior_mask: set[signal.Signals] | None = None
+        self.first_signal: int | None = None
+        self.blocked = False
+        self.committed = False
+        self.owns_boundary = False
+
+    def _record(self, signum: int) -> None:
+        if self.first_signal is None:
+            self.first_signal = int(signum)
+
+    def _handler(self, signum: int, _frame: object) -> None:
+        self._record(signum)
+        self.block()
+        raise KeyboardInterrupt
+
+    def start(self) -> None:
+        try:
+            prior = signal.pthread_sigmask(signal.SIG_BLOCK, self.watched)
+        except (OSError, ValueError, AttributeError):
+            raise HermesInstallError(
+                "The POSIX signal safety boundary is unavailable."
+            ) from None
+        self.prior_mask = set(prior)
+        self.blocked = True
+        if self.prior_mask & self.watched:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self.prior_mask)
+            self.blocked = False
+            raise HermesInstallError(
+                "SIGINT and SIGTERM must be unblocked before guided installation."
+            )
+        self.owns_boundary = True
+        try:
+            for signum in self.ordered:
+                numeric = int(signum)
+                self.previous_handlers[numeric] = signal.getsignal(signum)
+                signal.signal(signum, self._handler)
+                self.installed_handlers.add(numeric)
+            signal.pthread_sigmask(signal.SIG_SETMASK, self.prior_mask)
+            self.blocked = False
+        except BaseException:
+            self.block()
+            self.restore_handlers()
+            self.release()
+            raise HermesInstallError(
+                "The guided signal safety boundary could not be installed."
+            ) from None
+
+    def block(self) -> None:
+        if not self.owns_boundary or self.prior_mask is None or self.blocked:
+            return
+        signal.pthread_sigmask(signal.SIG_BLOCK, self.watched)
+        self.blocked = True
+
+    def restore_handlers(self) -> None:
+        if not self.owns_boundary:
+            return
+        self.block()
+        failures: list[BaseException] = []
+        for signum in reversed(self.ordered):
+            numeric = int(signum)
+            if numeric not in self.installed_handlers:
+                continue
+            try:
+                signal.signal(signum, self.previous_handlers[numeric])
+            except KeyboardInterrupt as error:
+                self._record(numeric)
+                try:
+                    signal.signal(signum, self.previous_handlers[numeric])
+                except BaseException as retry_error:
+                    failures.append(retry_error)
+                    continue
+            except BaseException as error:
+                failures.append(error)
+                continue
+            self.installed_handlers.remove(numeric)
+        if failures or self.installed_handlers:
+            raise HermesInstallError(
+                "The original signal handlers could not be restored."
+            )
+
+    def _pending_snapshot(self) -> set[signal.Signals]:
+        try:
+            return set(signal.sigpending()) & self.watched
+        except (OSError, ValueError, AttributeError):
+            raise HermesInstallError(
+                "The pending signal boundary could not be inspected."
+            ) from None
+
+    def _consume(self, pending: set[signal.Signals]) -> None:
+        for signum in self.ordered:
+            if signum not in pending:
+                continue
+            try:
+                received = signal.sigwait({signum})
+            except (OSError, ValueError, AttributeError):
+                raise HermesInstallError(
+                    "A pending installer signal could not be consumed safely."
+                ) from None
+            self._record(int(received))
+
+    def linearize_commit(self) -> None:
+        """Classify the one kernel pending snapshot as precommit."""
+        self.block()
+        pending = self._pending_snapshot()
+        self._consume(pending)
+        if self.first_signal is not None:
+            raise KeyboardInterrupt
+        self.committed = True
+
+    def finish_abort(self) -> None:
+        """Consume the abort-boundary snapshot before original semantics resume."""
+        if not self.owns_boundary:
+            return
+        self.block()
+        self._consume(self._pending_snapshot())
+
+    def release(self) -> None:
+        if not self.owns_boundary or self.prior_mask is None or not self.blocked:
+            return
+        prior = self.prior_mask
+        self.blocked = False
+        self.owns_boundary = False
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior)
+
+
 def guided_hermes_install() -> int:
     """Run the complete interactive Hermes installation workflow."""
     credentials: ProviderCredentials | None = None
-    interrupted_signal: int | None = None
-    signal_can_interrupt = True
-    previous_handlers: dict[int, object] = {}
-    installed_handlers: set[int] = set()
+    fence = _GuidedSignalFence()
     failure_message: str | None = None
     interruption_reported = False
     committed_report: str | None = None
-
-    def interrupt(signum: int, _frame: object) -> None:
-        nonlocal interrupted_signal
-        if interrupted_signal is None:
-            interrupted_signal = int(signum)
-        if signal_can_interrupt:
-            raise KeyboardInterrupt
+    committed = False
+    activation_environment = None
+    activation_environment_entered = False
 
     def report_interruption(signum: int) -> None:
         name = signal.Signals(signum).name
         print(f"Hermes guided installation interrupted ({name}).", file=sys.stderr)
 
-    def defer_signals() -> None:
-        nonlocal signal_can_interrupt
-        signal_can_interrupt = False
-
-    def restore_handlers() -> None:
-        nonlocal signal_can_interrupt
-        signal_can_interrupt = False
-        interrupt_number = int(signal.SIGINT)
-        terminate_number = int(signal.SIGTERM)
-        try:
-            if terminate_number in installed_handlers:
-                signal.signal(
-                    terminate_number, previous_handlers[terminate_number],
-                )
-                installed_handlers.remove(terminate_number)
-        finally:
-            if interrupt_number in installed_handlers:
-                signal.signal(
-                    interrupt_number, previous_handlers[interrupt_number],
-                )
-                installed_handlers.remove(interrupt_number)
-
     try:
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            numeric = int(signum)
-            previous_handlers[numeric] = signal.getsignal(signum)
-            signal.signal(signum, interrupt)
-            installed_handlers.add(numeric)
-
+        fence.start()
         require_guided_environment()
         memory_home = resolve_guided_memory_home()
         target = resolve_guided_hermes_target()
@@ -2014,20 +2118,26 @@ def guided_hermes_install() -> int:
         for secret in (credentials.openrouter_key, credentials.voyage_key):
             report = report.replace(secret, "<redacted>")
         report_buffer = io.StringIO()
-        with _guided_activation_environment(
-            target, memory_home, credentials, defer_signals,
-        ):
-            with _activation_transaction(target):
-                print(report, file=report_buffer)
-                if interrupted_signal is not None:
-                    raise KeyboardInterrupt
-                committed_report = report_buffer.getvalue()
+        fence.block()
+        activation_environment = _guided_activation_environment(
+            target, memory_home, credentials,
+        )
+        activation_environment.__enter__()
+        activation_environment_entered = True
+        with _activation_transaction(target):
+            print(report, file=report_buffer)
+            committed_report = report_buffer.getvalue()
+            try:
+                activation_environment.__exit__(None, None, None)
+            finally:
+                activation_environment_entered = False
+            fence.restore_handlers()
+            fence.linearize_commit()
+        committed = True
     except KeyboardInterrupt:
-        signal_can_interrupt = False
-        if interrupted_signal is None:
-            interrupted_signal = int(signal.SIGINT)
+        if fence.first_signal is None:
+            fence._record(int(signal.SIGINT))
     except (HermesInstallError, HermesCompatibilityError) as error:
-        signal_can_interrupt = False
         failure_message = str(error)
         if credentials is not None:
             for secret in (credentials.openrouter_key, credentials.voyage_key):
@@ -2036,27 +2146,48 @@ def guided_hermes_install() -> int:
         if not failure_message:
             failure_message = "A required installation stage failed."
     finally:
-        signal_can_interrupt = False
-        if installed_handlers:
+        if not committed:
+            fence.block()
+            if activation_environment_entered and activation_environment is not None:
+                try:
+                    activation_environment.__exit__(None, None, None)
+                except BaseException:
+                    if failure_message is None and fence.first_signal is None:
+                        failure_message = "The canonical installation environment could not be restored."
+                finally:
+                    activation_environment_entered = False
             try:
                 try:
-                    if interrupted_signal is not None:
-                        report_interruption(interrupted_signal)
+                    if fence.first_signal is not None:
+                        report_interruption(fence.first_signal)
                         interruption_reported = True
                     elif failure_message is not None:
                         print(
                             f"Hermes guided installation failed: {failure_message}",
                             file=sys.stderr,
                         )
-                except OSError:
+                except (OSError, KeyboardInterrupt):
                     pass
             finally:
-                restore_handlers()
+                try:
+                    fence.restore_handlers()
+                    fence.finish_abort()
+                except HermesInstallError as cleanup_error:
+                    if failure_message is None and fence.first_signal is None:
+                        failure_message = str(cleanup_error)
+                finally:
+                    fence.release()
 
-    if interrupted_signal is not None:
+    # This is deliberately outside the guided exception mapping. Signals
+    # arriving after the pending snapshot resume the caller's exact original
+    # disposition and cannot be misreported as a failed installation.
+    if committed:
+        fence.release()
+
+    if fence.first_signal is not None:
         if not interruption_reported:
-            report_interruption(interrupted_signal)
-        return 128 + interrupted_signal
+            report_interruption(fence.first_signal)
+        return 128 + fence.first_signal
     if failure_message is not None:
         return 1
     assert committed_report is not None

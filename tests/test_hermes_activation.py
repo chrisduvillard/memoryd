@@ -938,7 +938,7 @@ def test_signal_during_failure_reporting_cannot_escape_or_leak_handlers(
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
-def test_signal_during_each_handler_restore_preserves_commit_and_restores_both(
+def test_signal_during_each_handler_restore_rolls_back_and_restores_both(
     monkeypatch, tmp_path, capsys, signum,
 ):
     target = _target(tmp_path, "legacy")
@@ -955,7 +955,7 @@ def test_signal_during_each_handler_restore_preserves_commit_and_restores_both(
     assert escaped is None
     assert result == 128 + int(signum)
     assert signals.restore_signal_delivered
-    assert _read_provider(target.home) == "memoryd"
+    assert _read_provider(target.home) == "legacy"
     assert boundary.gateway_running is True
     assert artifact.read_bytes() == b"preserved installation evidence"
     assert signals.current == signals.previous
@@ -1063,13 +1063,20 @@ def test_activation_status_uses_canonical_guided_environment_and_restores_ambien
     marker.write_bytes(b"untouched")
     monkeypatch.setenv("HOME", os.fspath(hostile))
     monkeypatch.delenv("MEMORYD_HOME", raising=False)
-    before = {name: os.environ.get(name) for name in ("HOME", "MEMORYD_HOME", "HERMES_HOME")}
+    monkeypatch.setenv("MEMORYD_DSN", "postgresql://HOSTILE-DB.invalid/redirect")
+    monkeypatch.setenv("MEMORYD_PORT", "65530")
+    monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "hostile-marker-must-survive")
+    owned = ("HOME", "MEMORYD_HOME", "HERMES_HOME", "MEMORYD_DSN", "MEMORYD_PORT")
+    before = {name: os.environ.get(name) for name in owned}
 
     def status() -> int:
         boundary.events.append("memoryd cli status")
         assert os.environ["HOME"] == os.fspath(operator)
         assert os.environ["MEMORYD_HOME"] == os.fspath(memory_home)
         assert os.environ["HERMES_HOME"] == os.fspath(target.home)
+        assert "MEMORYD_DSN" not in os.environ
+        assert "MEMORYD_PORT" not in os.environ
+        assert os.environ["HERMES_TUI_GATEWAY_URL"] == "hostile-marker-must-survive"
         if outcome == "signal":
             signals.deliver(signal.SIGTERM)
         return 1 if outcome == "failure" else 0
@@ -1080,12 +1087,13 @@ def test_activation_status_uses_canonical_guided_environment_and_restores_ambien
 
     assert escaped is None
     assert result == {"success": 0, "failure": 1, "signal": 143}[outcome]
-    assert {name: os.environ.get(name) for name in before} == before
+    assert {name: os.environ.get(name) for name in owned} == before
+    assert os.environ["HERMES_TUI_GATEWAY_URL"] == "hostile-marker-must-survive"
     assert marker.read_bytes() == b"untouched"
     assert _read_provider(target.home) == ("memoryd" if outcome == "success" else "legacy")
 
 
-def _real_sigterm_precommit_child(root: str) -> None:
+def _real_precommit_signal_child(root: str, signum: int) -> None:
     tmp_path = Path(root)
     monkeypatch = pytest.MonkeyPatch()
     target = _target(tmp_path, "legacy")
@@ -1105,32 +1113,45 @@ def _real_sigterm_precommit_child(root: str) -> None:
     monkeypatch.setattr(hermes, "collect_provider_credentials", lambda _path: credentials)
     monkeypatch.setattr(hermes, "validate_provider_credentials", lambda _value: None)
     monkeypatch.setattr(hermes, "install_hermes_core", lambda *_args: artifact)
+    real_sigpending = signal.sigpending
+    delivered = False
+
+    def inject_before_snapshot():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            os.kill(os.getpid(), signum)
+        return real_sigpending()
+
+    monkeypatch.setattr(hermes.signal, "sigpending", inject_before_snapshot)
 
     @contextlib.contextmanager
     def activation(_target):
         try:
             yield
-            os.kill(os.getpid(), signal.SIGTERM)
         except BaseException:
             rollback.write_text("rolled back", encoding="utf-8")
             raise hermes.HermesInstallError("activation interrupted after rollback") from None
 
     monkeypatch.setattr(hermes, "_activation_transaction", activation)
     try:
-        assert hermes.guided_hermes_install() == 143
+        assert hermes.guided_hermes_install() == 128 + signum
+        assert delivered
         assert rollback.read_text(encoding="utf-8") == "rolled back"
     finally:
         monkeypatch.undo()
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="real signal boundary is POSIX-only")
-def test_real_sigterm_after_report_before_transaction_exit_rolls_back(tmp_path):
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_real_signal_pending_at_commit_snapshot_rolls_back(tmp_path, signum):
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             "import runpy; ns=runpy.run_path(" + repr(str(Path(__file__)))
-            + "); ns['_real_sigterm_precommit_child'](" + repr(str(tmp_path)) + ")",
+            + "); ns['_real_precommit_signal_child']("
+            + repr(str(tmp_path)) + "," + repr(int(signum)) + ")",
         ],
         text=True,
         capture_output=True,
@@ -1138,3 +1159,169 @@ def test_real_sigterm_after_report_before_transaction_exit_rolls_back(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _prepare_real_signal_child(monkeypatch, tmp_path):
+    target = _target(tmp_path, "legacy")
+    _spool_root(target)
+    boundary = _install_boundary(monkeypatch, target, gateway_running=True)
+    artifact = tmp_path / "memory" / "initial.snapshot"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"preserved")
+    credentials = hermes.ProviderCredentials("open", "voyage")
+    monkeypatch.setattr(hermes, "require_guided_environment", lambda: None)
+    monkeypatch.setattr(hermes, "resolve_guided_memory_home", lambda: artifact.parent)
+    monkeypatch.setattr(hermes, "resolve_guided_hermes_target", lambda: target)
+    monkeypatch.setattr(hermes.cli, "_resource_dir", lambda _name: target.home)
+    monkeypatch.setattr(hermes, "validate_hermes_compatibility", lambda *_args: None)
+    monkeypatch.setattr(hermes, "classify_memory_home", lambda _home: "managed")
+    monkeypatch.setattr(hermes, "confirm_operator", lambda: None)
+    monkeypatch.setattr(hermes, "collect_provider_credentials", lambda _path: credentials)
+    monkeypatch.setattr(hermes, "validate_provider_credentials", lambda _value: None)
+    monkeypatch.setattr(hermes, "install_hermes_core", lambda *_args: artifact)
+    return target, boundary, artifact
+
+
+def _real_signal_during_handler_restore_child(root: str, signum: int) -> None:
+    tmp_path = Path(root)
+    monkeypatch = pytest.MonkeyPatch()
+    target, boundary, artifact = _prepare_real_signal_child(monkeypatch, tmp_path)
+    original_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+    prior_mask = original_mask | {signal.SIGUSR1}
+    signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+    originals = {value: signal.getsignal(value) for value in (signal.SIGINT, signal.SIGTERM)}
+    real_signal = signal.signal
+    delivered = False
+
+    def inject_during_restore(value, handler):
+        nonlocal delivered
+        if int(value) == signum and handler is originals[value] and not delivered:
+            delivered = True
+            os.kill(os.getpid(), signum)
+        return real_signal(value, handler)
+
+    monkeypatch.setattr(hermes.signal, "signal", inject_during_restore)
+    try:
+        assert hermes.guided_hermes_install() == 128 + signum
+        assert delivered
+        assert _read_provider(target.home) == "legacy"
+        assert boundary.gateway_running is True
+        assert artifact.read_bytes() == b"preserved"
+        assert {value: signal.getsignal(value) for value in originals} == originals
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == prior_mask
+        assert not (set(signal.sigpending()) & {signal.SIGINT, signal.SIGTERM})
+    finally:
+        monkeypatch.undo()
+        for value, handler in originals.items():
+            real_signal(value, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="real signal boundary is POSIX-only")
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_real_signal_during_handler_restore_rolls_back_with_exact_state(
+    tmp_path, signum,
+):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy; ns=runpy.run_path(" + repr(str(Path(__file__)))
+            + "); ns['_real_signal_during_handler_restore_child']("
+            + repr(str(tmp_path)) + "," + repr(int(signum)) + ")",
+        ],
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _real_postcommit_signal_child(root: str, signum: int) -> None:
+    tmp_path = Path(root)
+    monkeypatch = pytest.MonkeyPatch()
+    target, boundary, artifact = _prepare_real_signal_child(monkeypatch, tmp_path)
+    ambient = {
+        "HOME": str(tmp_path / "ambient-home"),
+        "HERMES_HOME": str(tmp_path / "ambient-hermes"),
+        "MEMORYD_HOME": str(tmp_path / "ambient-memory"),
+        "MEMORYD_DSN": "postgresql://ambient.invalid/redirect",
+        "MEMORYD_PORT": "65530",
+    }
+    os.environ.update(ambient)
+    original_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+    prior_mask = original_mask | {signal.SIGUSR1}
+    signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+    originals = {value: signal.getsignal(value) for value in (signal.SIGINT, signal.SIGTERM)}
+    marker = tmp_path / "original-handler.marker"
+
+    def original_handler(value, _frame):
+        assert int(value) == signum
+        assert {name: os.environ.get(name) for name in ambient} == ambient
+        assert signal.getsignal(signal.Signals(signum)) is original_handler
+        other = signal.SIGTERM if signum == int(signal.SIGINT) else signal.SIGINT
+        assert signal.getsignal(other) is originals[other]
+        marker.write_text("original disposition ran", encoding="utf-8")
+
+    signal.signal(signal.Signals(signum), original_handler)
+    originals[signal.Signals(signum)] = original_handler
+    real_sigpending = signal.sigpending
+    delivered = False
+
+    def inject_after_snapshot():
+        nonlocal delivered
+        snapshot = real_sigpending()
+        if not delivered:
+            delivered = True
+            os.kill(os.getpid(), signum)
+        return snapshot
+
+    monkeypatch.setattr(hermes.signal, "sigpending", inject_after_snapshot)
+    try:
+        assert hermes.guided_hermes_install() == 0
+        assert delivered
+        assert marker.read_text(encoding="utf-8") == "original disposition ran"
+        assert _read_provider(target.home) == "memoryd"
+        assert boundary.gateway_running is True
+        assert artifact.read_bytes() == b"preserved"
+        assert {name: os.environ.get(name) for name in ambient} == ambient
+        assert {value: signal.getsignal(value) for value in originals} == originals
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == prior_mask
+    finally:
+        monkeypatch.undo()
+        for value, handler in originals.items():
+            signal.signal(value, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="real signal boundary is POSIX-only")
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_real_postcommit_signal_resumes_original_disposition_and_exact_state(
+    tmp_path, signum,
+):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy; ns=runpy.run_path(" + repr(str(Path(__file__)))
+            + "); ns['_real_postcommit_signal_child']("
+            + repr(str(tmp_path)) + "," + repr(int(signum)) + ")",
+        ],
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX masks are Linux-only")
+def test_signal_fence_rejects_preblocked_watched_signal_without_changing_state():
+    original_mask = set(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+    originals = {value: signal.getsignal(value) for value in (signal.SIGINT, signal.SIGTERM)}
+    blocked = original_mask | {signal.SIGTERM}
+    signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+    try:
+        fence = hermes._GuidedSignalFence()
+        with pytest.raises(hermes.HermesInstallError, match="unblocked"):
+            fence.start()
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == blocked
+        assert {value: signal.getsignal(value) for value in originals} == originals
+        assert not fence.owns_boundary
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)

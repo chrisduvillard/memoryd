@@ -804,15 +804,33 @@ def test_linux_hermes_installer_writes_non_pruning_initial_backup_unit(
     scheduled = (tmp_path / "memoryd-backup.service").read_text()
     daemon = (tmp_path / "memoryd.service").read_text()
     microsleep = (tmp_path / "memoryd-microsleep.service").read_text()
+    expected_unset = (
+        "UnsetEnvironment=HOME HERMES_HOME MEMORYD_HOME MEMORYD_DSN MEMORYD_PORT "
+        "ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY VOYAGE_API_KEY "
+        "MEMORYD_LLM MEMORYD_LLM_BASE MEMORYD_LLM_MODEL MEMORYD_MODEL_PROFILE "
+        "MEMORYD_EMBED MEMORYD_EMBED_BASE MEMORYD_EMBED_MODEL\n"
+    )
     assert "ExecStartPre=systemctl --user stop memoryd.service" in initial
     assert ("ExecStart=\"/opt/memoryd/bin/python\" -m memoryd backup create "
             "--no-retention") in initial
     assert "ExecStopPost=systemctl --user start memoryd.service" in initial
     assert "backup create --retain 14" in scheduled
     for service in (daemon, microsleep, scheduled, initial):
-        assert "UnsetEnvironment=" in service
-        assert "MEMORYD_LLM_BASE" in service
-        assert "OPENROUTER_API_KEY" in service
+        assert service.count("UnsetEnvironment=") == 1
+        assert expected_unset in service
+        unset_names = expected_unset.removeprefix("UnsetEnvironment=").split()
+        manager_environment = {
+            name: f"HOSTILE-{name}-SENTINEL" for name in unset_names
+        }
+        manager_environment["HERMES_TUI_GATEWAY_URL"] = "preserved-marker"
+        runtime_environment = {
+            name: value for name, value in manager_environment.items()
+            if name not in unset_names
+        }
+        assert not any(name in runtime_environment for name in unset_names)
+        assert runtime_environment == {
+            "HERMES_TUI_GATEWAY_URL": "preserved-marker",
+        }
     assert not (tmp_path / "memoryd-backup-initial.timer").exists()
     enable = next(call for call in calls if "enable" in call)
     assert "memoryd-backup-initial.service" not in enable

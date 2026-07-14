@@ -247,16 +247,33 @@ def test_symlinked_named_profile_is_rejected(tmp_path: Path) -> None:
     assert linked_profile.is_symlink()
 
 
-def test_profile_mode_mismatch_is_rejected_without_chmod(tmp_path: Path) -> None:
+def test_named_profile_accepts_pinned_hermes_default_modes_inside_private_root(
+    tmp_path: Path,
+) -> None:
     root = _mkdir(tmp_path / ".hermes")
-    profile = _mkdir(_mkdir(root / "profiles") / "work", mode=0o755)
-    _write_active_profile(root, "work")
+    profiles = _mkdir(root / "profiles", mode=0o755)
+    profile = _mkdir(profiles / "work", mode=0o755)
+    marker = _write_active_profile(root, "work\n", mode=0o644)
 
-    with pytest.raises(HermesCompatibilityError) as exc_info:
-        resolve_hermes_home({"HERMES_HOME": str(root)})
-
-    _assert_safe_error(exc_info)
+    assert resolve_hermes_home({"HERMES_HOME": str(root)}) == (root, profile)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(profiles.stat().st_mode) == 0o755
     assert stat.S_IMODE(profile.stat().st_mode) == 0o755
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("component", ["profiles", "profile", "marker"])
+def test_named_profile_rejects_group_or_other_writable_descendants(
+    tmp_path: Path, component: str,
+) -> None:
+    root = _mkdir(tmp_path / ".hermes")
+    profiles = _mkdir(root / "profiles", mode=0o755)
+    profile = _mkdir(profiles / "work", mode=0o755)
+    marker = _write_active_profile(root, "work", mode=0o644)
+    {"profiles": profiles, "profile": profile, "marker": marker}[component].chmod(0o777)
+
+    with pytest.raises(HermesCompatibilityError, match="writable"):
+        resolve_hermes_home({"HERMES_HOME": str(root)})
 
 
 def test_selected_profile_owned_by_another_uid_is_rejected(
@@ -273,19 +290,32 @@ def test_selected_profile_owned_by_another_uid_is_rejected(
         resolve_hermes_home({"HERMES_HOME": str(root)})
 
 
-@pytest.mark.parametrize("component", ["root", "profiles", "marker"])
-def test_named_profile_authority_components_require_owner_only_modes(
-    tmp_path: Path, component: str,
+def test_owned_descendant_validator_rejects_wrong_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _mkdir(tmp_path / "work", mode=0o755)
+    monkeypatch.setattr(
+        compat, "_effective_uid", lambda: profile.stat().st_uid + 1,
+    )
+
+    with pytest.raises(HermesCompatibilityError, match="owned"):
+        compat._validate_owned_directory(profile, "Selected Hermes profile")
+
+
+def test_named_profile_root_requires_owner_only_mode_with_safe_remediation(
+    tmp_path: Path,
 ) -> None:
     root = _mkdir(tmp_path / ".hermes")
-    profiles = _mkdir(root / "profiles")
-    _mkdir(profiles / "work")
-    marker = _write_active_profile(root, "work")
-    target = {"root": root, "profiles": profiles, "marker": marker}[component]
-    target.chmod(0o755 if component != "marker" else 0o644)
+    profiles = _mkdir(root / "profiles", mode=0o755)
+    _mkdir(profiles / "work", mode=0o755)
+    _write_active_profile(root, "work", mode=0o644)
+    root.chmod(0o755)
 
-    with pytest.raises(HermesCompatibilityError, match="0700|0600"):
+    with pytest.raises(HermesCompatibilityError) as exc_info:
         resolve_hermes_home({"HERMES_HOME": str(root)})
+
+    assert 'chmod 700 "$HERMES_HOME"' in str(exc_info.value)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
 
 
 def test_non_linux_platform_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

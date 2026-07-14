@@ -28,8 +28,9 @@ AFFECTED_ENV = (
     "MEMORYD_LLM_MODEL", "MEMORYD_MODEL_PROFILE", "MEMORYD_EMBED_BASE",
     "MEMORYD_EMBED_MODEL", *KEY_NAMES,
 )
-INSTALL_ENV = ("HERMES_HOME", "MEMORYD_HOME", "OPENROUTER_API_KEY",
-               "VOYAGE_API_KEY", "MEMORYD_LLM", "MEMORYD_EMBED")
+INSTALL_ENV = ("HOME", "HERMES_HOME", "MEMORYD_HOME", "MEMORYD_DSN",
+               "MEMORYD_PORT", "OPENROUTER_API_KEY", "VOYAGE_API_KEY",
+               "MEMORYD_LLM", "MEMORYD_EMBED")
 
 GUIDED_PROVIDER_OVERRIDES = (
     "MEMORYD_LLM_BASE",
@@ -116,6 +117,7 @@ def test_guided_memory_home_rejects_ambient_redirects_without_echo(
     _operator_home(monkeypatch, tmp_path)
     monkeypatch.delenv("MEMORYD_HOME", raising=False)
     monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    monkeypatch.delenv("MEMORYD_PORT", raising=False)
     monkeypatch.setenv(name, value)
 
     with pytest.raises(hermes.HermesInstallError) as caught:
@@ -1670,7 +1672,11 @@ def test_core_install_orders_revalidation_install_backup_verification_and_restar
         events.append("core-install")
         assert options.hermes_home == target.home
         assert options.publish_hermes_plugin is False
-        assert {name: os.environ[name] for name in INSTALL_ENV} == {
+        assert {name: os.environ[name] for name in (
+            "HOME", "HERMES_HOME", "MEMORYD_HOME", "OPENROUTER_API_KEY",
+            "VOYAGE_API_KEY", "MEMORYD_LLM", "MEMORYD_EMBED",
+        )} == {
+            "HOME": str(hermes._resolved_operator_home()),
             "HERMES_HOME": str(target.home),
             "MEMORYD_HOME": str(memory_home),
             "OPENROUTER_API_KEY": credentials.openrouter_key,
@@ -1678,6 +1684,8 @@ def test_core_install_orders_revalidation_install_backup_verification_and_restar
             "MEMORYD_LLM": "openrouter",
             "MEMORYD_EMBED": "voyage",
         }
+        assert "MEMORYD_DSN" not in os.environ
+        assert "MEMORYD_PORT" not in os.environ
         return 0
 
     def publish(actual_target):
@@ -1741,7 +1749,10 @@ def test_core_install_pins_home_for_real_autostart_and_default_backup_selection(
     monkeypatch.setenv("HOME", str(hostile))
     monkeypatch.setenv("HERMES_HOME", str(target.root))
     monkeypatch.delenv("MEMORYD_HOME", raising=False)
-    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    monkeypatch.setenv("MEMORYD_DSN", "postgresql://HOSTILE-DB.invalid/redirect")
+    monkeypatch.setenv("MEMORYD_PORT", "65530")
+    monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "hostile-marker-must-survive")
+    ambient = {name: os.environ.get(name) for name in INSTALL_ENV}
     monkeypatch.setattr(
         hermes, "resolve_guided_hermes_home", lambda: (target.root, target.home),
     )
@@ -1755,12 +1766,23 @@ def test_core_install_pins_home_for_real_autostart_and_default_backup_selection(
     def run(command, timeout=120):
         calls.append(list(command))
         if command[-1] == "memoryd-backup-initial.service":
+            assert os.environ["HOME"] == str(operator)
+            assert os.environ["HERMES_HOME"] == str(target.home)
+            assert os.environ["MEMORYD_HOME"] == str(memory_home)
+            assert "MEMORYD_DSN" not in os.environ
+            assert "MEMORYD_PORT" not in os.environ
+            assert os.environ["HERMES_TUI_GATEWAY_URL"] == "hostile-marker-must-survive"
             snapshot = memory_home / "backups" / "20260714T010203Z-v1"
             snapshot.mkdir(parents=True)
         return 0, ""
 
     def install(options):
         assert os.environ["HOME"] == str(operator)
+        assert os.environ["HERMES_HOME"] == str(target.home)
+        assert os.environ["MEMORYD_HOME"] == str(memory_home)
+        assert "MEMORYD_DSN" not in os.environ
+        assert "MEMORYD_PORT" not in os.environ
+        assert os.environ["HERMES_TUI_GATEWAY_URL"] == "hostile-marker-must-survive"
         assert cli._home() == memory_home
         cli.install_autostart(_hermes_mode=True)
         return 0
@@ -1777,7 +1799,8 @@ def test_core_install_pins_home_for_real_autostart_and_default_backup_selection(
     assert not (hostile / ".config").exists()
     assert not (hostile / "memory").exists()
     assert marker.read_bytes() == b"untouched"
-    assert os.environ["HOME"] == str(hostile)
+    assert {name: os.environ.get(name) for name in INSTALL_ENV} == ambient
+    assert os.environ["HERMES_TUI_GATEWAY_URL"] == "hostile-marker-must-survive"
 
 
 def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_reruns(
@@ -1795,6 +1818,11 @@ def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_r
     managed = _managed_payload(memory_home)
     assert isinstance(managed["env"], dict)
     managed["env"].update({
+        "HOME": "/tmp/HOSTILE-HOME-SENTINEL",
+        "HERMES_HOME": "/tmp/HOSTILE-HERMES-SENTINEL",
+        "MEMORYD_HOME": "/tmp/HOSTILE-MEMORY-SENTINEL",
+        "MEMORYD_DSN": "postgresql://HOSTILE-DB-SENTINEL.invalid/redirect",
+        "MEMORYD_PORT": "65530",
         "MEMORYD_LLM_BASE": "https://HOSTILE-CONFIG-SENTINEL.invalid/collect",
         "MEMORYD_LLM_MODEL": "hostile/model",
         "MEMORYD_MODEL_PROFILE": "hostile-profile",
@@ -1914,17 +1942,12 @@ def test_core_install_sanitizes_core_or_migration_failure_and_restores_environme
     assert "SECRET-SENTINEL" not in rendered
 
 
-@pytest.mark.parametrize(
-    ("name", "value"),
-    [
-        ("MEMORYD_HOME", "/tmp/late-home-SENSITIVE"),
-        (
-            "MEMORYD_DSN",
-            "postgresql://postgres:SENSITIVE@remote.invalid/unrelated",
-        ),
-    ],
-)
-def test_core_revalidation_rejects_late_memory_redirect_before_mutation(
+@pytest.mark.parametrize(("name", "value"), [
+    ("MEMORYD_HOME", "/tmp/late-home-SENSITIVE"),
+    ("MEMORYD_DSN", "postgresql://postgres:SENSITIVE@remote.invalid/unrelated"),
+    ("MEMORYD_PORT", "65530"),
+])
+def test_core_revalidation_owns_and_restores_late_memory_redirects(
     monkeypatch, tmp_path, name, value,
 ):
     target = _hermes_target(tmp_path)
@@ -1932,18 +1955,27 @@ def test_core_revalidation_rejects_late_memory_redirect_before_mutation(
     monkeypatch.setenv("HERMES_HOME", str(target.root))
     monkeypatch.delenv("MEMORYD_HOME", raising=False)
     monkeypatch.delenv("MEMORYD_DSN", raising=False)
+    monkeypatch.delenv("MEMORYD_PORT", raising=False)
     monkeypatch.setenv(name, value)
-    monkeypatch.setattr(
-        cli, "install", lambda _options: pytest.fail("target mutation must not start"),
-    )
+    observed: list[tuple[str, str, str]] = []
+
+    def install(_options):
+        observed.append((
+            os.environ["HERMES_HOME"], os.environ["MEMORYD_HOME"],
+            os.environ.get("MEMORYD_PORT", ""),
+        ))
+        assert "MEMORYD_DSN" not in os.environ
+        return 1
+
+    monkeypatch.setattr(cli, "install", install)
 
     with pytest.raises(hermes.HermesInstallError) as caught:
         hermes.install_hermes_core(
             target, hermes.ProviderCredentials("openrouter", "voyage"),
         )
 
-    assert operator.exists()
-    assert value not in str(caught.value)
+    assert observed == [(str(target.home), str(operator / "memory"), "")]
+    assert os.environ[name] == value
     assert "SENSITIVE" not in str(caught.value)
 
 
@@ -2166,7 +2198,7 @@ def test_core_install_revalidates_authoritative_profile_before_first_mutation(
         os.chmod(other, 0o700)
         (target.root / "active_profile").write_text("other", encoding="utf-8")
     else:
-        os.chmod(target.home, 0o755)
+        os.chmod(target.home, 0o777)
     monkeypatch.setattr(
         cli, "install", lambda _options: pytest.fail("mutation started before revalidation"))
 

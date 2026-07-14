@@ -57,6 +57,14 @@ GUIDED_PROVIDER_ENV_KEYS = (
     "MEMORYD_EMBED_BASE",
     "MEMORYD_EMBED_MODEL",
 )
+GUIDED_RUNTIME_ENV_KEYS = (
+    "HOME",
+    "HERMES_HOME",
+    "MEMORYD_HOME",
+    "MEMORYD_DSN",
+    "MEMORYD_PORT",
+    *GUIDED_PROVIDER_ENV_KEYS,
+)
 _GUIDED_PROVIDER_VALUES = (
     "OPENROUTER_API_KEY",
     "VOYAGE_API_KEY",
@@ -559,7 +567,7 @@ def write_config(dsn: str, *, _hermes_mode: bool = False) -> Path:
             raise OSError("guided provider environment is incomplete")
         env = {
             name: value for name, value in existing.items()
-            if name not in GUIDED_PROVIDER_ENV_KEYS
+            if name not in GUIDED_RUNTIME_ENV_KEYS
         }
         env.update(guided)
         cfg["env"] = env
@@ -728,7 +736,7 @@ def install_autostart(*, _hermes_mode: bool = False) -> None:
         unit_dir.mkdir(parents=True, exist_ok=True)
         python = _systemd_exec_arg(sys.executable)
         environment = (
-            "UnsetEnvironment=" + " ".join(GUIDED_PROVIDER_ENV_KEYS) + "\n"
+            "UnsetEnvironment=" + " ".join(GUIDED_RUNTIME_ENV_KEYS) + "\n"
             if _hermes_mode else ""
         )
         (unit_dir / "memoryd.service").write_text(

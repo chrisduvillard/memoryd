@@ -53,13 +53,31 @@ def test_packaged_preflight_runs_against_distinct_pinned_hermes(
     assert probe.returncode == 0, probe.stdout + probe.stderr
 
     root = tmp_path / "authoritative-hermes"
-    home = root / "profiles" / "work"
-    home.mkdir(parents=True, mode=0o700)
+    root.mkdir(mode=0o700)
     root.chmod(0o700)
-    (root / "profiles").chmod(0o700)
-    home.chmod(0o700)
-    (root / "active_profile").write_text("work", encoding="utf-8")
-    os.chmod(root / "active_profile", 0o600)
+    profile_environment = dict(os.environ)
+    profile_environment["HERMES_HOME"] = os.fspath(root)
+    profile_environment["HOME"] = os.fspath(tmp_path)
+    created = subprocess.run(
+        [
+            os.fspath(target_python),
+            "-P",
+            "-c",
+            "import os; os.umask(0o022); "
+            "from hermes_cli.profiles import create_profile,set_active_profile; "
+            "create_profile('work', no_alias=True, no_skills=True); "
+            "set_active_profile('work')",
+        ],
+        env=profile_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    home = root / "profiles" / "work"
+    assert (root / "profiles").stat().st_mode & 0o777 == 0o755
+    assert home.stat().st_mode & 0o777 == 0o755
+    assert (root / "active_profile").stat().st_mode & 0o777 == 0o644
     (home / "sentinel.json").write_text(
         '{"authoritative": true}\n', encoding="utf-8"
     )
