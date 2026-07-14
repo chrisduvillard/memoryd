@@ -100,6 +100,7 @@ def test_packaged_preflight_runs_against_distinct_pinned_explicit_profile(
         home=home,
         executable=executable.resolve(),
         python=target_python,
+        selector=home,
     )
     package = Path(memoryd.__file__).resolve().parent
     plugin = package / "hermes_plugin"

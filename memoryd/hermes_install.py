@@ -1816,7 +1816,7 @@ def install_hermes_core(
         os.environ.update(
             {
                 "HOME": os.fspath(operator_home),
-                "HERMES_HOME": os.fspath(target.home),
+                "HERMES_HOME": os.fspath(target.selector or target.home),
                 "MEMORYD_HOME": os.fspath(operator_home / "memory"),
                 "OPENROUTER_API_KEY": credentials.openrouter_key,
                 "VOYAGE_API_KEY": credentials.voyage_key,

@@ -19,6 +19,7 @@ import pytest
 
 from memoryd import backup, cli
 from memoryd.hermes_compat import HermesTarget
+import memoryd.hermes_compat as compat
 import memoryd.hermes_install as hermes
 
 
@@ -1650,6 +1651,19 @@ def _prepare_core(
     return target, memory_home, credentials
 
 
+def _resolve_real_guided_target(
+    monkeypatch: pytest.MonkeyPatch, seed: HermesTarget,
+) -> HermesTarget:
+    monkeypatch.setattr(compat.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(compat, "_resolve_command", lambda: seed.executable)
+    monkeypatch.setattr(compat, "_resolve_python", lambda _command: seed.python)
+    monkeypatch.setattr(
+        compat, "_query_version", lambda _python: compat.PINNED_HERMES_VERSION,
+    )
+    monkeypatch.setattr(compat, "_validate_console_origin", lambda *_args: None)
+    return hermes.resolve_guided_hermes_target()
+
+
 def test_core_install_orders_revalidation_install_backup_verification_and_restart_health(
     monkeypatch, tmp_path,
 ):
@@ -2199,6 +2213,29 @@ def test_core_install_revalidates_unsafe_authoritative_profile_before_first_muta
         hermes.install_hermes_core(target, credentials)
 
 
+@pytest.mark.parametrize("root_marker", ["other", "../invalid-profile"])
+def test_core_revalidation_tracks_root_selector_before_first_mutation(
+    monkeypatch, tmp_path, root_marker,
+):
+    seed, _memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    target = _resolve_real_guided_target(monkeypatch, seed)
+    other = target.root / "profiles" / "other"
+    other.mkdir(mode=0o755)
+    evidence = target.home / "must-not-change"
+    evidence.write_bytes(b"selected profile evidence")
+    (target.root / "active_profile").write_text(root_marker, encoding="utf-8")
+    monkeypatch.setattr(
+        cli, "install", lambda _options: pytest.fail(
+            "mutation started after root selector changed"
+        ),
+    )
+
+    with pytest.raises(hermes.HermesInstallError, match="changed|revalidation"):
+        hermes.install_hermes_core(target, credentials)
+
+    assert evidence.read_bytes() == b"selected profile evidence"
+
+
 def test_core_install_refuses_changed_explicit_target_before_first_mutation(
     monkeypatch, tmp_path,
 ):
@@ -2230,7 +2267,9 @@ def test_core_install_refuses_changed_explicit_target_before_first_mutation(
 def test_core_revalidation_pins_explicit_profile_authority_and_restores_ambient(
     monkeypatch, tmp_path, root_marker,
 ):
-    target, memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    seed, memory_home, credentials = _prepare_core(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", os.fspath(seed.home))
+    target = _resolve_real_guided_target(monkeypatch, seed)
     other = target.root / "profiles" / "other"
     other.mkdir(mode=0o755)
     other_marker = other / "must-not-change"

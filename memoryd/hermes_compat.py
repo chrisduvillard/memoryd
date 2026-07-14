@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import unicodedata
 
 from memoryd.hermes_validation.resources import (
     canonical_migrations_source,
@@ -49,6 +50,7 @@ class HermesTarget:
     home: Path
     executable: Path
     python: Path
+    selector: Path | None = None
 
 
 class HermesCompatibilityError(RuntimeError):
@@ -60,6 +62,11 @@ def _error(message: str) -> HermesCompatibilityError:
 
 
 def _canonical_absolute(path: Path, description: str) -> Path:
+    if any(
+        unicodedata.category(character) == "Cc"
+        for character in os.fspath(path)
+    ):
+        raise _error(f"{description} must not contain control characters")
     if not path.is_absolute():
         raise _error(f"{description} must be absolute")
     current = Path(path.anchor)
@@ -166,9 +173,9 @@ def _read_active_profile(marker: Path) -> str:
         raise _error("Could not read the Hermes active_profile marker") from None
 
 
-def resolve_hermes_home(
+def _resolve_hermes_home(
     environ: Mapping[str, str] | None = None,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     env = os.environ if environ is None else environ
     configured = env.get("HERMES_HOME")
     if configured is None:
@@ -183,7 +190,7 @@ def resolve_hermes_home(
         _validate_private_directory(root, "Hermes root")
         _validate_owned_directory(candidate.parent, "Hermes profiles directory")
         _validate_selected_home(candidate)
-        return root, candidate
+        return root, candidate, candidate
 
     root = candidate
     if root.exists() and not root.is_dir():
@@ -197,7 +204,7 @@ def resolve_hermes_home(
     if active_profile in ("", "default"):
         if root.exists():
             _validate_selected_home(root)
-        return root, root
+        return root, root, candidate
 
     if _PROFILE_NAME.fullmatch(active_profile) is None:
         raise _error("Hermes active_profile contains an invalid profile name")
@@ -205,6 +212,13 @@ def resolve_hermes_home(
     _validate_owned_directory(root / "profiles", "Hermes profiles directory")
     home = _canonical_absolute(root / "profiles" / active_profile, "Hermes profile")
     _validate_selected_home(home)
+    return root, home, candidate
+
+
+def resolve_hermes_home(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[Path, Path]:
+    root, home, _selector = _resolve_hermes_home(environ)
     return root, home
 
 
@@ -328,7 +342,7 @@ def resolve_hermes_target(
     if platform.system() != "Linux":
         raise _error("Hermes compatibility is supported on Linux only")
 
-    root, home = resolve_hermes_home(environ)
+    root, home, selector = _resolve_hermes_home(environ)
     executable = _resolve_command()
     python = _resolve_python(executable)
     version = _query_version(python)
@@ -339,7 +353,13 @@ def resolve_hermes_target(
         )
     _validate_selected_home(home)
     _validate_console_origin(executable, python)
-    return HermesTarget(root=root, home=home, executable=executable, python=python)
+    return HermesTarget(
+        root=root,
+        home=home,
+        executable=executable,
+        python=python,
+        selector=selector,
+    )
 
 
 def _memoryd_package_root() -> Path:

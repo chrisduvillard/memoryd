@@ -323,6 +323,22 @@ def test_named_profile_root_requires_owner_only_mode_with_safe_remediation(
     assert stat.S_IMODE(root.stat().st_mode) == 0o755
 
 
+@pytest.mark.parametrize("control", ["\n", "\r", "\x1f", "\x7f"])
+def test_hermes_home_rejects_control_characters_without_echoing_path(
+    tmp_path: Path, control: str,
+) -> None:
+    configured = tmp_path / f"Hermes-{control}-SENSITIVE"
+
+    with pytest.raises(HermesCompatibilityError, match="control") as exc_info:
+        resolve_hermes_home({"HERMES_HOME": os.fspath(configured)})
+
+    message = str(exc_info.value)
+    assert "SENSITIVE" not in message
+    assert control not in message
+    assert "\n" not in message
+    assert "\r" not in message
+
+
 def test_non_linux_platform_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
 
@@ -683,6 +699,7 @@ def test_success_resolves_real_command_interpreter_profile_and_pinned_version(
         home=profile,
         executable=real_hermes.resolve(),
         python=python.resolve(),
+        selector=root,
     )
     assert which_calls == ["hermes"]
     assert len(run_calls) == 1

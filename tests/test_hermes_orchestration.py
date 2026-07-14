@@ -37,6 +37,7 @@ def _workflow(
         home=tmp_path / "hermes" / "profiles" / "authoritative",
         executable=tmp_path / "bin" / "hermes",
         python=tmp_path / "venv" / "bin" / "python",
+        selector=tmp_path / "hermes" / "profiles" / "authoritative",
     )
     memory_home = tmp_path / "memory"
     plugin = tmp_path / "packaged-plugin"
@@ -442,6 +443,31 @@ def test_each_pre_mutation_failure_stops_without_core_or_activation(
     assert "Hermes guided installation failed:" in output.err
     assert OPENROUTER_SECRET not in output.err
     assert VOYAGE_SECRET not in output.err
+    assert current == previous
+
+
+def test_control_character_hermes_home_has_safe_one_line_guided_error(
+    monkeypatch, tmp_path, capsys,
+):
+    resolve_target = hermes.resolve_guided_hermes_target
+    events, _target, _snapshot, previous, current = _workflow(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "HERMES_HOME", os.fspath(tmp_path / "Hermes\nSENSITIVE-root"),
+    )
+    monkeypatch.setattr(compat.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        hermes, "resolve_guided_hermes_target", resolve_target,
+    )
+
+    assert hermes.guided_hermes_install() == 1
+
+    assert "core install" not in events
+    assert "activation" not in events
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.count("\n") == 1
+    assert "control" in output.err
+    assert "SENSITIVE" not in output.err
     assert current == previous
 
 
