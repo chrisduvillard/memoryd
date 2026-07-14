@@ -354,15 +354,15 @@ def _validate_console_origin(executable: Path, python: Path) -> None:
     if expected != executable:
         raise _error("The hermes command is a shadow wrapper, not the runtime console entry point")
     try:
-        content = executable.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+        content = executable.read_bytes()
+    except OSError:
         raise _error("Could not inspect the Hermes console entry point content") from None
-    shebang = f"#!{python}\n"
+    shebang = b"#!" + os.fsencode(python) + b"\n"
     if not content.startswith(shebang):
         raise _error("The Hermes console entry point content is not the pinned safe wrapper")
     try:
         signature = ast.dump(
-            ast.parse(content[len(shebang):]), include_attributes=False,
+            ast.parse(content), include_attributes=False,
         )
     except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError):
         raise _error(

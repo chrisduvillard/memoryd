@@ -44,7 +44,7 @@ def _mkdir(path: Path, mode: int = 0o700) -> Path:
 
 def _write_executable(path: Path, content: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.write_bytes(content.encode("utf-8"))
     path.chmod(0o755)
     return path
 
@@ -793,6 +793,42 @@ def test_console_origin_rejects_wrong_shebang(
         python.parent / "hermes",
         f"#!/other/python\n{PIP_CURRENT_CONSOLE_BODY}",
     )
+    _mock_console_metadata(monkeypatch, scripts=python.parent)
+
+    with pytest.raises(HermesCompatibilityError, match="content|console|entry"):
+        compat._validate_console_origin(console, python)
+
+
+def test_console_origin_rejects_alternate_encoding_differential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = _python_interpreter(tmp_path)
+    console = python.parent / "hermes"
+    console.write_bytes(
+        b"#!" + os.fsencode(python) + b"\n"
+        b"# coding: utf-7\n"
+        b"# +AAo-print('unexpected operation')\n"
+        + PIP_CURRENT_CONSOLE_BODY.encode("utf-8")
+    )
+    console.chmod(0o755)
+    _mock_console_metadata(monkeypatch, scripts=python.parent)
+
+    with pytest.raises(HermesCompatibilityError, match="content|console|entry"):
+        compat._validate_console_origin(console, python)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"# coding: missing-codec\n", b"# coding: utf-8\n\xff\n"],
+    ids=["unknown-codec", "invalid-encoded-bytes"],
+)
+def test_console_origin_rejects_source_decoding_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes,
+) -> None:
+    python = _python_interpreter(tmp_path)
+    console = python.parent / "hermes"
+    console.write_bytes(b"#!" + os.fsencode(python) + b"\n" + body)
+    console.chmod(0o755)
     _mock_console_metadata(monkeypatch, scripts=python.parent)
 
     with pytest.raises(HermesCompatibilityError, match="content|console|entry"):
