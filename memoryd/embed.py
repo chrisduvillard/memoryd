@@ -62,9 +62,8 @@ class HashEmbedder:
 
 
 class VoyageEmbedder:
-    model = os.environ.get("MEMORYD_EMBED_MODEL", "voyage-3")
-
     def __init__(self) -> None:
+        self.model = os.environ.get("MEMORYD_EMBED_MODEL", "voyage-3")
         self.key = os.environ.get("VOYAGE_API_KEY", "")
         if not self.key:
             raise EmbedError("VOYAGE_API_KEY not set")

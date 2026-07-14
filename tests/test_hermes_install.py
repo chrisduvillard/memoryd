@@ -23,9 +23,21 @@ import memoryd.hermes_install as hermes
 
 
 KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
-AFFECTED_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *KEY_NAMES)
+AFFECTED_ENV = (
+    "MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE",
+    "MEMORYD_LLM_MODEL", "MEMORYD_MODEL_PROFILE", "MEMORYD_EMBED_BASE",
+    "MEMORYD_EMBED_MODEL", *KEY_NAMES,
+)
 INSTALL_ENV = ("HERMES_HOME", "MEMORYD_HOME", "OPENROUTER_API_KEY",
                "VOYAGE_API_KEY", "MEMORYD_LLM", "MEMORYD_EMBED")
+
+GUIDED_PROVIDER_OVERRIDES = (
+    "MEMORYD_LLM_BASE",
+    "MEMORYD_LLM_MODEL",
+    "MEMORYD_MODEL_PROFILE",
+    "MEMORYD_EMBED_BASE",
+    "MEMORYD_EMBED_MODEL",
+)
 
 
 def _tty(value: bool = True) -> SimpleNamespace:
@@ -61,6 +73,31 @@ def _operator_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         hermes, "_operator_home_from_passwd", lambda: operator, raising=False,
     )
     return operator
+
+
+@pytest.mark.parametrize(
+    ("marker", "value"),
+    [
+        ("_HERMES_GATEWAY", "1"),
+        ("HERMES_TUI", "1"),
+        ("HERMES_TUI_ACTIVE_SESSION_FILE", "/tmp/hermes-session.json"),
+        ("HERMES_TUI_GATEWAY_URL", "ws://127.0.0.1:4000"),
+    ],
+)
+def test_guided_environment_rejects_official_in_process_hermes_markers_first(
+    monkeypatch, marker, value,
+):
+    monkeypatch.setattr(hermes.sys, "platform", "linux")
+    monkeypatch.setattr(hermes.sys, "stdin", _tty())
+    monkeypatch.setattr(hermes.sys, "stdout", _tty())
+    monkeypatch.setenv(marker, value)
+    monkeypatch.setattr(
+        hermes.subprocess, "run",
+        lambda *_args, **_kwargs: pytest.fail("systemd probe must not run"),
+    )
+
+    with pytest.raises(hermes.HermesInstallError, match="Hermes|TUI|gateway"):
+        hermes.require_guided_environment()
 
 
 @pytest.mark.parametrize(
@@ -595,7 +632,12 @@ def test_credentials_never_read_secrets_from_non_owner_only_config(tmp_path, mon
 
 
 def test_validation_uses_canonical_provider_endpoints_minimally_and_restores_environment(monkeypatch):
-    old_values = ("old-llm", "old-embed", "https://attacker.invalid/collect", "old-open", "old-voyage")
+    old_values = (
+        "old-llm", "old-embed", "https://attacker.invalid/collect",
+        "attacker/chat-model", "attacker-profile",
+        "https://attacker.invalid/embed", "attacker-embed-model",
+        "old-open", "old-voyage",
+    )
     for name, value in zip(AFFECTED_ENV, old_values):
         monkeypatch.setenv(name, value)
     before = dict(os.environ)
@@ -613,6 +655,10 @@ def test_validation_uses_canonical_provider_endpoints_minimally_and_restores_env
         "MEMORYD_LLM": "openrouter",
         "MEMORYD_EMBED": "voyage",
         "MEMORYD_LLM_BASE": "https://openrouter.ai/api/v1",
+        "MEMORYD_LLM_MODEL": None,
+        "MEMORYD_MODEL_PROFILE": None,
+        "MEMORYD_EMBED_BASE": None,
+        "MEMORYD_EMBED_MODEL": None,
         "OPENROUTER_API_KEY": "new-open",
         "VOYAGE_API_KEY": "new-voyage",
     }
@@ -621,6 +667,8 @@ def test_validation_uses_canonical_provider_endpoints_minimally_and_restores_env
     assert events[1]["authorization"] == "Bearer new-voyage"
     chat_body = events[0]["body"]
     embed_body = events[1]["body"]
+    assert chat_body["model"] == "google/gemini-3.5-flash"
+    assert embed_body["model"] == "voyage-3"
     assert 0 < chat_body["max_tokens"] <= 8
     assert len(chat_body["messages"]) == 2
     assert embed_body["input"] == ["credential validation"]
@@ -750,8 +798,11 @@ def _hermes_target(tmp_path: Path) -> HermesTarget:
     root = tmp_path / "hermes"
     home = root / "profiles" / "work"
     home.mkdir(parents=True)
+    os.chmod(root, 0o700)
+    os.chmod(root / "profiles", 0o700)
     os.chmod(home, 0o700)
     (root / "active_profile").write_text("work", encoding="utf-8")
+    os.chmod(root / "active_profile", 0o600)
     return HermesTarget(
         root=root.resolve(),
         home=home.resolve(),
@@ -1741,7 +1792,19 @@ def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_r
     migrations = tmp_path / "migrations"
     migrations.mkdir()
     (migrations / "001_base.sql").write_text("SELECT 1;\n", encoding="utf-8")
-    _safe_config(memory_home / "config.json", _managed_payload(memory_home))
+    managed = _managed_payload(memory_home)
+    assert isinstance(managed["env"], dict)
+    managed["env"].update({
+        "MEMORYD_LLM_BASE": "https://HOSTILE-CONFIG-SENTINEL.invalid/collect",
+        "MEMORYD_LLM_MODEL": "hostile/model",
+        "MEMORYD_MODEL_PROFILE": "hostile-profile",
+        "MEMORYD_EMBED_BASE": "https://HOSTILE-EMBED-SENTINEL.invalid",
+        "MEMORYD_EMBED_MODEL": "hostile-embed",
+        "ANTHROPIC_API_KEY": "stale-anthropic-secret",
+        "OPENAI_API_KEY": "stale-openai-secret",
+        "MEMORYD_RECALL_POLICY": "operator-policy-v1",
+    })
+    _safe_config(memory_home / "config.json", managed)
     monkeypatch.setenv("OPENROUTER_API_KEY", "caller-openrouter")
     monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
     monkeypatch.setenv("MEMORYD_LLM", "caller-llm")
@@ -1773,7 +1836,10 @@ def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_r
     monkeypatch.setattr(
         cli, "install_autostart",
         lambda *, _hermes_mode=False: autostart_modes.append(_hermes_mode))
-    monkeypatch.setattr(cli, "_start_daemon_now", lambda: None)
+    monkeypatch.setattr(
+        cli, "_start_daemon_now",
+        lambda: pytest.fail("Hermes systemd mode must not use detached fallback"),
+    )
     monkeypatch.setattr(cli, "_wait_for_healthy_daemon", lambda: True, raising=False)
     monkeypatch.setattr(cli, "status", lambda: 0)
 
@@ -1803,6 +1869,7 @@ def test_core_install_uses_explicit_profile_skips_hooks_persists_providers_and_r
         "VOYAGE_API_KEY": credentials.voyage_key,
         "MEMORYD_LLM": "openrouter",
         "MEMORYD_EMBED": "voyage",
+        "MEMORYD_RECALL_POLICY": "operator-policy-v1",
     }
     if os.name != "nt":
         assert stat.S_IMODE(hermes_config.stat().st_mode) == 0o600

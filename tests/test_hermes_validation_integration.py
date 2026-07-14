@@ -11,6 +11,7 @@ import memoryd
 from memoryd.hermes_compat import (
     PINNED_HERMES_VERSION,
     HermesTarget,
+    resolve_hermes_target,
     validate_hermes_compatibility,
 )
 
@@ -54,13 +55,28 @@ def test_packaged_preflight_runs_against_distinct_pinned_hermes(
     root = tmp_path / "authoritative-hermes"
     home = root / "profiles" / "work"
     home.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    (root / "profiles").chmod(0o700)
     home.chmod(0o700)
     (root / "active_profile").write_text("work", encoding="utf-8")
+    os.chmod(root / "active_profile", 0o600)
     (home / "sentinel.json").write_text(
         '{"authoritative": true}\n', encoding="utf-8"
     )
     before = _tree_manifest(root)
     executable = target_python.parent / "hermes"
+    previous_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = os.pathsep.join((os.fspath(target_python.parent), previous_path))
+    try:
+        resolved = resolve_hermes_target({"HERMES_HOME": os.fspath(root)})
+    finally:
+        os.environ["PATH"] = previous_path
+    assert resolved == HermesTarget(
+        root=root,
+        home=home,
+        executable=executable.resolve(),
+        python=target_python,
+    )
     package = Path(memoryd.__file__).resolve().parent
     plugin = package / "hermes_plugin"
     assert plugin.is_dir(), "integration must run from an installed memoryd wheel"

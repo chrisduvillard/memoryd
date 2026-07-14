@@ -6,11 +6,18 @@ from pathlib import Path
 import pytest
 
 from memoryd import hermes_install as hermes
+import memoryd.hermes_compat as compat
 from memoryd.hermes_compat import HermesCompatibilityError, HermesTarget
 
 
 OPENROUTER_SECRET = "orchestration-openrouter-secret"
 VOYAGE_SECRET = "orchestration-voyage-secret"
+
+
+@pytest.fixture(autouse=True)
+def _clean_guided_provider_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in hermes._PROVIDER_ROUTING_ENV:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _workflow(
@@ -178,6 +185,84 @@ def test_ambient_memory_redirect_stops_before_target_or_plugin_mutation(
     assert name in output.err
     assert value not in output.err
     assert "SENSITIVE" not in output.err
+
+
+def test_missing_default_profile_stops_before_prompt_probe_or_target_mutation(
+    monkeypatch, tmp_path, capsys,
+):
+    operator = tmp_path / "operator"
+    operator.mkdir(mode=0o700)
+    hermes_root = operator / ".hermes"
+    memory_home = operator / "memory"
+    monkeypatch.setattr(hermes, "require_guided_environment", lambda: None)
+    monkeypatch.setattr(
+        hermes, "_operator_home_from_passwd", lambda: operator, raising=False,
+    )
+    monkeypatch.setattr(compat.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        compat, "_resolve_command", lambda: tmp_path / "bin" / "hermes",
+    )
+    monkeypatch.setattr(
+        compat, "_resolve_python", lambda _command: tmp_path / "venv" / "python",
+    )
+    monkeypatch.setattr(
+        compat, "_query_version", lambda _python: compat.PINNED_HERMES_VERSION,
+    )
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("MEMORYD_HOME", raising=False)
+    monkeypatch.delenv("MEMORYD_DSN", raising=False)
+
+    for name in (
+        "validate_hermes_compatibility",
+        "classify_memory_home",
+        "confirm_operator",
+        "collect_provider_credentials",
+        "validate_provider_credentials",
+        "install_hermes_core",
+    ):
+        monkeypatch.setattr(
+            hermes, name,
+            lambda *_args, _name=name, **_kwargs: pytest.fail(
+                f"{_name} must not run for a missing selected profile"
+            ),
+        )
+
+    assert hermes.guided_hermes_install() == 1
+
+    assert not hermes_root.exists()
+    assert not memory_home.exists()
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "profile" in output.err.lower()
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "MEMORYD_LLM_BASE",
+        "MEMORYD_LLM_MODEL",
+        "MEMORYD_MODEL_PROFILE",
+        "MEMORYD_EMBED_BASE",
+        "MEMORYD_EMBED_MODEL",
+    ],
+)
+def test_hostile_ambient_provider_override_stops_before_prompt_probe_or_core(
+    monkeypatch, tmp_path, capsys, override,
+):
+    sentinel = "HOSTILE-PROVIDER-OVERRIDE-SENTINEL"
+    monkeypatch.setenv(override, f"https://{sentinel}.invalid/collect")
+    events, _target, _snapshot, previous, current = _workflow(
+        monkeypatch, tmp_path,
+    )
+
+    assert hermes.guided_hermes_install() == 1
+
+    assert events == ["environment", "home", "target", "plugin", "compatibility", "classify"]
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert override in output.err
+    assert sentinel not in output.err
+    assert current == previous
 
 
 @pytest.mark.parametrize("classification", ["fresh", "managed"])

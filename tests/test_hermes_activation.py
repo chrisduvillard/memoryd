@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import contextlib
 import io
 import json
 import multiprocessing
@@ -22,6 +23,12 @@ from memoryd.hermes_compat import HermesTarget
 
 
 SECRET = "CHILD-CONFIG-SECRET-SENTINEL"
+
+
+@pytest.fixture(autouse=True)
+def _clean_guided_provider_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in hermes._PROVIDER_ROUTING_ENV:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _move_job_under_plugin_lock(
@@ -294,6 +301,53 @@ def test_real_provider_child_rejects_unsafe_value_without_emitting_it(
     assert result.stdout == ""
     assert result.stderr == ""
     assert SECRET not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("provider_yaml", ['""', '"   "', "null"])
+def test_real_provider_child_normalizes_hermes_builtin_only_forms(
+    tmp_path, provider_yaml,
+):
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        f"memory:\n  provider: {provider_yaml}\n", encoding="utf-8"
+    )
+    environment = dict(os.environ)
+    environment["HERMES_HOME"] = os.fspath(home)
+
+    result = subprocess.run(
+        [sys.executable, "-c", hermes._PROVIDER_PROBE],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) is None
+    assert result.stderr == ""
+
+
+def test_capture_normalizes_empty_provider_output_to_builtin_only(
+    monkeypatch, tmp_path,
+):
+    target = _target(tmp_path)
+    monkeypatch.setenv("UNRELATED_ACTIVATION_TEST", "preserved")
+    calls = 0
+
+    def run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(command, 0, '""\n', "")
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+    monkeypatch.setattr(hermes.subprocess, "run", run)
+
+    assert hermes.capture_runtime_state(target) == hermes.HermesRuntimeState(
+        provider=None, gateway_running=False,
+    )
 
 
 @pytest.mark.parametrize("gateway_running", [False, True])
@@ -884,7 +938,7 @@ def test_signal_during_failure_reporting_cannot_escape_or_leak_handlers(
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
-def test_signal_during_each_handler_restore_rolls_back_and_restores_both(
+def test_signal_during_each_handler_restore_preserves_commit_and_restores_both(
     monkeypatch, tmp_path, capsys, signum,
 ):
     target = _target(tmp_path, "legacy")
@@ -901,7 +955,7 @@ def test_signal_during_each_handler_restore_rolls_back_and_restores_both(
     assert escaped is None
     assert result == 128 + int(signum)
     assert signals.restore_signal_delivered
-    assert _read_provider(target.home) == "legacy"
+    assert _read_provider(target.home) == "memoryd"
     assert boundary.gateway_running is True
     assert artifact.read_bytes() == b"preserved installation evidence"
     assert signals.current == signals.previous
@@ -986,3 +1040,101 @@ def test_sigint_during_committed_stdout_flush_propagates_without_rollback(
     output = capsys.readouterr()
     assert "Authoritative Hermes profile" in output.out
     assert "14-day/200-turn canary" in output.out
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "signal"])
+def test_activation_status_uses_canonical_guided_environment_and_restores_ambient(
+    monkeypatch, tmp_path, capsys, outcome,
+):
+    target = _target(tmp_path, "legacy")
+    _spool_root(target)
+    boundary = _install_boundary(monkeypatch, target, gateway_running=True)
+    operator = tmp_path / "operator"
+    operator.mkdir(mode=0o700)
+    memory_home = operator / "memory"
+    artifact = memory_home / "initial.snapshot"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"preserved")
+    signals = _prepare_guided_activation(monkeypatch, target, artifact)
+    monkeypatch.setattr(hermes, "_resolved_operator_home", lambda: operator)
+    hostile = tmp_path / "hostile-home"
+    hostile.mkdir(mode=0o700)
+    marker = hostile / "marker"
+    marker.write_bytes(b"untouched")
+    monkeypatch.setenv("HOME", os.fspath(hostile))
+    monkeypatch.delenv("MEMORYD_HOME", raising=False)
+    before = {name: os.environ.get(name) for name in ("HOME", "MEMORYD_HOME", "HERMES_HOME")}
+
+    def status() -> int:
+        boundary.events.append("memoryd cli status")
+        assert os.environ["HOME"] == os.fspath(operator)
+        assert os.environ["MEMORYD_HOME"] == os.fspath(memory_home)
+        assert os.environ["HERMES_HOME"] == os.fspath(target.home)
+        if outcome == "signal":
+            signals.deliver(signal.SIGTERM)
+        return 1 if outcome == "failure" else 0
+
+    monkeypatch.setattr(hermes.cli, "status", status)
+
+    result, escaped = _guided_outcome()
+
+    assert escaped is None
+    assert result == {"success": 0, "failure": 1, "signal": 143}[outcome]
+    assert {name: os.environ.get(name) for name in before} == before
+    assert marker.read_bytes() == b"untouched"
+    assert _read_provider(target.home) == ("memoryd" if outcome == "success" else "legacy")
+
+
+def _real_sigterm_precommit_child(root: str) -> None:
+    tmp_path = Path(root)
+    monkeypatch = pytest.MonkeyPatch()
+    target = _target(tmp_path, "legacy")
+    artifact = tmp_path / "memory" / "initial.snapshot"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"preserved")
+    credentials = hermes.ProviderCredentials("open", "voyage")
+    rollback = tmp_path / "rollback.marker"
+
+    monkeypatch.setattr(hermes, "require_guided_environment", lambda: None)
+    monkeypatch.setattr(hermes, "resolve_guided_memory_home", lambda: artifact.parent)
+    monkeypatch.setattr(hermes, "resolve_guided_hermes_target", lambda: target)
+    monkeypatch.setattr(hermes.cli, "_resource_dir", lambda _name: target.home)
+    monkeypatch.setattr(hermes, "validate_hermes_compatibility", lambda *_args: None)
+    monkeypatch.setattr(hermes, "classify_memory_home", lambda _home: "managed")
+    monkeypatch.setattr(hermes, "confirm_operator", lambda: None)
+    monkeypatch.setattr(hermes, "collect_provider_credentials", lambda _path: credentials)
+    monkeypatch.setattr(hermes, "validate_provider_credentials", lambda _value: None)
+    monkeypatch.setattr(hermes, "install_hermes_core", lambda *_args: artifact)
+
+    @contextlib.contextmanager
+    def activation(_target):
+        try:
+            yield
+            os.kill(os.getpid(), signal.SIGTERM)
+        except BaseException:
+            rollback.write_text("rolled back", encoding="utf-8")
+            raise hermes.HermesInstallError("activation interrupted after rollback") from None
+
+    monkeypatch.setattr(hermes, "_activation_transaction", activation)
+    try:
+        assert hermes.guided_hermes_install() == 143
+        assert rollback.read_text(encoding="utf-8") == "rolled back"
+    finally:
+        monkeypatch.undo()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="real signal boundary is POSIX-only")
+def test_real_sigterm_after_report_before_transaction_exit_rolls_back(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy; ns=runpy.run_path(" + repr(str(Path(__file__)))
+            + "); ns['_real_sigterm_precommit_child'](" + repr(str(tmp_path)) + ")",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

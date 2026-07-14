@@ -58,10 +58,20 @@ class ProviderCredentials:
 
 
 _KEY_NAMES = ("OPENROUTER_API_KEY", "VOYAGE_API_KEY")
-_VALIDATION_ENV = ("MEMORYD_LLM", "MEMORYD_EMBED", "MEMORYD_LLM_BASE", *_KEY_NAMES)
+_PROVIDER_ROUTING_ENV = (
+    "MEMORYD_LLM",
+    "MEMORYD_LLM_BASE",
+    "MEMORYD_LLM_MODEL",
+    "MEMORYD_MODEL_PROFILE",
+    "MEMORYD_EMBED",
+    "MEMORYD_EMBED_BASE",
+    "MEMORYD_EMBED_MODEL",
+)
+_ALTERNATE_PROVIDER_KEYS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+_PROVIDER_ENV = (*_PROVIDER_ROUTING_ENV, *_ALTERNATE_PROVIDER_KEYS, *_KEY_NAMES)
+_VALIDATION_ENV = _PROVIDER_ENV
 _INSTALL_ENV = (
-    "HOME", "HERMES_HOME", "MEMORYD_HOME", *_KEY_NAMES,
-    "MEMORYD_LLM", "MEMORYD_EMBED",
+    "HOME", "HERMES_HOME", "MEMORYD_HOME", *_PROVIDER_ENV,
 )
 _PROVIDER_PATTERN = r"[a-z0-9][a-z0-9_-]{0,63}"
 _PROVIDER_NAME = re.compile(_PROVIDER_PATTERN)
@@ -69,6 +79,12 @@ _PLUGIN_URL = "http://127.0.0.1:7437"
 _SPOOL_DRAIN_TIMEOUT = 15.0
 _SPOOL_POLL_INTERVAL = 0.1
 _PLUGIN_REQUIRED = frozenset(("__init__.py", "plugin.yaml", "spool.py"))
+_HERMES_PROCESS_MARKERS = (
+    ("_HERMES_GATEWAY", "1"),
+    ("HERMES_TUI", "1"),
+    ("HERMES_TUI_ACTIVE_SESSION_FILE", None),
+    ("HERMES_TUI_GATEWAY_URL", None),
+)
 _PROVIDER_PROBE = """\
 import json
 import os
@@ -90,6 +106,8 @@ try:
     if not isinstance(memory, dict):
         raise ValueError
     provider = memory.get("provider")
+    if type(provider) is str and not provider.strip():
+        provider = None
     if provider is not None and (
         type(provider) is not str
         or re.fullmatch(provider_pattern, provider) is None
@@ -139,6 +157,8 @@ def _capture_provider(target: HermesTarget) -> str | None:
         provider = json.loads(result.stdout)
     except (TypeError, ValueError, RecursionError):
         raise HermesInstallError("The Hermes provider state is malformed.") from None
+    if type(provider) is str and not provider.strip():
+        provider = None
     if provider is not None and (
         type(provider) is not str or _PROVIDER_NAME.fullmatch(provider) is None
     ):
@@ -586,6 +606,13 @@ def require_guided_environment() -> None:
     if not sys.platform.startswith("linux"):
         raise HermesInstallError("Guided installation requires Linux.")
 
+    for name, exact in _HERMES_PROCESS_MARKERS:
+        value = os.environ.get(name, "")
+        if (exact is None and bool(value)) or value == exact:
+            raise HermesInstallError(
+                f"Hermes guided installation cannot run inside Hermes ({name})."
+            )
+
     try:
         interactive = sys.stdin.isatty() and sys.stdout.isatty()
     except (AttributeError, OSError):
@@ -780,6 +807,26 @@ def classify_memory_home(home: Path) -> Literal["fresh", "managed"]:
     return "managed"
 
 
+def validate_guided_provider_environment() -> None:
+    """Refuse ambient routing that could redirect validated production keys."""
+    allowed = {
+        "MEMORYD_LLM": "openrouter",
+        "MEMORYD_LLM_BASE": "https://openrouter.ai/api/v1",
+        "MEMORYD_LLM_MODEL": "google/gemini-3.5-flash",
+        "MEMORYD_MODEL_PROFILE": "openrouter",
+        "MEMORYD_EMBED": "voyage",
+        "MEMORYD_EMBED_MODEL": "voyage-3",
+    }
+    for name in _PROVIDER_ROUTING_ENV:
+        value = os.environ.get(name, "")
+        if not value:
+            continue
+        if name == "MEMORYD_EMBED_BASE" or value != allowed.get(name):
+            raise HermesInstallError(
+                f"{name} must be unset or use the guided production default."
+            )
+
+
 def collect_provider_credentials(config_path: Path) -> ProviderCredentials:
     """Collect provider keys from process env, safe config, then hidden prompts."""
     values = {key_name: os.environ.get(key_name, "") for key_name in _KEY_NAMES}
@@ -833,6 +880,8 @@ def validate_provider_credentials(credentials: ProviderCredentials) -> None:
     try:
         environment_failed = False
         try:
+            for name in _VALIDATION_ENV:
+                os.environ.pop(name, None)
             os.environ.update(
                 {
                     "MEMORYD_LLM": "openrouter",
@@ -1774,6 +1823,8 @@ def install_hermes_core(
 
         if failure is None:
             try:
+                for name in _PROVIDER_ENV:
+                    os.environ.pop(name, None)
                 os.environ.update(
                     {
                         "HERMES_HOME": os.fspath(target.home),
@@ -1854,6 +1905,37 @@ def install_hermes_core(
     return snapshot
 
 
+@contextlib.contextmanager
+def _guided_activation_environment(
+    target: HermesTarget,
+    memory_home: Path,
+    credentials: ProviderCredentials,
+    before_restore,
+):
+    names = ("HOME", "HERMES_HOME", "MEMORYD_HOME", "MEMORYD_DSN", *_PROVIDER_ENV)
+    previous = {name: os.environ[name] for name in names if name in os.environ}
+    try:
+        for name in names:
+            os.environ.pop(name, None)
+        os.environ.update(
+            {
+                "HOME": os.fspath(_resolved_operator_home()),
+                "HERMES_HOME": os.fspath(target.home),
+                "MEMORYD_HOME": os.fspath(memory_home),
+                "OPENROUTER_API_KEY": credentials.openrouter_key,
+                "VOYAGE_API_KEY": credentials.voyage_key,
+                "MEMORYD_LLM": "openrouter",
+                "MEMORYD_EMBED": "voyage",
+            }
+        )
+        yield
+    finally:
+        before_restore()
+        for name in names:
+            os.environ.pop(name, None)
+        os.environ.update(previous)
+
+
 def guided_hermes_install() -> int:
     """Run the complete interactive Hermes installation workflow."""
     credentials: ProviderCredentials | None = None
@@ -1875,6 +1957,10 @@ def guided_hermes_install() -> int:
     def report_interruption(signum: int) -> None:
         name = signal.Signals(signum).name
         print(f"Hermes guided installation interrupted ({name}).", file=sys.stderr)
+
+    def defer_signals() -> None:
+        nonlocal signal_can_interrupt
+        signal_can_interrupt = False
 
     def restore_handlers() -> None:
         nonlocal signal_can_interrupt
@@ -1908,6 +1994,7 @@ def guided_hermes_install() -> int:
             target, cli._resource_dir("hermes_plugin"),
         )
         classify_memory_home(memory_home)
+        validate_guided_provider_environment()
         confirm_operator()
         credentials = collect_provider_credentials(memory_home / "config.json")
         validate_provider_credentials(credentials)
@@ -1927,12 +2014,14 @@ def guided_hermes_install() -> int:
         for secret in (credentials.openrouter_key, credentials.voyage_key):
             report = report.replace(secret, "<redacted>")
         report_buffer = io.StringIO()
-        with _activation_transaction(target):
-            print(report, file=report_buffer)
-            restore_handlers()
-            if interrupted_signal is not None:
-                raise KeyboardInterrupt
-            committed_report = report_buffer.getvalue()
+        with _guided_activation_environment(
+            target, memory_home, credentials, defer_signals,
+        ):
+            with _activation_transaction(target):
+                print(report, file=report_buffer)
+                if interrupted_signal is not None:
+                    raise KeyboardInterrupt
+                committed_report = report_buffer.getvalue()
     except KeyboardInterrupt:
         signal_can_interrupt = False
         if interrupted_signal is None:

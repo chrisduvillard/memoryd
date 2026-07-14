@@ -44,6 +44,25 @@ LEGACY_PG_PASSWORD = "memoryd"
 MANAGED_CREDENTIALS = ".managed-postgres.json"
 DOCKER_ENV_PREFIX = ".memoryd-docker-env-"
 HERMES_MEMORYD_URL = "http://127.0.0.1:7437"
+GUIDED_PROVIDER_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "VOYAGE_API_KEY",
+    "MEMORYD_LLM",
+    "MEMORYD_LLM_BASE",
+    "MEMORYD_LLM_MODEL",
+    "MEMORYD_MODEL_PROFILE",
+    "MEMORYD_EMBED",
+    "MEMORYD_EMBED_BASE",
+    "MEMORYD_EMBED_MODEL",
+)
+_GUIDED_PROVIDER_VALUES = (
+    "OPENROUTER_API_KEY",
+    "VOYAGE_API_KEY",
+    "MEMORYD_LLM",
+    "MEMORYD_EMBED",
+)
 HOOK_SENTINEL = "-m memoryd.hook"
 HOOK_EVENTS = {
     "UserPromptSubmit": ("recall", 5),
@@ -490,7 +509,7 @@ def apply_migrations(dsn: str) -> list[str]:
 
 # ----------------------------------------------------------------- install steps
 
-def write_config(dsn: str) -> Path:
+def write_config(dsn: str, *, _hermes_mode: bool = False) -> Path:
     home = _home()
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     if home.is_symlink() or not home.is_dir():
@@ -527,13 +546,35 @@ def write_config(dsn: str) -> Path:
             "MEMORYD_RECALL_POLICY",
             "MEMORYD_PACKET_COMPILER", "MEMORYD_EVAL_PROFILE")
     existing = cfg.get("env") or {}
-    changed = [k for k in keys if os.environ.get(k) and existing.get(k) != os.environ[k]]
-    if changed:
-        env = cfg.setdefault("env", {})
-        for k in changed:
-            env[k] = os.environ[k]  # env wins on install so key rotation takes effect
-        print(f"  config     persisted {', '.join(changed)} so scheduled runs "
-              "use them; edit config.json's env map to change")
+    if _hermes_mode:
+        if not isinstance(existing, dict):
+            raise OSError("memoryd config env must be an object")
+        guided = {name: os.environ.get(name, "") for name in _GUIDED_PROVIDER_VALUES}
+        if (
+            not guided["OPENROUTER_API_KEY"]
+            or not guided["VOYAGE_API_KEY"]
+            or guided["MEMORYD_LLM"] != "openrouter"
+            or guided["MEMORYD_EMBED"] != "voyage"
+        ):
+            raise OSError("guided provider environment is incomplete")
+        env = {
+            name: value for name, value in existing.items()
+            if name not in GUIDED_PROVIDER_ENV_KEYS
+        }
+        env.update(guided)
+        cfg["env"] = env
+        print("  config     persisted guided OpenRouter and Voyage providers")
+    else:
+        changed = [
+            k for k in keys
+            if os.environ.get(k) and existing.get(k) != os.environ[k]
+        ]
+        if changed:
+            env = cfg.setdefault("env", {})
+            for k in changed:
+                env[k] = os.environ[k]  # env wins on install so key rotation takes effect
+            print(f"  config     persisted {', '.join(changed)} so scheduled runs "
+                  "use them; edit config.json's env map to change")
     _atomic_owner_json(p, cfg)
     value = p.stat(follow_symlinks=False)
     if p.is_symlink() or not stat.S_ISREG(value.st_mode):
@@ -586,7 +627,7 @@ _SYSTEMD_SERVICE = """[Unit]
 Description=memoryd memory daemon
 
 [Service]
-ExecStart={python} -m memoryd serve
+{environment}ExecStart={python} -m memoryd serve
 Restart=on-failure
 RestartSec=5
 
@@ -598,7 +639,7 @@ _SYSTEMD_SLEEP_SERVICE = """[Unit]
 Description=memoryd nightly consolidation
 
 [Service]
-Type=oneshot
+{environment}Type=oneshot
 ExecStart={python} -m memoryd microsleep
 """
 
@@ -617,7 +658,7 @@ _SYSTEMD_BACKUP_SERVICE = """[Unit]
 Description=memoryd daily verified backup
 
 [Service]
-Type=oneshot
+{environment}Type=oneshot
 ExecStartPre=systemctl --user stop memoryd.service
 ExecStart={python} -m memoryd backup create --retain 14
 ExecStopPost=systemctl --user start memoryd.service
@@ -627,7 +668,7 @@ _SYSTEMD_INITIAL_BACKUP_SERVICE = """[Unit]
 Description=memoryd initial verified backup
 
 [Service]
-Type=oneshot
+{environment}Type=oneshot
 ExecStartPre=systemctl --user stop memoryd.service
 ExecStart={python} -m memoryd backup create --no-retention
 ExecStopPost=systemctl --user start memoryd.service
@@ -686,25 +727,55 @@ def install_autostart(*, _hermes_mode: bool = False) -> None:
         unit_dir = Path("~/.config/systemd/user").expanduser()
         unit_dir.mkdir(parents=True, exist_ok=True)
         python = _systemd_exec_arg(sys.executable)
+        environment = (
+            "UnsetEnvironment=" + " ".join(GUIDED_PROVIDER_ENV_KEYS) + "\n"
+            if _hermes_mode else ""
+        )
         (unit_dir / "memoryd.service").write_text(
-            _SYSTEMD_SERVICE.format(python=python), encoding="utf-8")
+            _SYSTEMD_SERVICE.format(python=python, environment=environment),
+            encoding="utf-8")
         (unit_dir / "memoryd-microsleep.service").write_text(
-            _SYSTEMD_SLEEP_SERVICE.format(python=python), encoding="utf-8")
+            _SYSTEMD_SLEEP_SERVICE.format(python=python, environment=environment),
+            encoding="utf-8")
         (unit_dir / "memoryd-microsleep.timer").write_text(
             _SYSTEMD_SLEEP_TIMER, encoding="utf-8")
         (unit_dir / "memoryd-backup.service").write_text(
-            _SYSTEMD_BACKUP_SERVICE.format(python=python),
+            _SYSTEMD_BACKUP_SERVICE.format(
+                python=python, environment=environment,
+            ),
             encoding="utf-8")
         if _hermes_mode:
             (unit_dir / "memoryd-backup-initial.service").write_text(
-                _SYSTEMD_INITIAL_BACKUP_SERVICE.format(python=python),
+                _SYSTEMD_INITIAL_BACKUP_SERVICE.format(
+                    python=python, environment=environment,
+                ),
                 encoding="utf-8")
         (unit_dir / "memoryd-backup.timer").write_text(
             _SYSTEMD_BACKUP_TIMER, encoding="utf-8")
-        _run(["systemctl", "--user", "daemon-reload"])
+        reload_code, _ = _run(["systemctl", "--user", "daemon-reload"])
+        if _hermes_mode and reload_code != 0:
+            raise RuntimeError("Hermes systemd daemon reload failed")
         code, out = _run(["systemctl", "--user", "enable", "--now",
                           "memoryd.service", "memoryd-microsleep.timer",
                           "memoryd-backup.timer"])
+        if _hermes_mode and code != 0:
+            raise RuntimeError("Hermes systemd unit enable/start failed")
+        if _hermes_mode:
+            required = (
+                "memoryd.service",
+                "memoryd-microsleep.timer",
+                "memoryd-backup.timer",
+            )
+            for unit in required:
+                enabled, _ = _run(
+                    ["systemctl", "--user", "is-enabled", unit]
+                )
+                if enabled != 0:
+                    raise RuntimeError("Hermes systemd unit is not enabled")
+            for unit in required:
+                active, _ = _run(["systemctl", "--user", "is-active", unit])
+                if active != 0:
+                    raise RuntimeError("Hermes systemd unit is not active")
         print("  autostart  systemd user units enabled"
               + (" (headless box? run: loginctl enable-linger $USER)" if code == 0
                  else f" FAILED: {out}"))
@@ -797,7 +868,7 @@ def install(options: _InstallOptions | None = None) -> int:
     total = len(list(_resource_dir("migrations").glob("*.sql")))
     print(f"  migrations {len(applied)} applied, {total} total"
           + (f" ({', '.join(applied)})" if applied else ""))
-    print(f"  config     {write_config(dsn)}")
+    print(f"  config     {write_config(dsn, _hermes_mode=options is not None)}")
     if options is None:
         print(f"  hooks      registered in {register_claude_hooks()}")
         install_hermes_plugin()
@@ -806,7 +877,8 @@ def install(options: _InstallOptions | None = None) -> int:
         if options.publish_hermes_plugin:
             install_hermes_plugin(options.hermes_home, show_activation_hint=False)
         install_autostart(_hermes_mode=True)
-    _start_daemon_now()
+    if options is None:
+        _start_daemon_now()
     healthy = _wait_for_healthy_daemon()
     if options is not None and not healthy:
         raise RuntimeError("memoryd did not become healthy after installation")

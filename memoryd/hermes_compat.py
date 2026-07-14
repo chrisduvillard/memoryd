@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -23,6 +24,17 @@ PINNED_HERMES_TAG = "v2026.6.5"
 PINNED_HERMES_COMMIT = "3c231eb3979ab9c57d5cd6d02f1d577a3b718b43"
 
 _PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_CONSOLE_ENTRY_POINT = "hermes_cli.main:main"
+_CONSOLE_BODY = """# -*- coding: utf-8 -*-
+import sys
+from hermes_cli.main import main
+if __name__ == "__main__":
+    if sys.argv[0].endswith("-script.pyw"):
+        sys.argv[0] = sys.argv[0][:-11]
+    elif sys.argv[0].endswith(".exe"):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(main())
+"""
 _REMEDIATION = (
     "pipx install --force --python python3.13 "
     "'git+https://github.com/NousResearch/hermes-agent.git@"
@@ -71,15 +83,65 @@ def _canonical_absolute(path: Path, description: str) -> Path:
     return path
 
 
-def _validate_selected_home(path: Path) -> None:
-    if not path.is_dir():
-        raise _error(f"Selected Hermes profile does not exist as a directory: {path}")
+def _effective_uid() -> int:
+    getter = getattr(os, "geteuid", None)
+    return int(getter()) if getter is not None else 0
+
+
+def _stable_path_stat(path: Path, description: str) -> os.stat_result:
     try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-    except OSError as exc:
-        raise _error(f"Could not inspect selected Hermes profile: {path}") from exc
-    if mode != 0o700:
-        raise _error(f"Selected Hermes profile must have mode 0700: {path}")
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or path.resolve(strict=True) != path:
+            raise _error(f"{description} must have stable canonical topology")
+        after = path.lstat()
+    except HermesCompatibilityError:
+        raise
+    except (OSError, RuntimeError):
+        raise _error(f"Could not inspect {description}") from None
+    if (before.st_dev, before.st_ino, before.st_mode) != (
+        after.st_dev, after.st_ino, after.st_mode,
+    ):
+        raise _error(f"{description} changed during inspection")
+    if after.st_uid != _effective_uid():
+        raise _error(f"{description} must be owned by the effective user")
+    return after
+
+
+def _validate_private_directory(path: Path, description: str) -> None:
+    try:
+        value = _stable_path_stat(path, description)
+    except HermesCompatibilityError as error:
+        if not path.exists():
+            raise _error(f"{description} does not exist as a directory") from None
+        raise error
+    if not stat.S_ISDIR(value.st_mode):
+        raise _error(f"{description} does not exist as a directory")
+    if stat.S_IMODE(value.st_mode) != 0o700:
+        raise _error(f"{description} must have mode 0700")
+
+
+def _validate_selected_home(path: Path) -> None:
+    _validate_private_directory(path, "Selected Hermes profile")
+
+
+def _read_active_profile(marker: Path) -> str:
+    try:
+        value = marker.lstat()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        raise _error("Could not inspect the Hermes active_profile marker") from None
+    if stat.S_ISLNK(value.st_mode):
+        raise _error("Hermes active_profile marker must not be a symlink")
+    stable = _stable_path_stat(marker, "Hermes active_profile marker")
+    if not stat.S_ISREG(stable.st_mode):
+        raise _error("Hermes active_profile marker must be a regular file")
+    if stat.S_IMODE(stable.st_mode) != 0o600:
+        raise _error("Hermes active_profile marker must have mode 0600")
+    try:
+        return marker.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise _error("Could not read the Hermes active_profile marker") from None
 
 
 def resolve_hermes_home(
@@ -96,6 +158,8 @@ def resolve_hermes_home(
     candidate = _canonical_absolute(candidate, "Hermes home")
     if candidate.parent.name == "profiles":
         root = _canonical_absolute(candidate.parent.parent, "Hermes root")
+        _validate_private_directory(root, "Hermes root")
+        _validate_private_directory(candidate.parent, "Hermes profiles directory")
         _validate_selected_home(candidate)
         return root, candidate
 
@@ -103,15 +167,10 @@ def resolve_hermes_home(
     if root.exists() and not root.is_dir():
         raise _error(f"Hermes root is not a directory: {root}")
 
+    if root.exists():
+        _validate_private_directory(root, "Hermes root")
     marker = root / "active_profile"
-    try:
-        if marker.is_symlink():
-            raise _error("Hermes active_profile marker must not be a symlink")
-        active_profile = marker.read_text(encoding="utf-8") if marker.exists() else ""
-    except HermesCompatibilityError:
-        raise
-    except (OSError, UnicodeError) as exc:
-        raise _error("Could not read the Hermes active_profile marker") from exc
+    active_profile = _read_active_profile(marker) if root.exists() else ""
 
     if active_profile in ("", "default"):
         if root.exists():
@@ -121,6 +180,7 @@ def resolve_hermes_home(
     if _PROFILE_NAME.fullmatch(active_profile) is None:
         raise _error("Hermes active_profile contains an invalid profile name")
 
+    _validate_private_directory(root / "profiles", "Hermes profiles directory")
     home = _canonical_absolute(root / "profiles" / active_profile, "Hermes profile")
     _validate_selected_home(home)
     return root, home
@@ -180,11 +240,64 @@ def _query_version(python: Path) -> str:
         "-c",
         "import importlib.metadata; print(importlib.metadata.version('hermes-agent'))",
     ]
+    result: subprocess.CompletedProcess[str] | None = None
+    failed = False
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise _error("Could not query the installed hermes-agent version") from exc
+        result = subprocess.run(
+            command, check=True, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        failed = True
+    if failed or result is None:
+        raise _error("Could not query the installed hermes-agent version")
     return result.stdout.strip()
+
+
+def _validate_console_origin(executable: Path, python: Path) -> None:
+    query = (
+        "import importlib.metadata as m,json,sysconfig;"
+        "d=m.distribution('hermes-agent');"
+        "e=[x for x in d.entry_points if x.group=='console_scripts' and x.name=='hermes'];"
+        "print(json.dumps({'entry_point':e[0].value if len(e)==1 else None,"
+        "'scripts':sysconfig.get_path('scripts')}))"
+    )
+    command = [os.fspath(python), "-c", query]
+    payload: object = None
+    failed = False
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError, RecursionError):
+        failed = True
+    if failed:
+        raise _error("Could not resolve the Hermes console entry point")
+    if not isinstance(payload, dict) or payload.get("entry_point") != _CONSOLE_ENTRY_POINT:
+        raise _error("The Hermes console entry point is not the pinned runtime entry point")
+    scripts = payload.get("scripts")
+    if not isinstance(scripts, str):
+        raise _error("The Hermes console entry point origin is malformed")
+    scripts_path = Path(scripts)
+    if not scripts_path.is_absolute():
+        raise _error("The Hermes console entry point origin is malformed")
+    expected = _canonical_absolute(scripts_path / "hermes", "Hermes console entry point")
+    try:
+        expected = expected.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise _error("The Hermes console entry point does not exist") from None
+    if expected != executable:
+        raise _error("The hermes command is a shadow wrapper, not the runtime console entry point")
+    try:
+        content = executable.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise _error("Could not inspect the Hermes console entry point content") from None
+    if content != f"#!{python}\n{_CONSOLE_BODY}":
+        raise _error("The Hermes console entry point content is not the pinned safe wrapper")
 
 
 def resolve_hermes_target(
@@ -202,6 +315,8 @@ def resolve_hermes_target(
             "Detected hermes-agent version does not match the required version "
             f"{PINNED_HERMES_VERSION}"
         )
+    _validate_selected_home(home)
+    _validate_console_origin(executable, python)
     return HermesTarget(root=root, home=home, executable=executable, python=python)
 
 
@@ -310,6 +425,8 @@ def _run_validation_stage(
     environment: Mapping[str, str],
 ) -> None:
     command = [os.fspath(target.python), "-P", "-m", module, *arguments]
+    result: subprocess.CompletedProcess[str] | None = None
+    failed = False
     try:
         result = subprocess.run(
             command,
@@ -318,9 +435,12 @@ def _run_validation_stage(
             check=False,
             capture_output=True,
             text=True,
+            timeout=180,
         )
-    except OSError:
-        raise _error(f"Hermes {stage} validation could not start") from None
+    except (OSError, subprocess.TimeoutExpired):
+        failed = True
+    if failed or result is None:
+        raise _error(f"Hermes {stage} validation could not start")
     if result.returncode != 0:
         raise _error(
             f"Hermes {stage} validation failed (exit code {result.returncode})"

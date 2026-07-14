@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import json
 import os
 from pathlib import Path
 import platform
@@ -10,6 +11,7 @@ import subprocess
 
 import pytest
 
+import memoryd.hermes_compat as compat
 from memoryd.hermes_compat import (
     PINNED_HERMES_COMMIT,
     PINNED_HERMES_TAG,
@@ -44,6 +46,13 @@ def _write_executable(path: Path, content: str) -> Path:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _write_active_profile(root: Path, value: str, mode: int = 0o600) -> Path:
+    marker = root / "active_profile"
+    marker.write_text(value, encoding="utf-8")
+    marker.chmod(mode)
+    return marker
 
 
 def _python_interpreter(tmp_path: Path, *, executable: bool = True) -> Path:
@@ -86,12 +95,33 @@ def test_default_home_selects_root_without_creating_it(tmp_path: Path) -> None:
     assert not hermes_root.exists()
 
 
+def test_missing_default_home_is_discoverable_but_not_a_guided_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hermes_root = tmp_path / ".hermes"
+    environment = {"HERMES_HOME": str(hermes_root)}
+    assert resolve_hermes_home(environment) == (hermes_root, hermes_root)
+
+    executable = tmp_path / "bin" / "hermes"
+    python = tmp_path / "venv" / "bin" / "python"
+    monkeypatch.setattr(compat, "_resolve_command", lambda: executable)
+    monkeypatch.setattr(compat, "_resolve_python", lambda _command: python)
+    monkeypatch.setattr(
+        compat, "_query_version", lambda _python: PINNED_HERMES_VERSION,
+    )
+
+    with pytest.raises(HermesCompatibilityError, match="profile.*does not exist"):
+        resolve_hermes_target(environment)
+
+    assert not hermes_root.exists()
+
+
 @pytest.mark.parametrize("active_profile", ["", "default"])
 def test_empty_or_default_active_profile_selects_existing_root(
     tmp_path: Path, active_profile: str
 ) -> None:
     root = _mkdir(tmp_path / ".hermes")
-    (root / "active_profile").write_text(active_profile, encoding="utf-8")
+    _write_active_profile(root, active_profile)
 
     resolved_root, home = resolve_hermes_home({"HERMES_HOME": str(root)})
 
@@ -113,7 +143,7 @@ def test_explicit_profile_is_selected_without_reading_root_marker(tmp_path: Path
 def test_valid_named_profile_is_selected(tmp_path: Path) -> None:
     root = _mkdir(tmp_path / ".hermes")
     profile = _mkdir(_mkdir(root / "profiles") / "work_1")
-    (root / "active_profile").write_text("work_1", encoding="utf-8")
+    _write_active_profile(root, "work_1")
 
     resolved_root, home = resolve_hermes_home({"HERMES_HOME": str(root)})
 
@@ -128,8 +158,7 @@ def test_invalid_multiline_or_traversing_profile_is_rejected_without_mutation(
     tmp_path: Path, active_profile: str
 ) -> None:
     root = _mkdir(tmp_path / ".hermes")
-    marker = root / "active_profile"
-    marker.write_text(active_profile, encoding="utf-8")
+    marker = _write_active_profile(root, active_profile)
     before = marker.read_bytes()
 
     with pytest.raises(HermesCompatibilityError) as exc_info:
@@ -143,7 +172,7 @@ def test_invalid_multiline_or_traversing_profile_is_rejected_without_mutation(
 def test_missing_named_profile_is_rejected_without_being_created(tmp_path: Path) -> None:
     root = _mkdir(tmp_path / ".hermes")
     missing = root / "profiles" / "missing"
-    (root / "active_profile").write_text("missing", encoding="utf-8")
+    _write_active_profile(root, "missing")
 
     with pytest.raises(HermesCompatibilityError) as exc_info:
         resolve_hermes_home({"HERMES_HOME": str(root)})
@@ -209,7 +238,7 @@ def test_symlinked_named_profile_is_rejected(tmp_path: Path) -> None:
     real_profile = _mkdir(profiles / "real")
     linked_profile = profiles / "linked"
     linked_profile.symlink_to(real_profile, target_is_directory=True)
-    (root / "active_profile").write_text("linked", encoding="utf-8")
+    _write_active_profile(root, "linked")
 
     with pytest.raises(HermesCompatibilityError) as exc_info:
         resolve_hermes_home({"HERMES_HOME": str(root)})
@@ -221,13 +250,42 @@ def test_symlinked_named_profile_is_rejected(tmp_path: Path) -> None:
 def test_profile_mode_mismatch_is_rejected_without_chmod(tmp_path: Path) -> None:
     root = _mkdir(tmp_path / ".hermes")
     profile = _mkdir(_mkdir(root / "profiles") / "work", mode=0o755)
-    (root / "active_profile").write_text("work", encoding="utf-8")
+    _write_active_profile(root, "work")
 
     with pytest.raises(HermesCompatibilityError) as exc_info:
         resolve_hermes_home({"HERMES_HOME": str(root)})
 
     _assert_safe_error(exc_info)
     assert stat.S_IMODE(profile.stat().st_mode) == 0o755
+
+
+def test_selected_profile_owned_by_another_uid_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _mkdir(tmp_path / ".hermes")
+    profile = _mkdir(_mkdir(root / "profiles") / "work")
+    _write_active_profile(root, "work")
+    monkeypatch.setattr(
+        os, "geteuid", lambda: profile.stat().st_uid + 1, raising=False,
+    )
+
+    with pytest.raises(HermesCompatibilityError, match="owned"):
+        resolve_hermes_home({"HERMES_HOME": str(root)})
+
+
+@pytest.mark.parametrize("component", ["root", "profiles", "marker"])
+def test_named_profile_authority_components_require_owner_only_modes(
+    tmp_path: Path, component: str,
+) -> None:
+    root = _mkdir(tmp_path / ".hermes")
+    profiles = _mkdir(root / "profiles")
+    _mkdir(profiles / "work")
+    marker = _write_active_profile(root, "work")
+    target = {"root": root, "profiles": profiles, "marker": marker}[component]
+    target.chmod(0o755 if component != "marker" else 0o644)
+
+    with pytest.raises(HermesCompatibilityError, match="0700|0600"):
+        resolve_hermes_home({"HERMES_HOME": str(root)})
 
 
 def test_non_linux_platform_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -416,6 +474,67 @@ def test_version_query_subprocess_failure_is_rejected(
     _assert_safe_error(exc_info)
 
 
+def test_version_query_timeout_is_bounded_and_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "VERSION-TIMEOUT-SECRET"
+    python = _python_interpreter(tmp_path)
+    hermes = _write_executable(tmp_path / "bin" / "hermes", f"#!{python}\n")
+    monkeypatch.setattr(shutil, "which", lambda command: str(hermes))
+
+    def timeout(command: object, **kwargs: object):
+        assert kwargs["timeout"] <= 30
+        raise subprocess.TimeoutExpired(
+            command, kwargs["timeout"], output=secret, stderr=secret,
+        )
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+
+    with pytest.raises(HermesCompatibilityError) as exc_info:
+        resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
+
+    rendered = repr(exc_info.value)
+    assert secret not in rendered
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_compatibility_stage_timeout_is_bounded_and_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "VALIDATION-TIMEOUT-SECRET"
+    target = HermesTarget(
+        root=tmp_path / "root",
+        home=tmp_path / "profile",
+        executable=tmp_path / "hermes",
+        python=tmp_path / "python",
+    )
+    monkeypatch.setattr(
+        compat, "_canonical_plugin_source", lambda path: path,
+    )
+    monkeypatch.setattr(
+        compat, "_stage_memoryd_package",
+        lambda import_root, package_root, plugin: (import_root / "memoryd", {}),
+    )
+    monkeypatch.setattr(compat, "_staged_package_matches", lambda *_args: True)
+
+    def timeout(command: object, **kwargs: object):
+        assert kwargs["timeout"] <= 180
+        raise subprocess.TimeoutExpired(
+            command, kwargs["timeout"], output=secret, stderr=secret,
+        )
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+
+    with pytest.raises(HermesCompatibilityError) as exc_info:
+        compat.validate_hermes_compatibility(target, tmp_path / "plugin")
+
+    rendered = repr(exc_info.value)
+    assert secret not in rendered
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
 def test_version_mismatch_reports_pin_and_safe_remediation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -440,12 +559,59 @@ def test_version_mismatch_reports_pin_and_safe_remediation(
     assert sentinel not in message
 
 
+def test_shadow_hermes_wrapper_with_pinned_shebang_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _mkdir(tmp_path / ".hermes")
+    python = _python_interpreter(tmp_path)
+    shadow = _write_executable(
+        tmp_path / "shadow-bin" / "hermes",
+        f"#!{python}\nfrom hermes_cli.main import main\nmain()\n",
+    )
+    monkeypatch.setattr(shutil, "which", lambda _command: str(shadow))
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=f"{PINNED_HERMES_VERSION}\n", stderr="",
+        ),
+    )
+
+    with pytest.raises(HermesCompatibilityError, match="entry|origin|console"):
+        resolve_hermes_target({"HERMES_HOME": str(root)})
+
+
+def test_console_origin_rejects_tampered_script_at_runtime_entry_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = _python_interpreter(tmp_path)
+    console = _write_executable(
+        python.parent / "hermes",
+        f"#!{python}\nfrom hermes_cli.main import main\nmain()\n",
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                '{"entry_point":"hermes_cli.main:main","scripts":'
+                + json.dumps(str(python.parent))
+                + "}\n"
+            ),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(HermesCompatibilityError, match="content|console|entry"):
+        compat._validate_console_origin(console, python)
+
+
 def test_success_resolves_real_command_interpreter_profile_and_pinned_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _mkdir(tmp_path / ".hermes")
     profile = _mkdir(_mkdir(root / "profiles") / "work")
-    (root / "active_profile").write_text("work", encoding="utf-8")
+    _write_active_profile(root, "work")
     python = _python_interpreter(tmp_path)
     real_hermes = _write_executable(
         tmp_path / "bin" / "hermes-real", f"#!{python}\nprint('hermes')\n"
@@ -467,6 +633,13 @@ def test_success_resolves_real_command_interpreter_profile_and_pinned_version(
 
     monkeypatch.setattr(shutil, "which", which)
     monkeypatch.setattr(subprocess, "run", run)
+    origin_calls: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        compat, "_validate_console_origin",
+        lambda executable, interpreter: origin_calls.append(
+            (executable, interpreter)
+        ),
+    )
 
     target = resolve_hermes_target({"HERMES_HOME": str(root)})
 
@@ -487,11 +660,14 @@ def test_success_resolves_real_command_interpreter_profile_and_pinned_version(
     assert kwargs["check"] is True
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
+    assert kwargs["timeout"] <= 30
+    assert origin_calls == [(real_hermes.resolve(), python.resolve())]
 
 
 def test_symlinked_venv_python_preserves_environment_launcher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _mkdir(tmp_path / ".hermes")
     base_python = _write_executable(tmp_path / "runtime" / "python3.11", "")
     venv_python = tmp_path / "pipx" / "venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
@@ -507,6 +683,7 @@ def test_symlinked_venv_python_preserves_environment_launcher(
         )
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(compat, "_validate_console_origin", lambda *_args: None)
 
     target = resolve_hermes_target({"HERMES_HOME": str(tmp_path / ".hermes")})
 
