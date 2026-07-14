@@ -29,6 +29,8 @@ from http.server import (
 )
 from pathlib import Path
 
+from . import __version__
+
 from .core import (
     ArchiveOccurrenceCollision,
     CFG,
@@ -216,7 +218,7 @@ def _capture_worker() -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "memoryd/0.3.0"
+    server_version = f"memoryd/{__version__}"
 
     def _json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode()

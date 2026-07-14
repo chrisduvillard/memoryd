@@ -1,388 +1,188 @@
 # Production Linux rollout
 
-This runbook installs one clean, authoritative memoryd 0.3.0 instance beside
-Hermes on the Linux laptop. It does not read, repair, delete, or migrate the
-Windows installation or its data. Run every command below from a normal user
-shell on Linux, never from inside a Hermes tool call.
+This runbook is the audit, troubleshooting, and recovery reference for one
+authoritative memoryd 0.3.1 instance beside Hermes on a Linux laptop. The
+guided installer is the supported production path. Manual commands in this
+document are for inspection, an additional backup or restore drill, and
+emergency rollback—not a second installation recipe.
+
+The rollout never reads, repairs, deletes, or migrates a Windows installation
+or its data. Run every command from a normal Linux terminal, never from a
+Hermes chat, TUI, gateway tool call, cron job, or subagent.
 
 ## Fixed release inputs
 
-- memoryd and the bundled Hermes plugin: `v0.3.0`
-- Hermes Agent package: `hermes-agent==0.16.0`
+- memoryd and bundled plugin: `v0.3.1`
+- Hermes Agent package: exactly `hermes-agent==0.16.0`
 - Hermes source tag: `v2026.6.5`
 - Hermes resolved commit:
   `3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`
-- memoryd API: `http://127.0.0.1:7437`
-- memory home: exactly `~/memory`
-- database: Docker PostgreSQL 16 with pgvector, bound to `127.0.0.1`
+- daemon and plugin URL: `http://127.0.0.1:7437`
+- managed memory home: `~/memory`
+- database: Docker PostgreSQL 16 with pgvector, bound to localhost
+- extraction: OpenRouter; embeddings: Voyage
 
-The [official Hermes release](https://github.com/NousResearch/hermes-agent/releases/tag/v2026.6.5)
-names package version 0.16.0 and source tag `v2026.6.5`. Do not substitute
-upstream `main` during this rollout.
+Do not substitute upstream Hermes `main`. The exact-version validator runs
+through the interpreter behind the installed `hermes` executable and compares
+the installed contract with the copy bundled in the memoryd wheel.
 
-## 1. Preflight, select the Hermes profile, and pin Hermes
+## 1. Prerequisites and operator boundary
 
-Install Docker, Python 3.11 or 3.13, `pipx`, `git`, `curl`, and PostgreSQL
-client tools. Select one authoritative Hermes profile before running either
-installer. Every later command must run from a shell that exports this same
-absolute `HERMES_HOME`.
+The laptop needs:
 
-```bash
-set -euo pipefail
-umask 077
-docker version
-python3 --version
-pipx --version
-git --version
-curl --version
-psql --version
-hermes --version
+- Linux with a working systemd user manager
+- Docker with permission to start a localhost container
+- `git` (required by the immutable `pipx` Git URL)
+- `pipx` and Python 3.13 (Python 3.11 is supported if 3.13 is unavailable)
+- Hermes Agent already installed and available as `hermes`
+- OpenRouter and Voyage API keys
+- an interactive terminal; stdin and stdout must both be TTYs
 
-HERMES_ROOT="$(realpath -m "${HERMES_HOME:-$HOME/.hermes}")"
-# Hermes treats an explicit .../profiles/<name> path as authoritative. When
-# given the root, resolve its sticky active profile now so memoryd and every
-# later Hermes command address the same directory.
-HERMES_PROFILE_DIR_SELECTED=0
-if [[ "$(basename "$(dirname "$HERMES_ROOT")")" == profiles ]]; then
-  export HERMES_HOME="$HERMES_ROOT"
-  HERMES_PROFILE_DIR_SELECTED=1
-elif [[ -s "$HERMES_ROOT/active_profile" ]]; then
-  IFS= read -r HERMES_PROFILE <"$HERMES_ROOT/active_profile"
-  if [[ "$HERMES_PROFILE" == default ]]; then
-    export HERMES_HOME="$HERMES_ROOT"
-  elif [[ "$HERMES_PROFILE" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
-    export HERMES_HOME="$HERMES_ROOT/profiles/$HERMES_PROFILE"
-    HERMES_PROFILE_DIR_SELECTED=1
-  else
-    echo 'Invalid Hermes active_profile value.' >&2; exit 1
-  fi
-else
-  export HERMES_HOME="$HERMES_ROOT"
-fi
-case "$HERMES_HOME" in /*) ;; *) echo 'HERMES_HOME must be absolute' >&2; exit 1;; esac
-if (( HERMES_PROFILE_DIR_SELECTED )); then
-  test -d "$HERMES_HOME" || {
-    echo "Selected Hermes profile is missing: $HERMES_HOME" >&2
-    echo 'Repair active_profile or select an existing profile; no directory was created.' >&2
-    exit 1
-  }
-  chmod 700 "$HERMES_HOME"
-else
-  # Pinned Hermes treats an absent or literal "default" active_profile as the
-  # root profile. Only this default root may be created during preflight.
-  install -d -m 700 "$HERMES_ROOT"
-fi
-test "$(stat -c '%a' "$HERMES_HOME")" = 700
+Finish any in-flight response and exit every Hermes chat/TUI before starting.
+Hermes must not install or activate its own memory provider. The installer may
+stop a running Hermes gateway while it switches providers and will restore the
+gateway to its prior state.
 
-# A production rollout always uses ~/memory. An inherited override is a
-# configuration error, even when it is the empty string.
-if [[ -n ${MEMORYD_HOME+x} ]]; then
-  echo 'Unset MEMORYD_HOME; production uses the clean default ~/memory.' >&2
-  exit 1
-fi
-test ! -e "$HOME/memory" || {
-  echo '~/memory already exists; stop and investigate it without modifying it.' >&2
-  exit 1
-}
-```
+The authoritative profile comes from `$HERMES_HOME` and Hermes's
+`active_profile` marker. An explicit `.../profiles/<name>` path wins. Otherwise
+an absent marker or literal `default` selects the root; a valid named marker
+selects `$HERMES_HOME/profiles/<name>`. The authoritative root itself must be
+owned by the effective user and mode `0700`; if it is too broad, use the exact
+shell-quoted `chmod 700 -- <resolved-root>` command in the error and retry. The
+resolved root can differ from `$HERMES_HOME` when it names a profile. Inside
+that private root, the installer
+accepts the owned, non-group/other-writable `0755` profile directories and
+`0644` `active_profile` marker created by Hermes 0.16.0. Symlinks, special
+files, wrong owners, writable descendants, invalid or multiline names,
+traversal, ambiguity, and missing selected profiles are refused. The installer
+does not invent a missing selected profile.
 
-Resolve the interpreter behind the active `hermes` command and verify the
-installed distribution. If either assertion fails, reinstall the exact
-resolved commit and repeat the check; do not use `hermes update`.
+## 2. Guided installation
 
-```bash
-HERMES_BIN="$(readlink -f "$(command -v hermes)")"
-export HERMES_PY="$(sed -n '1s/^#!//p' "$HERMES_BIN")"
-test -x "$HERMES_PY"
-
-if ! "$HERMES_PY" - <<'PY'
-from importlib.metadata import version
-actual = version("hermes-agent")
-assert actual == "0.16.0", f"expected hermes-agent 0.16.0, got {actual}"
-print(f"hermes-agent {actual}")
-PY
-then
-  pipx install --force --python python3.13 \
-    'git+https://github.com/NousResearch/hermes-agent.git@3c231eb3979ab9c57d5cd6d02f1d577a3b718b43'
-  hash -r
-  HERMES_BIN="$(readlink -f "$(command -v hermes)")"
-  export HERMES_PY="$(sed -n '1s/^#!//p' "$HERMES_BIN")"
-  "$HERMES_PY" -c \
-    'from importlib.metadata import version; assert version("hermes-agent") == "0.16.0"'
-fi
-```
-
-Use Python 3.11 in that remediation command if Python 3.13 is unavailable.
-For a source/editable Hermes installation, additionally require its checkout
-HEAD to equal the resolved commit above.
-
-Check out memoryd's tagged release into a new owner-private directory and run
-the immutable contract checker with the installed Hermes interpreter:
-
-```bash
-export MEMORYD_RELEASE_DIR="$HOME/.local/src/memoryd-v0.3.0"
-test ! -e "$MEMORYD_RELEASE_DIR"
-install -d -m 700 "$(dirname "$MEMORYD_RELEASE_DIR")"
-git clone --branch v0.3.0 --depth 1 \
-  https://github.com/chrisduvillard/memoryd.git "$MEMORYD_RELEASE_DIR"
-cd "$MEMORYD_RELEASE_DIR"
-"$HERMES_PY" scripts/check_hermes_contract.py
-```
-
-The checker must print `COMPATIBLE`.
-
-## 2. Install memoryd in its own pipx environment
+Run exactly:
 
 ```bash
 pipx install --python python3.13 \
-  'git+https://github.com/chrisduvillard/memoryd.git@v0.3.0'
-hash -r
-memoryd --help
-
-MEMORYD_BIN="$(readlink -f "$(command -v memoryd)")"
-export MEMORYD_PY="$(sed -n '1s/^#!//p' "$MEMORYD_BIN")"
-test -x "$MEMORYD_PY"
-export MEMORYD_PLUGIN_SOURCE="$($MEMORYD_PY - <<'PY'
-from pathlib import Path
-import memoryd
-source = Path(memoryd.__file__).resolve().with_name("hermes_plugin")
-assert (source / "plugin.yaml").is_file(), source
-print(source)
-PY
-)"
+  'git+https://github.com/chrisduvillard/memoryd.git@v0.3.1'
+memoryd install --hermes
 ```
 
-Use Python 3.11 if Python 3.13 is unavailable. Validate the installed Hermes
-loader and complete lifecycle against the plugin copied from the installed
-memoryd wheel. The validator owns a temporary isolated profile, starts its own
-localhost probe, and must report recall, capture, pre-compress, extraction,
-loader origin, and an empty durable spool.
+The command performs all non-mutating checks first:
+
+1. Linux, TTY, systemd user-manager, exact Hermes version and packaged contract
+2. authoritative profile resolution and owner-only permission checks
+3. fresh or recognized managed `~/memory` classification
+4. explicit operator confirmation
+5. hidden credential collection and minimal live provider probes
+
+Only after those checks succeed does it create or adopt managed state. It
+installs PostgreSQL 16/pgvector with a random password, applies migrations
+001–007, writes owner-only memoryd configuration, copies the wheel-bundled
+plugin, installs the daemon and backup timer, starts the daemon, and creates
+and verifies one initial snapshot.
+
+### Unsupported Hermes version
+
+A version or contract mismatch stops without changing memoryd or Hermes. Use
+the exact command printed by the installer, which pins the resolved commit:
 
 ```bash
-HERMES_VALIDATION_HOME="$(mktemp -d)"
-"$HERMES_PY" "$MEMORYD_RELEASE_DIR/scripts/validate_installed_hermes.py" \
-  --hermes-home "$HERMES_VALIDATION_HOME" \
-  --plugin-source "$MEMORYD_PLUGIN_SOURCE" \
-  --expected-version 0.16.0
+pipx install --force --python python3.13 \
+  'git+https://github.com/NousResearch/hermes-agent.git@3c231eb3979ab9c57d5cd6d02f1d577a3b718b43'
 ```
 
-Do not continue on version drift, a checkout-origin plugin, a loader mismatch,
-an uncalled lifecycle hook, a nonempty spool, or a durability fault. Preserve
-the isolated profile and validator output as rollout evidence.
+Then close Hermes again and rerun `memoryd install --hermes`. The installer
+never repairs or upgrades Hermes automatically.
 
-## 3. Supply provider secrets and install
+### Secret handling
 
-Read secrets interactively so they never enter shell history. `memoryd
-install` stores them in the owner-readable configuration used by the systemd
-user service. The backup manifest records their names, never values.
+Do not pass secrets as command-line arguments and do not paste them into chat.
+Missing `OPENROUTER_API_KEY` and `VOYAGE_API_KEY` values are collected with
+hidden `getpass` prompts. Both must pass minimal live OpenRouter completion and
+Voyage embedding probes before target mutation. Provider failures are reported
+without keys or response bodies.
 
-```bash
-read -rsp 'OpenRouter API key: ' OPENROUTER_API_KEY; printf '\n'
-read -rsp 'Voyage API key: ' VOYAGE_API_KEY; printf '\n'
-export OPENROUTER_API_KEY VOYAGE_API_KEY
-export MEMORYD_LLM=openrouter
-export MEMORYD_EMBED=voyage
+The accepted values are stored only in the `0600` memoryd configuration under
+the `0700` memory home, together with `MEMORYD_LLM=openrouter` and
+`MEMORYD_EMBED=voyage`. Snapshot manifests record secret names that must be
+supplied after restore, never their values. Configuration and local backups are
+owner-only but not encrypted at rest.
 
-memoryd install
-unset OPENROUTER_API_KEY VOYAGE_API_KEY
+### Reruns and refusal
 
-chmod 700 "$HOME/memory"
-test "$(stat -c '%a' "$HOME/memory/config.json")" = 600
-systemctl --user is-active memoryd.service
-systemctl --user is-enabled memoryd-backup.timer
-systemctl --user list-timers memoryd-backup.timer memoryd-microsleep.timer
-```
+The command is idempotent for a positively recognized managed memoryd
+installation. It revalidates credentials and all boundaries, recopies the
+identical wheel plugin, reapplies only missing migrations, verifies a new
+initial snapshot, and rechecks activation.
 
-The installer must place the plugin at `$HERMES_HOME/plugins/memoryd`, never
-the obsolete nested `plugins/memory/memoryd` path, and must publish exactly
-the selected localhost URL in an owner-only profile configuration:
+An unknown or partially shaped nonempty `~/memory` is refused without
+modification. Investigate it as evidence; do not rename, delete, merge, or
+adopt it by hand. Restore also refuses a nonempty home or target database and
+never performs destructive in-place recovery.
 
-```bash
-"$HERMES_PY" - <<'PY'
-import json, os, stat
-from pathlib import Path
+## 3. Transactional activation and success report
 
-home_text = os.environ["HERMES_HOME"]
-home = Path(home_text).resolve()
-assert home_text == str(home), (home_text, home)
-assert (home / "plugins/memoryd/plugin.yaml").is_file()
-assert not (home / "plugins/memory/memoryd").exists()
-cfg = home / "memoryd.json"
-assert json.loads(cfg.read_text(encoding="utf-8")) == {
-    "url": "http://127.0.0.1:7437"
-}
-assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
-print(f"verified Hermes profile {home}")
-PY
-```
-
-A fresh install creates `memoryd-pgvector` with a random PostgreSQL password,
-a persistent Docker volume, and a localhost-only published port. Confirm the
-binding instead of assuming it:
+Immediately before activation the installer records the current provider and
+whether the Hermes gateway is running. It stops only a running gateway, sets
+the external provider, verifies the selected profile and localhost URL, then
+runs these four checks in order:
 
 ```bash
-docker inspect memoryd-pgvector \
-  --format '{{json .HostConfig.PortBindings}}'
-memoryd status
-memoryd doctor
-```
-
-The PostgreSQL binding must show `127.0.0.1`. Do not expose the daemon or
-database beyond localhost; this rollout intentionally has no TLS or network
-authentication.
-
-## 4. Activate Hermes without interrupting a turn
-
-First exit every active Hermes chat/TUI cleanly and wait for any in-flight
-response to finish. Hermes 0.16.0 has no command that drains an interactive
-chat, so this is an operator gate. The following installed-runtime probe
-records whether the selected profile's gateway must be restarted:
-
-```bash
-gateway_running() {
-  "$HERMES_PY" -c \
-    'from hermes_cli.gateway import get_gateway_runtime_snapshot as s; raise SystemExit(0 if s().running else 1)'
-}
-
-GATEWAY_WAS_ACTIVE=0
-if gateway_running; then
-  GATEWAY_WAS_ACTIVE=1
-  hermes gateway stop
-  ! gateway_running
-fi
-
-hermes config set memory.provider memoryd
-"$HERMES_PY" - <<'PY'
-import os
-from pathlib import Path
-import yaml
-cfg = yaml.safe_load((Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text()) or {}
-assert (cfg.get("memory") or {}).get("provider") == "memoryd", cfg.get("memory")
-PY
 hermes memory status
 hermes memoryd config
 memoryd status
 hermes memoryd status
-
-if (( GATEWAY_WAS_ACTIVE )); then
-  hermes gateway start
-  gateway_running
-fi
 ```
 
-Both memoryd status commands must be healthy. The Hermes report must show the
-exact URL, zero dead letters, and no durability fault. Incoming or processing
-work must drain to zero after the daemon becomes reachable. Start a new
-chat/TUI only after these checks and any previously active gateway are healthy.
+Success requires the exact URL, no durability fault, zero dead letters, and an
+incoming/processing queue that drains to zero. A previously running gateway
+must be running again before the command returns success. The completion report
+names the authoritative profile, daemon URL, verified initial snapshot, health
+checks, restored gateway state, and canary next step; it never prints secrets.
 
-## 5. Disposable integration and restore drill
+On failure, SIGINT, or SIGTERM, the transaction restores the previous provider
+(or built-in-only state) and the previous gateway state. It retains the
+memoryd database, spool, archive, configuration, backups, and logs. All
+dead-letter evidence is preserved. If rollback is incomplete, the command
+reports the failed restoration stage and remains nonzero. Do not open a new Hermes session
+until the provider and gateway state are known.
 
-Run this drill from the tagged checkout. It uses an isolated Python virtual
-environment, database container, daemon port, memory home, and Hermes home.
-The custom `MEMORYD_HOME` below is permitted only for this disposable test; it
-does not alter the production `~/memory` decision.
+## 4. Post-install audit
+
+The guided command already runs the four status checks. Operators may repeat
+these read-only checks after installation:
 
 ```bash
-set -euo pipefail
-umask 077
-cd "$MEMORYD_RELEASE_DIR"
-python3 -m venv .drill-venv
-. .drill-venv/bin/activate
-python -m pip install .
-
-DRILL_ROOT="$(mktemp -d)"
-DRILL_DB=memoryd-v030-drill-db
-DRILL_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export MEMORYD_HOME="$DRILL_ROOT/home"
-export HERMES_HOME="$DRILL_ROOT/hermes"
-export MEMORYD_PORT=17437
-export MEMORYD_DSN="postgresql://postgres:${DRILL_PASSWORD}@127.0.0.1:55432/memoryd_drill"
-install -d -m 700 "$HERMES_HOME"
-
-cleanup() {
-  status=$?
-  for pid in "${DAEMON_PID:-}" "${RESTORE_PID:-}"; do
-    if [[ -n "$pid" ]]; then
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
-  done
-  if (( status != 0 )); then
-    printf 'Drill failed; evidence preserved at:\n' >&2
-    printf '  drill root: %s\n' "$DRILL_ROOT" >&2
-    printf '  database container: %s\n' "$DRILL_DB" >&2
-  fi
-  return "$status"
-}
-trap cleanup EXIT
-
-docker run -d --name "$DRILL_DB" \
-  -e POSTGRES_PASSWORD="$DRILL_PASSWORD" -e POSTGRES_DB=memoryd_drill \
-  -p 127.0.0.1:55432:5432 pgvector/pgvector:pg16
-until python - <<'PY'
-import os, psycopg
-try:
-    psycopg.connect(os.environ["MEMORYD_DSN"], connect_timeout=1).close()
-except Exception:
-    raise SystemExit(1)
-PY
-do sleep 1; done
-
-python - <<'PY'
-import os
-from memoryd.cli import apply_migrations
-print(apply_migrations(os.environ["MEMORYD_DSN"]))
-PY
-python -m memoryd serve >"$DRILL_ROOT/daemon.log" 2>&1 &
-DAEMON_PID=$!
-until curl -fsS http://127.0.0.1:17437/health >/dev/null; do sleep 1; done
-
-python scripts/test_durable_capture.py
-python scripts/test_hermes_spool.py
-python scripts/test_bitter_lesson.py
-"$HERMES_PY" scripts/test_hermes_contract.py
-python scripts/smoke_test.py
-python scripts/test_extract.py
-python scripts/test_vector.py
-python scripts/test_hermes.py
-
-kill "$DAEMON_PID"; wait "$DAEMON_PID" || true; unset DAEMON_PID
-SNAPSHOT="$(python -m memoryd backup create --output "$DRILL_ROOT/backups" \
-  | sed -n 's/^created //p')"
-test -n "$SNAPSHOT"
-python -m memoryd backup verify "$SNAPSHOT"
-
-docker exec "$DRILL_DB" createdb -U postgres memoryd_drill_restore
-RESTORE_HOME="$DRILL_ROOT/restored-home"
-RESTORE_DSN="postgresql://postgres:${DRILL_PASSWORD}@127.0.0.1:55432/memoryd_drill_restore"
-python -m memoryd backup restore "$SNAPSHOT" \
-  --dsn "$RESTORE_DSN" --home "$RESTORE_HOME"
-env -u MEMORYD_DSN MEMORYD_HOME="$RESTORE_HOME" MEMORYD_PORT=17438 \
-  python -m memoryd serve >"$DRILL_ROOT/restored-daemon.log" 2>&1 &
-RESTORE_PID=$!
-until curl -fsS http://127.0.0.1:17438/health >/dev/null; do sleep 1; done
-env -u MEMORYD_DSN MEMORYD_HOME="$RESTORE_HOME" MEMORYD_PORT=17438 \
-  python -m memoryd doctor
-kill "$RESTORE_PID"; wait "$RESTORE_PID" || true; unset RESTORE_PID
+systemctl --user is-active memoryd.service
+systemctl --user is-enabled memoryd-backup.timer
+systemctl --user list-timers memoryd-backup.timer memoryd-microsleep.timer
+docker inspect memoryd-pgvector --format '{{json .HostConfig.PortBindings}}'
+memoryd status
+memoryd doctor
+hermes memory status
+hermes memoryd config
+hermes memoryd status
 ```
 
-The EXIT trap stops helper daemons but never deletes `$DRILL_ROOT` or the
-container. On failure, it prints both evidence locations and preserves them.
-After every assertion passes, first record the complete test output and both
-evidence locations. Then remove the disposable database container manually:
+PostgreSQL must be bound to `127.0.0.1`; the daemon is also localhost-only.
+This design intentionally has no TLS or network authentication. The selected
+profile's `$HERMES_HOME/plugins/memoryd/plugin.yaml` and `memoryd.json` must be
+owner-only and the latter must contain only the localhost URL.
+
+Daily snapshots run at 02:35. The user service stops memoryd, creates and
+verifies the snapshot, and restarts memoryd through `ExecStopPost` even when
+creation fails. It retains 14 daily snapshots. Check failures with:
 
 ```bash
-docker rm -f "$DRILL_DB"
+journalctl --user -u memoryd-backup.service
+memoryd backup list
+memoryd backup verify ~/memory/backups/<UTC>-v1
 ```
 
-Retain `$DRILL_ROOT` according to the rollout evidence policy. Production
-promotion still requires the [14-day scorecard](CANARY_SCORECARD.md), including
-a restore of a real production snapshot rather than only this synthetic drill.
+## 5. Additional backup and disposable restore drill
 
-## 6. First production snapshot
-
-The backup command requires the daemon to be stopped. Always restart it, even
-when creation or verification fails:
+This is the only routine manual mutation documented here. Stop the daemon for
+an additional coherent snapshot and always restart it:
 
 ```bash
 set -euo pipefail
@@ -396,58 +196,58 @@ trap - EXIT
 memoryd status
 ```
 
-## Rollback without evidence loss
-
-Run rollback from a separate shell, not from the gateway or a Hermes tool
-call. Exit active chat/TUI sessions cleanly and wait for in-flight turns. Then
-disable the external provider while memoryd is still available, verify the
-selected profile is built-in-only, restart only a gateway that was previously
-active, and finally stop memoryd:
+Restore only into a new empty database and a new target home while every target
+daemon is stopped:
 
 ```bash
-set -euo pipefail
-gateway_running() {
-  "$HERMES_PY" -c \
-    'from hermes_cli.gateway import get_gateway_runtime_snapshot as s; raise SystemExit(0 if s().running else 1)'
-}
-
-ROLLBACK_GATEWAY_WAS_ACTIVE=0
-if gateway_running; then
-  ROLLBACK_GATEWAY_WAS_ACTIVE=1
-  hermes gateway stop
-  ! gateway_running
-fi
-
-hermes memory off
-"$HERMES_PY" - <<'PY'
-import os
-from pathlib import Path
-import yaml
-cfg = yaml.safe_load((Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text()) or {}
-assert not (cfg.get("memory") or {}).get("provider"), cfg.get("memory")
-PY
-hermes memory status
-
-if (( ROLLBACK_GATEWAY_WAS_ACTIVE )); then
-  hermes gateway start
-  gateway_running
-fi
-systemctl --user stop memoryd.service
+createdb memoryd_restore_drill
+memoryd backup restore "$SNAPSHOT" \
+  --dsn 'postgresql://restore-user@localhost/memoryd_restore_drill' \
+  --home ~/memory-restore-drill
+MEMORYD_HOME=~/memory-restore-drill memoryd doctor
 ```
 
-`hermes memory status` must report no external provider before memoryd stops.
-Do not start a new chat/TUI until that is true. Do not uninstall memoryd,
-remove the Docker container or volume, delete queue jobs, edit dead letters,
-prune the archive, restore over the live database, or reuse request IDs.
-Preserve at least these artifacts before diagnosis:
+Never restore over `~/memory` or the live database. Re-enter required secrets
+after the drill; do not copy them from the live config. Preserve the snapshot,
+verification output, restored doctor output, and database name as canary
+evidence.
+
+## 6. Emergency rollback without evidence loss
+
+The guided installer rolls back activation failures automatically. This manual
+procedure is only for a later canary or operational failure. Exit every Hermes
+chat/TUI and work from a normal terminal.
+
+1. Record `hermes memory status`, `hermes memoryd status`, and `memoryd status`.
+2. Stop a running Hermes gateway and record that it was running.
+3. Run `hermes memory off` and verify `hermes memory status` reports no external
+   provider.
+4. Restart the gateway only if it was running before rollback.
+5. Stop `memoryd.service` after Hermes is confirmed built-in-only.
+
+Do not uninstall memoryd, delete the database container or volume, remove queue
+jobs, edit dead letters, prune archives, restore over the live instance, or
+reuse request IDs. Preserve at least:
 
 - `$HERMES_HOME/spool/memoryd/`, including incoming, processing, dead-letter,
   identity reservations, and fault state
-- `~/memory/spool/`, `~/memory/archive/`, `~/memory/backups/`, and
-  `~/memory/config.json`
-- the `memoryd-pgvector` container metadata and its persistent volume
-- `journalctl --user -u memoryd.service` and both status-command outputs
+- `~/memory/spool/`, `~/memory/archive/`, `~/memory/backups/`,
+  `~/memory/config.json`, and managed credential metadata
+- the `memoryd-pgvector` container metadata and persistent volume
+- `journalctl --user -u memoryd.service` and backup-service logs
+- all status outputs and the last successful snapshot verification
 
-Copy artifacts only to owner-readable storage. Keep the database and archive
-paired. Diagnose and repair in a cloned database/home, then restart the entire
-14-day/200-turn canary from day zero.
+Copy evidence only to owner-readable storage and keep the database and archive
+paired. Diagnose against a cloned database/home. After repair, restart the
+canary from day zero.
+
+## 7. Promotion gate
+
+Installation success does not equal production promotion. Follow
+[CANARY_SCORECARD.md](CANARY_SCORECARD.md) for at least 14 complete days and 200
+real Hermes turns. Promotion still requires zero unexplained loss, duplicate
+batches, dead letters, integrity defects, or visa leakage; ten planted
+out-of-visa canaries; clean daily doctor/status evidence; recall p95 below
+700 ms; fail-open below 1%; at least 18 of 20 expected replay memories; no
+sealed or superseded memory served; resolvable extraction citations; no
+hedge-to-commitment overstatement; and a verified full disposable restore.

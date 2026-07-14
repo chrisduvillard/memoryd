@@ -9,16 +9,21 @@ per-agent visas.
 
 ## Install
 
-1. Run the memoryd daemon (see the main memoryd README).
-2. Export the authoritative `HERMES_HOME` used by Hermes and copy this
-   directory to `$HERMES_HOME/plugins/memoryd/`. The default-profile path is
-   `~/.hermes/plugins/memoryd/`.
-3. Activate:
-   ```
-   hermes memory setup        # pick "memoryd", set url if non-default
-   # or: hermes config set memory.provider memoryd
-   ```
-4. Verify: `hermes memoryd status`
+For production, exit every Hermes chat/TUI and run the v0.3.1 guided installer
+from a normal Linux terminal:
+
+```bash
+pipx install --python python3.13 \
+  'git+https://github.com/chrisduvillard/memoryd.git@v0.3.1'
+memoryd install --hermes
+```
+
+It resolves the authoritative active profile, validates Hermes 0.16.0, copies
+this wheel-bundled plugin, creates and verifies an initial backup, activates the
+provider, and restores the previous provider and gateway state on failure or
+interruption. Do not ask an active Hermes session to execute its own install or
+activation. Manual copying and provider changes are reserved for audit or
+emergency troubleshooting in the production runbook.
 
 ## Hermes compatibility
 

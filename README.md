@@ -7,7 +7,7 @@
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache_2.0-4c1d95?style=for-the-badge"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-312e81?style=for-the-badge&logo=python&logoColor=white">
   <img alt="Platform: Windows, macOS, Linux" src="https://img.shields.io/badge/platform-Windows_|_macOS_|_Linux-1e1b4b?style=for-the-badge">
-  <img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-6d28d9?style=for-the-badge">
+  <img alt="Version 0.3.1" src="https://img.shields.io/badge/version-0.3.1-6d28d9?style=for-the-badge">
 </p>
 
 [**Quickstart**](#-choose-your-install-path) · [**Production Hermes**](#-production-hermes-on-linux) · [**Daily use**](#-daily-use) · [**Docs**](docs/REFERENCE.md) · [**Architecture**](docs/ARCHITECTURE.md)
@@ -71,7 +71,51 @@ sequenceDiagram
 | Goal | Use this path |
 |---|---|
 | Evaluate memoryd or connect Claude Code on Windows, macOS, or Linux | Follow the quickstart below. |
-| Make memoryd the production provider for Hermes on Linux | Use the [supervised Hermes prompt](docs/HERMES_INSTALL_PROMPT.md) and [production runbook](docs/PRODUCTION_ROLLOUT.md). |
+| Make memoryd the production provider for Hermes on Linux | Exit Hermes and use the two-command guided install below. |
+
+### Production Hermes quickstart (Linux)
+
+Close every Hermes chat/TUI, then run these commands in a normal terminal:
+
+```bash
+pipx install --python python3.13 \
+  'git+https://github.com/chrisduvillard/memoryd.git@v0.3.1'
+memoryd install --hermes
+```
+
+This guided path requires Docker, Git, `pipx`, a working systemd user manager, and
+Hermes Agent exactly `0.16.0`. It resolves `$HERMES_HOME` and `active_profile`,
+validates the installed Hermes contract through Hermes's own Python, and stops
+before mutation when the profile, version, permissions, or memory home is
+unsafe. If Hermes is on another version, use the exact remediation command the
+installer prints, then rerun the same guided command.
+
+Missing OpenRouter and Voyage keys are requested with hidden terminal prompts,
+validated with minimal live calls, and stored only in memoryd's owner-readable
+configuration. Do not put keys on the command line or in a Hermes chat. Both
+providers are required for this production path.
+
+Fresh installs create the localhost PostgreSQL/pgvector service, apply
+migrations, install the profile plugin and systemd units, and verify an initial
+backup before activation. Reruns adopt only a recognized managed installation;
+an unknown nonempty `~/memory` is left untouched. Activation preserves the
+previous provider and gateway state. Any failure or interruption rolls Hermes
+back while retaining memoryd's database, spool, archive, configuration,
+backups, logs, and dead-letter evidence.
+
+Success includes these four healthy checks:
+
+```bash
+hermes memory status
+hermes memoryd config
+memoryd status
+hermes memoryd status
+```
+
+The detailed [production runbook](docs/PRODUCTION_ROLLOUT.md) documents the
+preflight decisions, recovery drills, and emergency manual rollback. A
+successful install starts a production candidate, not a promotion: complete
+the [14-day, minimum-200-turn canary](docs/CANARY_SCORECARD.md) first.
 
 ### Quickstart (evaluation and local use)
 
@@ -79,7 +123,7 @@ Works on **Windows, macOS, and Linux**. Requires Python 3.11+ and [Docker](https
 
 ```bash
 # Optional: set OPENROUTER_API_KEY in your shell to enable fact extraction.
-python -m pip install git+https://github.com/chrisduvillard/memoryd.git@v0.3.0
+python -m pip install git+https://github.com/chrisduvillard/memoryd.git@v0.3.1
 memoryd install
 memoryd status                     # Everything green? The local install is ready.
 ```
@@ -116,10 +160,13 @@ Done by `memoryd install` — recall and capture run on every turn. For manual s
 
 ### 🤝 Connect Hermes Agent
 
-`memoryd install` uses the active `$HERMES_HOME` (default `~/.hermes`) and
-installs the provider at `$HERMES_HOME/plugins/memoryd`. Export the same
-`HERMES_HOME` for memoryd and Hermes; create it and re-run the installer if it
-did not exist initially. Then activate it:
+For production, use `memoryd install --hermes` from the normal Linux terminal
+as shown above. It selects the active profile, copies and verifies the plugin,
+and activates transactionally. Hermes must not run its own provider change.
+
+The generic cross-platform `memoryd install` can copy the plugin into an
+existing `$HERMES_HOME` for evaluation. Generic installs still require manual
+activation:
 
 ```bash
 hermes config set memory.provider memoryd
@@ -132,40 +179,13 @@ Both agents now share one memory: what Claude Code learns, Hermes knows, and vic
 
 ## 🚀 Production Hermes on Linux
 
-Use the hardened path when Hermes will depend on memoryd for real work. It pins
-[memoryd v0.3.0](https://github.com/chrisduvillard/memoryd/releases/tag/v0.3.0)
-and Hermes Agent 0.16.0, creates a clean authoritative `~/memory`, keeps
-PostgreSQL and the daemon on localhost, verifies backup and restore, and then
-starts a 14-day/200-turn canary.
-
-> **Never run any rollout command from an active Hermes tool call.** Give Hermes
-> the [supervised installation prompt](docs/HERMES_INSTALL_PROMPT.md), but have
-> the operator run every command block in a separate normal Linux terminal.
-> Before activation, exit every active Hermes chat/TUI cleanly and wait for
-> in-flight responses to finish.
-
-The [production runbook](docs/PRODUCTION_ROLLOUT.md) is authoritative. It stops
-on an existing `~/memory` or nonempty restore target and never migrates the
-Windows installation. Enter OpenRouter and Voyage keys only at its interactive
-terminal prompts; do not paste them into chat.
-
-With every Hermes chat/TUI still closed, the operator must run the activation
-block and all four checks in the normal terminal:
-
-```bash
-hermes memory status
-hermes memoryd config
-memoryd status
-hermes memoryd status
-```
-
-The Hermes report must show `http://127.0.0.1:7437`, zero dead letters, no
-durability fault, and a queue that drains to zero. The activation block then
-restores any gateway that was active before the rollout. Start a new Hermes
-chat/TUI only after all four checks pass and that gateway is healthy. Complete
-the disposable integration/restore drill and verify the first production
-snapshot before starting the [canary scorecard](docs/CANARY_SCORECARD.md).
-Treat the instance as a production candidate until every canary gate passes.
+The guided quickstart above is the supported production installation path for
+[memoryd v0.3.1](https://github.com/chrisduvillard/memoryd/releases/tag/v0.3.1).
+The [Hermes handoff prompt](docs/HERMES_INSTALL_PROMPT.md) exists only to tell
+an active agent to stop and hand control back to the operator. The
+[production runbook](docs/PRODUCTION_ROLLOUT.md) remains the audit and
+troubleshooting reference, including disposable restore validation and manual
+evidence-preserving rollback. Windows data is never read, changed, or migrated.
 
 ---
 
@@ -293,7 +313,7 @@ volume are absent.
 
 - [docs/REFERENCE.md](docs/REFERENCE.md) — full feature reference, configuration, embedder options
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the design: why raw evidence is sacred, how promotion works, the threat model, and what's deliberately not built yet
-- [docs/HERMES_INSTALL_PROMPT.md](docs/HERMES_INSTALL_PROMPT.md) — copy-paste prompt for a supervised, self-modification-safe Hermes installation
+- [docs/HERMES_INSTALL_PROMPT.md](docs/HERMES_INSTALL_PROMPT.md) — short handoff prompt that keeps installation outside Hermes
 - [docs/PRODUCTION_ROLLOUT.md](docs/PRODUCTION_ROLLOUT.md) — hardened Linux and Hermes rollout, verification, and rollback
 - [docs/CANARY_SCORECARD.md](docs/CANARY_SCORECARD.md) — the required 14-day, 200-turn production gate
 - [CHANGELOG.md](CHANGELOG.md) — release history
@@ -302,13 +322,12 @@ volume are absent.
 
 ## 🚦 Status
 
-v0.3.0 is a production candidate. Its release passed 265 local regression
-tests with 13 environment-dependent skips and 22 subtests, plus the GitHub
-Python 3.11/3.13 matrix. The hardened path adds durable Hermes queuing,
-idempotent writes, owner-private credentials, verified backups, and safe
-restore refusal. Production promotion still requires the documented 14-day,
-minimum-200-turn canary; until that passes, keep the rollback path and all
-evidence artifacts available.
+v0.3.1 is a production candidate. Release gates cover Python 3.11 and 3.13,
+the exact Hermes 0.16.0 contract and lifecycle, installed-wheel resources,
+durable queuing, idempotent writes, owner-private credentials, verified
+backups, transactional activation, and safe restore refusal. Production
+promotion still requires the documented 14-day, minimum-200-turn canary;
+until it passes, keep the rollback path and every evidence artifact available.
 
 ---
 

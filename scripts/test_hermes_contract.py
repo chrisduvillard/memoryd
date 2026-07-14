@@ -14,7 +14,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 CHECKER = REPO / "scripts" / "check_hermes_contract.py"
-PINNED = REPO / "scripts" / "_stubs" / "agent" / "memory_provider.py"
+PINNED = REPO / "memoryd" / "hermes_validation" / "agent" / "memory_provider.py"
 PLUGIN = REPO / "hermes_plugin" / "memoryd" / "__init__.py"
 
 

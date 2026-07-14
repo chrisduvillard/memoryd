@@ -227,7 +227,7 @@ def test_hermes_plugin_install_uses_active_profile_and_exact_private_config(
     source.mkdir()
     (source / "__init__.py").write_text("# provider\n", encoding="utf-8")
     (source / "plugin.yaml").write_text(
-        "name: memoryd\nversion: 0.3.0\n", encoding="utf-8")
+        "name: memoryd\nversion: 0.3.1\n", encoding="utf-8")
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -739,7 +739,10 @@ def test_install_reuses_working_config_dsn_without_docker(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "_home", lambda: tmp_path)
     monkeypatch.setattr(cli, "ensure_container", lambda: pytest.fail("Docker used"))
     monkeypatch.setattr(cli, "apply_migrations", lambda value: used.append(value) or [])
-    monkeypatch.setattr(cli, "write_config", lambda _dsn: tmp_path / "config.json")
+    monkeypatch.setattr(
+        cli, "write_config",
+        lambda _dsn, **_kwargs: tmp_path / "config.json",
+    )
     monkeypatch.setattr(cli, "register_claude_hooks", lambda: tmp_path / "settings")
     monkeypatch.setattr(cli, "install_hermes_plugin", lambda: None)
     monkeypatch.setattr(cli, "install_autostart", lambda: None)
@@ -776,16 +779,103 @@ def test_linux_installer_writes_backup_units_and_enables_timer(
     daemon_service = (tmp_path / "memoryd.service").read_text()
     assert ('ExecStart="/opt/My Python/bin/python%%worker" '
             '-m memoryd serve') in daemon_service
+    assert "UnsetEnvironment=" not in daemon_service
     assert "OnCalendar=*-*-* 02:35:00" in timer
     assert "Persistent=true" in timer
     enable = next(call for call in calls if "enable" in call)
     assert enable[-3:] == [
         "memoryd.service", "memoryd-microsleep.timer", "memoryd-backup.timer"]
+    assert not (tmp_path / "memoryd-backup-initial.service").exists()
+
+
+def test_linux_hermes_installer_writes_non_pruning_initial_backup_unit(
+        monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.sys, "executable", "/opt/memoryd/bin/python")
+    monkeypatch.setattr(Path, "expanduser", lambda self: (
+        tmp_path if self.parts[:1] == ("~",) else self))
+    monkeypatch.setattr(cli, "_run", lambda cmd, timeout=120: (
+        calls.append(cmd) or (0, "")))
+
+    cli.install_autostart(_hermes_mode=True)
+
+    initial = (tmp_path / "memoryd-backup-initial.service").read_text()
+    scheduled = (tmp_path / "memoryd-backup.service").read_text()
+    daemon = (tmp_path / "memoryd.service").read_text()
+    microsleep = (tmp_path / "memoryd-microsleep.service").read_text()
+    expected_unset = (
+        "UnsetEnvironment=HOME HERMES_HOME MEMORYD_HOME MEMORYD_DSN MEMORYD_PORT "
+        "ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY VOYAGE_API_KEY "
+        "MEMORYD_LLM MEMORYD_LLM_BASE MEMORYD_LLM_MODEL MEMORYD_MODEL_PROFILE "
+        "MEMORYD_EMBED MEMORYD_EMBED_BASE MEMORYD_EMBED_MODEL\n"
+    )
+    assert "ExecStartPre=systemctl --user stop memoryd.service" in initial
+    assert ("ExecStart=\"/opt/memoryd/bin/python\" -m memoryd backup create "
+            "--no-retention") in initial
+    assert "ExecStopPost=systemctl --user start memoryd.service" in initial
+    assert "backup create --retain 14" in scheduled
+    for service in (daemon, microsleep, scheduled, initial):
+        assert service.count("UnsetEnvironment=") == 1
+        assert expected_unset in service
+        unset_names = expected_unset.removeprefix("UnsetEnvironment=").split()
+        manager_environment = {
+            name: f"HOSTILE-{name}-SENTINEL" for name in unset_names
+        }
+        manager_environment["HERMES_TUI_GATEWAY_URL"] = "preserved-marker"
+        runtime_environment = {
+            name: value for name, value in manager_environment.items()
+            if name not in unset_names
+        }
+        assert not any(name in runtime_environment for name in unset_names)
+        assert runtime_environment == {
+            "HERMES_TUI_GATEWAY_URL": "preserved-marker",
+        }
+    assert not (tmp_path / "memoryd-backup-initial.timer").exists()
+    enable = next(call for call in calls if "enable" in call)
+    assert "memoryd-backup-initial.service" not in enable
+    required = [
+        "memoryd.service", "memoryd-microsleep.timer", "memoryd-backup.timer",
+    ]
+    assert calls == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", *required],
+        *[["systemctl", "--user", "is-enabled", unit] for unit in required],
+        *[["systemctl", "--user", "is-active", unit] for unit in required],
+    ]
+
+
+@pytest.mark.parametrize(
+    "failed_command",
+    ["daemon-reload", "enable", "is-enabled", "is-active"],
+)
+def test_linux_hermes_autostart_fails_closed_for_each_systemd_stage(
+    monkeypatch, tmp_path, failed_command,
+):
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(Path, "expanduser", lambda self: (
+        tmp_path if self.parts[:1] == ("~",) else self))
+    calls: list[list[str]] = []
+
+    def run(command, timeout=120):
+        calls.append(command)
+        if failed_command in command:
+            return 1, "SYSTEMD-FAILURE-SENTINEL"
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_run", run)
+
+    with pytest.raises(RuntimeError, match="systemd") as caught:
+        cli.install_autostart(_hermes_mode=True)
+
+    assert "SYSTEMD-FAILURE-SENTINEL" not in str(caught.value)
+    assert calls
 
 
 def test_linux_uninstall_disables_and_removes_backup_units(monkeypatch, tmp_path):
     calls: list[list[str]] = []
-    for name in ("memoryd-backup.service", "memoryd-backup.timer"):
+    for name in ("memoryd-backup.service", "memoryd-backup.timer",
+                 "memoryd-backup-initial.service"):
         (tmp_path / name).write_text("unit")
     monkeypatch.setattr(cli.sys, "platform", "linux")
     monkeypatch.setattr(Path, "expanduser", lambda self: (
@@ -799,12 +889,17 @@ def test_linux_uninstall_disables_and_removes_backup_units(monkeypatch, tmp_path
     disable_timer = ["systemctl", "--user", "disable", "--now",
                      "memoryd-backup.timer"]
     stop_backup = ["systemctl", "--user", "stop", "memoryd-backup.service"]
+    stop_initial = [
+        "systemctl", "--user", "stop", "memoryd-backup-initial.service"]
     stop_daemon = ["systemctl", "--user", "disable", "--now",
                    "memoryd.service", "memoryd-microsleep.timer"]
     assert disable_timer in calls
     assert stop_backup in calls
+    assert stop_initial in calls
     assert stop_daemon in calls
     assert calls.index(disable_timer) < calls.index(stop_backup)
-    assert calls.index(stop_backup) < calls.index(stop_daemon)
+    assert calls.index(stop_backup) < calls.index(stop_initial)
+    assert calls.index(stop_initial) < calls.index(stop_daemon)
     assert not (tmp_path / "memoryd-backup.service").exists()
     assert not (tmp_path / "memoryd-backup.timer").exists()
+    assert not (tmp_path / "memoryd-backup-initial.service").exists()

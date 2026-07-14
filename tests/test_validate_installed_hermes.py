@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import stat
@@ -9,18 +8,10 @@ from pathlib import Path
 import pytest
 
 
-REPO = Path(__file__).resolve().parents[1]
-VALIDATOR = REPO / "scripts" / "validate_installed_hermes.py"
-
-
 def _validator():
-    assert VALIDATOR.is_file(), "installed Hermes validator is missing"
-    spec = importlib.util.spec_from_file_location(
-        "memoryd_validate_installed_hermes", VALIDATOR)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    from memoryd.hermes_validation import installed_runtime
+
+    return installed_runtime
 
 
 def test_prepare_isolated_home_uses_real_user_provider_layout(tmp_path):
@@ -72,6 +63,8 @@ def test_plugin_source_must_be_the_wheel_copy_under_site_packages(
     expected = package / "hermes_plugin"
     expected.mkdir(parents=True)
     (expected / "__init__.py").write_text("# wheel plugin\n", encoding="utf-8")
+    (expected / "plugin.yaml").write_text("name: memoryd\n", encoding="utf-8")
+    (expected / "spool.py").write_text("SCHEMA_VERSION = 1\n", encoding="utf-8")
     monkeypatch.setattr(module, "_memoryd_package_root", lambda: package)
 
     assert module.require_installed_plugin_source(
@@ -80,6 +73,21 @@ def test_plugin_source_must_be_the_wheel_copy_under_site_packages(
         module.require_installed_plugin_source(
             tmp_path / "checkout" / "hermes_plugin" / "memoryd",
             site_roots=[site_packages])
+
+
+def test_damaged_installed_package_rejects_adjacent_fake_plugin(
+        monkeypatch, tmp_path):
+    module = _validator()
+    site_packages = tmp_path / "venv" / "lib" / "site-packages"
+    package = site_packages / "memoryd"
+    package.mkdir(parents=True)
+    adjacent = site_packages / "hermes_plugin" / "memoryd"
+    adjacent.mkdir(parents=True)
+    (adjacent / "__init__.py").write_text("# adjacent fake\n", encoding="utf-8")
+    monkeypatch.setattr(module, "_memoryd_package_root", lambda: package)
+
+    with pytest.raises(ValueError, match="wheel-bundled"):
+        module.require_installed_plugin_source(adjacent)
 
 
 def test_isolated_plugin_copy_preserves_installed_origin(tmp_path):

@@ -402,16 +402,19 @@ verbatim ABC from the Hermes repo, vendored in scripts/_stubs/):
 - Tools exposed to the model: `memoryd_search`, `memoryd_report_miss`.
 - CLI: `hermes memoryd status|config|miss`.
 
-Setup: export the authoritative `HERMES_HOME`, then copy
-`hermes_plugin/memoryd/` to `$HERMES_HOME/plugins/memoryd/` (or let
-`memoryd install` do so). Activate with
-`hermes config set memory.provider memoryd` (or `hermes memory setup`).
-Requires migrations 001–007. Per-agent scopes via `MEMORYD_VISAS`, e.g.
+Production setup is the guided Linux command `memoryd install --hermes` from a
+normal terminal after every Hermes chat/TUI has exited. It resolves the active
+profile, verifies Hermes 0.16.0, copies the wheel-bundled plugin, checks an
+initial backup, and activates transactionally with automatic provider/gateway
+rollback. Manual copying and activation are troubleshooting operations, not the
+production recommendation; see `docs/PRODUCTION_ROLLOUT.md`. Requires
+migrations 001–007. Per-agent scopes via `MEMORYD_VISAS`, e.g.
 `{"hermes": ["work_private","project_shared","public"]}`. Cross-agent
 sharing is automatic: memories extracted from Claude Code sessions are
 recallable in Hermes (and vice versa) under each agent's visa.
 
-Version note: the plugin targets Hermes Agent tag `v2026.6.5`, resolved commit
+Version note: memoryd and the plugin ship together as `v0.3.1`. The plugin
+targets Hermes Agent tag `v2026.6.5`, resolved commit
 `3c231eb3979ab9c57d5cd6d02f1d577a3b718b43`, source path
 `agent/memory_provider.py`. The vendored pinned contract is
 `scripts/_stubs/agent/memory_provider.py`.

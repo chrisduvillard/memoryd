@@ -76,8 +76,8 @@ def _prepare_installed_runtime(args: argparse.Namespace, daemon_url: str):
     import memoryd
     from memoryd.core import append_event, new_id, pool
 
-    if metadata.version("memoryd") != "0.3.0":
-        raise RuntimeError(f"expected memoryd 0.3.0, got {metadata.version('memoryd')}")
+    if metadata.version("memoryd") != "0.3.1":
+        raise RuntimeError(f"expected memoryd 0.3.1, got {metadata.version('memoryd')}")
     if metadata.version("hermes-agent") != args.expected_version:
         raise RuntimeError(
             f"expected hermes-agent {args.expected_version}, "
